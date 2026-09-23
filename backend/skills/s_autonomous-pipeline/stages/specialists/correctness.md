@@ -1,5 +1,5 @@
 # Correctness Specialist Review
-<!-- version: 2026-09-13 | synced with: REVIEW_PATTERNS.md RP1-RP84 -->
+<!-- version: 2026-09-13 | synced with: REVIEW_PATTERNS.md RP1-RP86 -->
 
 Scope: Always dispatched when changeset > 50 lines.
 
