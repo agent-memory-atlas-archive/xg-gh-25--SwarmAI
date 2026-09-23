@@ -40,8 +40,16 @@
  *
  * Advanced:
  *   eval <js-expression>        Evaluate JS in page context
- *   wait <ms|selector>          Wait for time or element
+ *   wait <ms|selector>          Wait for time (bare ms) or element (bare selector)
+ *   wait --text <t> | --text-gone <t> | --aria-busy-clear <sel> | --selector-state <sel:state> [--max-ms N]
+ *                               Semantic, event-driven waits (preferred over blind ms)
+ *   wait-reply --busy <sel> | --send-btn <sel> | --stop-btn <sel> [--quiet-ms N] [--max-ms N]
+ *                               Detect a streaming reply finished (chat SPAs) — multi-signal, capped
  *   pdf [path]                  Save page as PDF
+ *
+ * Readiness engine (wait-engine.mjs): actions run an event-driven readiness barrier
+ * (waitForCompletion) instead of fixed sleeps; streaming completion via
+ * waitForReplyComplete. Doctrine: Knowledge/Library/2026-09-23-browser-computer-use-agent-architecture.md
  */
 
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'fs';
@@ -61,6 +69,28 @@ if (!existsSync(join(skillNodeModules, 'playwright'))) {
 }
 
 const { chromium } = await import(join(skillNodeModules, 'playwright', 'index.mjs'));
+
+// ─── Readiness/wait engine (event-driven; replaces fixed-sleep readiness) ──
+// Doctrine: Knowledge/Library/2026-09-23-browser-computer-use-agent-architecture.md
+const { waitForCompletion, waitForReplyComplete, diffElementMap } =
+  await import(join(__dirname, 'wait-engine.mjs'));
+
+// Previous element map (for cross-read new-element diffing / *-marking).
+// NOTE: global /tmp path, consistent with the skill's existing single-session design
+// (STATE_FILE + ELEMENT_MAP_FILE below are likewise global). Concurrent browser-agent
+// invocations already share one CDP browser (port 9222) + one state file, so the `*`
+// isNew diff is best-effort: a concurrent run can cross-contaminate it, degrading to
+// harmless over-marking (loadPrevElements catch→[] → "all new"). Never crashes, never
+// affects click/type element resolution (that uses ELEMENT_MAP_FILE). Per-session
+// scoping is a skill-wide concern (all three /tmp files), out of this refactor's scope.
+const PREV_ELEMENTS_FILE = '/tmp/.browser-agent-prev-elements.json';
+function loadPrevElements() {
+  try { return existsSync(PREV_ELEMENTS_FILE) ? JSON.parse(readFileSync(PREV_ELEMENTS_FILE, 'utf8')) : []; }
+  catch { return []; }
+}
+function savePrevElements(els) {
+  try { writeFileSync(PREV_ELEMENTS_FILE, JSON.stringify(els)); } catch { /* best-effort */ }
+}
 
 const STATE_FILE = '/tmp/.browser-agent-state.json';
 const ELEMENT_MAP_FILE = '/tmp/.browser-agent-elements.json';
@@ -295,6 +325,26 @@ function truncateDOM(body, maxChars = 12000) {
   return body.substring(0, maxChars) + '\n... [truncated, use scroll or extract for more]';
 }
 
+// Compress the DOM, diff against the previous read to tag newly-appeared elements
+// (AC5), persist both the element map (for click/type index lookup) and the
+// signature snapshot (for the next diff), and mark new elements with a `*` prefix
+// in the rendered body so the model sees what an action changed.
+async function readDOM(page, maxDepth = 15) {
+  const dom = await compressDOM(page, maxDepth);
+  const diffed = diffElementMap(loadPrevElements(), dom.elementMap);
+  saveElementMap(diffed);           // element map now carries sig + isNew
+  savePrevElements(dom.elementMap); // snapshot for next diff (raw, pre-tag)
+  // Mark new elements in the body: `[N]<` → `*[N]<` for each isNew element.
+  let body = dom.body;
+  for (const el of diffed) {
+    if (el.isNew) body = body.replace(`[${el.index}]<`, `*[${el.index}]<`);
+  }
+  dom.body = body;
+  dom.elementMap = diffed;
+  dom.newCount = diffed.filter((e) => e.isNew).length;
+  return dom;
+}
+
 // ─── Output helper ──────────────────────────────────────────────────
 function out(obj) {
   console.log(JSON.stringify(obj, null, 2));
@@ -328,15 +378,19 @@ async function main() {
         const headless = process.env.BROWSER_HEADLESS !== 'false' && !args.includes('--headed');
         const CDP_PORT = 9222;
 
-        // Launch Chromium directly with remote debugging
-        const browser = await chromium.launch({
+        // Launch Chromium directly with remote debugging.
+        // BROWSER_AGENT_EXECUTABLE lets an env pin a specific chromium binary
+        // (e.g. an already-installed build) — omitted → Playwright's default.
+        const launchOpts = {
           headless,
           args: [
             '--no-sandbox',
             '--disable-blink-features=AutomationControlled',
             `--remote-debugging-port=${CDP_PORT}`,
           ],
-        });
+        };
+        if (process.env.BROWSER_AGENT_EXECUTABLE) launchOpts.executablePath = process.env.BROWSER_AGENT_EXECUTABLE;
+        const browser = await chromium.launch(launchOpts);
 
         const cdpUrl = `http://localhost:${CDP_PORT}`;
         saveState({ cdpUrl });
@@ -386,15 +440,14 @@ async function main() {
         const url = args[1];
         if (!url) throw new Error('Usage: navigate <url>');
         const { browser, page } = await connect();
-        await page.goto(url.startsWith('http') ? url : `https://${url}`, {
+        await page.goto(/^(https?|data|file|about):/.test(url) ? url : `https://${url}`, {
           waitUntil: 'domcontentloaded', timeout: 30000
         });
-        await page.waitForTimeout(800);
-        const dom = await compressDOM(page);
-        saveElementMap(dom.elementMap);
+        await waitForCompletion(page, { navigated: true });
+        const dom = await readDOM(page);
         out({
           status: 'ok', url: dom.url, title: dom.title,
-          stats: dom.stats,
+          stats: dom.stats, newElements: dom.newCount,
           dom: truncateDOM(dom.body)
         });
         break;
@@ -403,7 +456,7 @@ async function main() {
       case 'back': {
         const { browser, page } = await connect();
         await page.goBack({ waitUntil: 'domcontentloaded' });
-        await page.waitForTimeout(500);
+        await waitForCompletion(page, { navigated: true });
         out({ status: 'ok', url: page.url(), title: await page.title() });
         break;
       }
@@ -411,7 +464,7 @@ async function main() {
       case 'forward': {
         const { browser, page } = await connect();
         await page.goForward({ waitUntil: 'domcontentloaded' });
-        await page.waitForTimeout(500);
+        await waitForCompletion(page, { navigated: true });
         out({ status: 'ok', url: page.url(), title: await page.title() });
         break;
       }
@@ -423,9 +476,8 @@ async function main() {
         const delta = { down: [0,300], up: [0,-300], right: [300,0], left: [-300,0] };
         const [dx, dy] = (delta[direction] || delta.down).map(v => v * amount);
         await page.mouse.wheel(dx, dy);
-        await page.waitForTimeout(500);
-        const dom = await compressDOM(page);
-        saveElementMap(dom.elementMap);
+        await page.waitForTimeout(300); // throttle: let scroll-triggered animation/lazy-load paint (NOT a readiness wait)
+        const dom = await readDOM(page);
         out({
           status: 'ok', action: `scrolled ${direction} x${amount}`,
           stats: dom.stats,
@@ -439,11 +491,10 @@ async function main() {
         const maxDepth = args.includes('--max-depth')
           ? parseInt(args[args.indexOf('--max-depth') + 1]) : 15;
         const { browser, page } = await connect();
-        const dom = await compressDOM(page, maxDepth);
-        saveElementMap(dom.elementMap);
+        const dom = await readDOM(page, maxDepth);
         out({
           status: 'ok', url: dom.url, title: dom.title,
-          stats: dom.stats,
+          stats: dom.stats, newElements: dom.newCount,
           dom: truncateDOM(dom.body)
         });
         break;
@@ -503,14 +554,17 @@ async function main() {
         }
         if (!clicked) throw new Error(`Could not click [${idx}]. Try 'read' to refresh elements.`);
 
-        await page.waitForTimeout(800);
-        const dom = await compressDOM(page);
-        saveElementMap(dom.elementMap);
+        // Event-driven readiness barrier: a click may trigger navigation OR an
+        // in-page fetch/render. waitForCompletion detects which and drains it,
+        // capped by a hang-guard — replaces the old blind waitForTimeout(800).
+        const settle = await waitForCompletion(page, { navigated: false });
+        const dom = await readDOM(page);
         out({
           status: 'ok',
           action: `clicked [${idx}] <${el.tag}> "${el.text}"`,
+          settled: settle.settled,
           url: dom.url, title: dom.title,
-          stats: dom.stats,
+          stats: dom.stats, newElements: dom.newCount,
           dom: truncateDOM(dom.body)
         });
         break;
@@ -535,7 +589,8 @@ async function main() {
         } else {
           throw new Error(`Cannot type into [${idx}]. Try 'read' to refresh.`);
         }
-        await page.waitForTimeout(300);
+        // Typing may trigger autocomplete/validation fetches — drain them (capped).
+        await waitForCompletion(page, { navigated: false, settleMs: 200 });
         out({ status: 'ok', action: `typed "${text}" into [${idx}] <${el.tag}>`, url: page.url() });
         break;
       }
@@ -552,7 +607,8 @@ async function main() {
             else form.closest('form')?.submit();
           });
         }
-        await page.waitForTimeout(1000);
+        // A submit usually navigates or posts — detect + drain, capped.
+        await waitForCompletion(page, { navigated: true });
         out({ status: 'ok', action: `submitted form [${idx}]`, url: page.url() });
         break;
       }
@@ -580,11 +636,11 @@ async function main() {
         } else if (el.rect) {
           await page.mouse.move(el.rect.x + el.rect.w / 2, el.rect.y + el.rect.h / 2);
         }
-        await page.waitForTimeout(500);
-        const dom = await compressDOM(page);
-        saveElementMap(dom.elementMap);
+        await waitForCompletion(page, { navigated: false, settleMs: 300 });
+        const dom = await readDOM(page);
         out({
           status: 'ok', action: `hovered [${idx}] <${el.tag}> "${el.text}"`,
+          newElements: dom.newCount,
           dom: truncateDOM(dom.body)
         });
         break;
@@ -595,7 +651,8 @@ async function main() {
         if (!key) throw new Error('Usage: press <key> (Enter, Tab, Escape, ArrowDown, etc.)');
         const { browser, page } = await connect();
         await page.keyboard.press(key);
-        await page.waitForTimeout(300);
+        // Enter/arrow keys can submit/navigate/trigger fetch — drain, capped.
+        await waitForCompletion(page, { navigated: false, settleMs: 200 });
         out({ status: 'ok', action: `pressed ${key}` });
         break;
       }
@@ -651,15 +708,71 @@ async function main() {
       }
 
       case 'wait': {
-        const target = args[1];
-        if (!target) throw new Error('Usage: wait <ms|css-selector>');
         const { browser, page } = await connect();
-        if (/^\d+$/.test(target)) {
-          await page.waitForTimeout(parseInt(target));
+        const flag = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : null; };
+        const maxMs = parseInt(flag('--max-ms')) || 10000;
+        // Semantic conditions (preferred over blind ms sleep) — event-driven.
+        const textOf = flag('--text');
+        const textGone = flag('--text-gone');
+        const ariaBusyClear = flag('--aria-busy-clear'); // takes a selector value
+        const selState = flag('--selector-state'); // "sel:state" e.g. "#send:visible"
+        let waited;
+        if (textOf) {
+          await page.getByText(textOf, { exact: false }).first().waitFor({ state: 'visible', timeout: maxMs });
+          waited = `text:"${textOf}"`;
+        } else if (textGone) {
+          await page.getByText(textGone, { exact: false }).first().waitFor({ state: 'hidden', timeout: maxMs }).catch(async () => {
+            // already absent counts as gone
+            const cnt = await page.getByText(textGone, { exact: false }).count();
+            if (cnt > 0) throw new Error(`text "${textGone}" still present after ${maxMs}ms`);
+          });
+          waited = `text-gone:"${textGone}"`;
+        } else if (ariaBusyClear) {
+          await page.waitForFunction(
+            (sel) => { const el = document.querySelector(sel); return el && el.getAttribute('aria-busy') !== 'true'; },
+            ariaBusyClear, { timeout: maxMs, polling: 150 },
+          );
+          waited = `aria-busy-clear:${ariaBusyClear}`;
+        } else if (selState) {
+          // Split on the LAST ':' ONLY if the trailing token is a real Playwright
+          // state — otherwise a selector containing ':' (a:hover, li:nth-of-type(2))
+          // would be mangled and 'hover' passed as an invalid state (throws).
+          const KNOWN_STATES = ['visible', 'hidden', 'attached', 'detached'];
+          const ci = selState.lastIndexOf(':');
+          let sel = selState, state = 'visible';
+          if (ci > 0 && KNOWN_STATES.includes(selState.slice(ci + 1))) {
+            sel = selState.slice(0, ci);
+            state = selState.slice(ci + 1);
+          }
+          await page.locator(sel).first().waitFor({ state, timeout: maxMs });
+          waited = `selector-state:${sel}:${state}`;
         } else {
-          await page.waitForSelector(target, { timeout: 10000 });
+          // Back-compat: bare ms (blind sleep — kept for explicit throttle use) or bare selector.
+          const target = args[1];
+          if (!target) throw new Error('Usage: wait <ms|css-selector> | wait --text <t> | --text-gone <t> | --aria-busy-clear <sel> | --selector-state <sel:state> [--max-ms N]');
+          if (/^\d+$/.test(target)) { await page.waitForTimeout(parseInt(target)); waited = `${target}ms`; }
+          else { await page.waitForSelector(target, { timeout: maxMs }); waited = target; }
         }
-        out({ status: 'ok', waited: target });
+        out({ status: 'ok', waited });
+        break;
+      }
+
+      case 'wait-reply': {
+        // Detect that a streaming reply (chat SPA) finished — multi-signal, capped.
+        const { browser, page } = await connect();
+        const flag = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : null; };
+        const opts = {
+          sendBtnSel: flag('--send-btn'),
+          stopBtnSel: flag('--stop-btn'),
+          busyContainerSel: flag('--busy') || flag('--container'),
+          maxMs: parseInt(flag('--max-ms')) || 60000,
+          quietMs: parseInt(flag('--quiet-ms')) || 800,
+        };
+        if (!opts.sendBtnSel && !opts.stopBtnSel && !opts.busyContainerSel) {
+          throw new Error('Usage: wait-reply --busy <container-sel> | --send-btn <sel> | --stop-btn <sel> [--quiet-ms N] [--max-ms N]');
+        }
+        const res = await waitForReplyComplete(page, opts);
+        out({ status: 'ok', ...res });
         break;
       }
 

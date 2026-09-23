@@ -210,8 +210,63 @@ node .claude/skills/s_browser-agent/browser-agent.mjs close
 | Command | Description |
 |---------|-------------|
 | `eval <js-expression>` | Execute JavaScript in page |
-| `wait <ms\|selector>` | Wait for time or element to appear |
+| `wait <ms\|selector>` | Wait for time (bare ms) or element (bare selector) — back-compat |
+| `wait --text <t>` | Wait until text becomes visible (semantic, event-driven) |
+| `wait --text-gone <t>` | Wait until text disappears (e.g. a "Loading…" spinner) |
+| `wait --aria-busy-clear <sel>` | Wait until `aria-busy` clears on an element |
+| `wait --selector-state <sel:state>` | Wait for element state (`visible`/`hidden`/`attached`), e.g. `#send:visible` |
+| `wait-reply --busy <sel> \| --send-btn <sel> \| --stop-btn <sel>` | **Detect a streaming reply finished** (chat SPAs) — multi-signal, capped |
 | `pdf [path]` | Save page as PDF |
+
+All `wait*` semantic conditions accept `--max-ms N` (default 10000 for `wait`, 60000
+for `wait-reply`); `wait-reply` also takes `--quiet-ms N` (MutationObserver debounce
+window, default 800).
+
+---
+
+## Readiness / Waiting — Event-Driven Engine (READ THIS for dynamic SPAs)
+
+**The tool no longer relies on fixed `sleep` between actions.** After every
+`click`/`type`/`submit`/`navigate`/`press`, the tool runs an **event-driven
+readiness barrier** (`waitForCompletion`): it detects whether the action triggered
+a navigation (→ waits for the `load` event) or an in-page fetch (→ drains
+outstanding requests), everything bounded by a hard hang-guard cap so it can never
+hang. Action responses now carry a `settled` flag.
+
+**For streaming chat SPAs (ChatGPT, Claude, etc.) — use `wait-reply`, NOT a fixed
+sleep and NOT counting messages.** After sending a message, call:
+
+```bash
+# ChatGPT: the Stop button appears while streaming and disappears when done.
+node .claude/skills/s_browser-agent/browser-agent.mjs wait-reply \
+  --stop-btn '[data-testid="stop-button"]' --send-btn '[data-testid="send-button"]' \
+  --max-ms 90000 --quiet-ms 1200
+```
+
+`wait-reply` races multiple completion signals (priority order):
+1. **Semantic signal** — send-button re-enabled (`--send-btn`) / stop-button gone
+   (`--stop-btn`) / `aria-busy` cleared (`--busy`). Most reliable when the site
+   exposes it.
+2. **MutationObserver quiescence** — the reply container (`--busy <sel>`) goes
+   silent for `--quiet-ms`. Fallback when no semantic signal exists.
+3. **textContent-stable** — internal fallback if the observer can't be injected.
+
+Returns `{done, signal, timedOut}`. `done:true` + a `signal` = reliably complete.
+On a never-quiet stream it returns `done:false, timedOut:true` at the cap — never hangs.
+
+**New-element marking:** `read`/`navigate`/`click` output now prefixes newly-appeared
+interactive elements with `*` (e.g. `*[7]<button>`) and reports a `newElements` count,
+so you can see what an action changed without re-reading the whole DOM.
+
+### ChatGPT field notes (learned 2026-09-23)
+- **Login wall for uploads:** anonymous mode blocks file upload ("Add files. Log in
+  to use."). Use a persistent profile (`launchPersistentContext`) + manual login.
+- **File upload path:** `setInputFiles` on the hidden input does NOT work. Open the
+  `+` menu → "Add photos & files" → intercept the system file chooser
+  (`page.on('filechooser')` → `fc.setFiles(path)`). Chip renders on success.
+- **Composer** is a ProseMirror `div[contenteditable]`, not the visible `textarea`
+  (that's a hidden fallback). Click it, `Ctrl/Cmd+A` → `Backspace` → type.
+- **Free tier rate-limits** long multi-turn sessions ("Chat paused until HH:MM").
 
 ---
 
