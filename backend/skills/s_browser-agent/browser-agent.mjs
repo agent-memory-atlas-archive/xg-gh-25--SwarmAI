@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 /**
- * browser-agent.mjs — DOM-based browser automation for SwarmAI
+ * browser-agent.mjs — accessibility-tree browser automation for SwarmAI
  *
  * Architecture:
  *   - `launch` starts Chromium with --remote-debugging-port, saves CDP URL
  *   - All other commands connect via CDP (connectOverCDP) — pages/tabs persist across connections
- *   - DOM compression: strips invisible/non-interactive nodes, assigns [N] indices to interactive elements
- *   - Element map cached to /tmp for cross-command element reference
+ *   - Perception: Playwright-native a11y tree via ariaPerceive (aria-perceive.mjs,
+ *     using ariaSnapshot()) — role+name is both the representation AND the locator key.
+ *     NO @playwright/mcp needed. compressDOM (legacy self-built DOM traversal) is kept
+ *     as a strangler-fig fallback only (readDOM routes to ariaPerceive by default).
+ *   - Interaction: click/type/select/hover resolve a node via getByRole(role,{name})
+ *     (auto-wait), falling back to CSS/coordinate. Element map cached to /tmp.
  *
  * Usage: node browser-agent.mjs <action> [args...]
  *
@@ -15,12 +19,12 @@
  *   close                       Stop browser server
  *
  * Navigation:
- *   navigate <url>              Go to URL, return compressed DOM
+ *   navigate <url>              Go to URL, return a11y-tree read
  *   back / forward              Browser history navigation
  *   scroll <up|down> [amount]   Scroll page (default: 3 units)
  *
  * Reading:
- *   read [--max-depth N]        Get compressed DOM with element indices
+ *   read [--max-depth N]        Get a11y-tree read with element indices
  *   screenshot [path]           Screenshot (default: /tmp/browser-screenshot.png)
  *   extract <css-selector>      Extract text from matching elements
  *
@@ -74,6 +78,14 @@ const { chromium } = await import(join(skillNodeModules, 'playwright', 'index.mj
 // Doctrine: Knowledge/Library/2026-09-23-browser-computer-use-agent-architecture.md
 const { waitForCompletion, waitForReplyComplete, diffElementMap } =
   await import(join(__dirname, 'wait-engine.mjs'));
+
+// ─── Perception engine (a11y-tree via Playwright-native ariaSnapshot) ──
+// Replaces the self-built compressDOM page.evaluate DOM traversal (the CDP-DOM
+// school retired internally as "the single most brittle path"). NOT @playwright/mcp:
+// ariaSnapshot is a public library API. compressDOM is KEPT below as an escape-hatch
+// fallback (strangler-fig, R26) — readDOM routes to ariaPerceive by default.
+const { ariaPerceive, resolveAriaLocator } =
+  await import(join(__dirname, 'aria-perceive.mjs'));
 
 // Previous element map (for cross-read new-element diffing / *-marking).
 // NOTE: global /tmp path, consistent with the skill's existing single-session design
@@ -330,14 +342,41 @@ function truncateDOM(body, maxChars = 12000) {
 // signature snapshot (for the next diff), and mark new elements with a `*` prefix
 // in the rendered body so the model sees what an action changed.
 async function readDOM(page, maxDepth = 15) {
-  const dom = await compressDOM(page, maxDepth);
+  // Perception layer: a11y-tree via ariaPerceive (default). compressDOM is kept
+  // as an escape-hatch fallback (strangler-fig, R26) — if ariaPerceive throws or
+  // yields zero interactive nodes on a page that clearly has interactive content,
+  // fall back to the legacy self-built traversal so perception never goes dark.
+  let dom;
+  try {
+    dom = await ariaPerceive(page);
+    if (!dom || !Array.isArray(dom.elementMap)) throw new Error('ariaPerceive returned no elementMap');
+    // Under-parse guard (#2): a11y tree named interactive roles but we parsed zero
+    // (wrapped-name miss / unexpected YAML shape) → don't perceive nothing, fall back.
+    if (dom.underParsed) throw new Error('ariaPerceive under-parsed (interactive roles in YAML, 0 nodes)');
+  } catch (err) {
+    dom = await compressDOM(page, maxDepth);
+    dom.stats = { ...(dom.stats || {}), perception: 'compressDOM-fallback', fallback_reason: String(err && err.message || err) };
+    // Observable fallback rate (stderr, never pollutes the stdout JSON) — this is
+    // the sunset signal for the strangler-fig: compressDOM can be retired once
+    // a11y-perception fallback stays rare across real usage. Without a rate signal
+    // the strangler never completes and two perception engines live forever.
+    console.error(`[browser-agent] perception fallback → compressDOM (${dom.stats.fallback_reason})`);
+  }
   const diffed = diffElementMap(loadPrevElements(), dom.elementMap);
   saveElementMap(diffed);           // element map now carries sig + isNew
   savePrevElements(dom.elementMap); // snapshot for next diff (raw, pre-tag)
-  // Mark new elements in the body: `[N]<` → `*[N]<` for each isNew element.
+  // Mark new elements in the body: prefix `[N]` with `*` for each isNew element.
+  // Handles both perception formats: compressDOM's `[N]<tag>` and ariaPerceive's
+  // `[N] role "name"` — match `[N]` at the start (both share the `[idx]` prefix).
   let body = dom.body;
   for (const el of diffed) {
-    if (el.isNew) body = body.replace(`[${el.index}]<`, `*[${el.index}]<`);
+    if (el.isNew) {
+      // compressDOM body: `[N]<tag>`. ariaPerceive body: `[N] role "name"` at a
+      // LINE START (in the interactive-elements section) — anchor to `\n[N] ` so a
+      // literal `[N] ` inside a node NAME (in the YAML tree above) is never mis-marked.
+      if (body.includes(`[${el.index}]<`)) body = body.replace(`[${el.index}]<`, `*[${el.index}]<`);
+      else body = body.replace(`\n[${el.index}] `, `\n*[${el.index}] `);
+    }
   }
   dom.body = body;
   dom.elementMap = diffed;
@@ -530,15 +569,15 @@ async function main() {
         const { browser, page } = await connect();
 
         let clicked = false;
-        // Strategy 1: Playwright text selector (most stable for buttons/links)
-        if ((el.tag === 'button' || el.tag === 'a') && el.text) {
-          try {
-            await page.getByRole(el.tag === 'a' ? 'link' : 'button', { name: el.text.substring(0, 40) }).first().click({ timeout: 3000 });
-            clicked = true;
-          } catch {}
+        // Strategy 1: a11y role locator (primary — auto-wait, stable, from ariaPerceive).
+        // resolveAriaLocator returns null for a legacy CSS selector (compressDOM fallback).
+        const ariaLoc = await resolveAriaLocator(page, el.selector);
+        if (ariaLoc) {
+          try { await ariaLoc.click({ timeout: 3000 }); clicked = true; } catch {}
         }
-        // Strategy 2: CSS selector
-        if (!clicked) {
+        // Strategy 2: CSS selector (escape-hatch — only when selector is legacy CSS,
+        // not the aria-descriptor JSON, and not a :text() pseudo).
+        if (!clicked && !ariaLoc) {
           try {
             const sel = el.selector.includes(':text(') ? null : el.selector;
             if (sel) {
@@ -577,17 +616,36 @@ async function main() {
         const el = getElement(idx);
         const { browser, page } = await connect();
 
-        const sel = el.selector.includes(':text(') ? null : el.selector;
-        if (sel) {
-          const loc = page.locator(sel).first();
-          await loc.click({ timeout: 3000 });
-          await loc.fill(text);
-        } else if (el.rect && el.rect.w > 0) {
-          await page.mouse.click(el.rect.x + el.rect.w / 2, el.rect.y + el.rect.h / 2);
-          await page.keyboard.press('Control+a');
-          await page.keyboard.type(text);
-        } else {
-          throw new Error(`Cannot type into [${idx}]. Try 'read' to refresh.`);
+        // Strategy 1: a11y role locator (primary). fill() handles contenteditable
+        // role=textbox (the ChatGPT ProseMirror composer) — verified in THINK probe.
+        const ariaLoc = await resolveAriaLocator(page, el.selector);
+        let typed = false;
+        if (ariaLoc) {
+          try {
+            await ariaLoc.click({ timeout: 3000 });
+            await ariaLoc.fill(text);
+            typed = true;
+          } catch {}
+        }
+        // Strategy 2: legacy CSS selector (escape-hatch, only if not aria descriptor)
+        if (!typed && !ariaLoc) {
+          const sel = el.selector.includes(':text(') ? null : el.selector;
+          if (sel) {
+            const loc = page.locator(sel).first();
+            await loc.click({ timeout: 3000 });
+            await loc.fill(text);
+            typed = true;
+          }
+        }
+        // Strategy 3: coordinate fallback
+        if (!typed) {
+          if (el.rect && el.rect.w > 0) {
+            await page.mouse.click(el.rect.x + el.rect.w / 2, el.rect.y + el.rect.h / 2);
+            await page.keyboard.press('Control+a');
+            await page.keyboard.type(text);
+          } else {
+            throw new Error(`Cannot type into [${idx}]. Try 'read' to refresh.`);
+          }
         }
         // Typing may trigger autocomplete/validation fetches — drain them (capped).
         await waitForCompletion(page, { navigated: false, settleMs: 200 });
@@ -600,9 +658,12 @@ async function main() {
         if (isNaN(idx)) throw new Error('Usage: submit <form-element-index>');
         const el = getElement(idx);
         const { browser, page } = await connect();
-        const sel = el.selector.includes(':text(') ? null : el.selector;
-        if (sel) {
-          await page.locator(sel).first().evaluate(form => {
+        // aria descriptor → role locator; else legacy CSS. Guard against passing the
+        // aria-JSON descriptor to page.locator() (it is not a CSS selector).
+        const ariaLoc = await resolveAriaLocator(page, el.selector);
+        const submitLoc = ariaLoc || (el.selector.includes(':text(') ? null : page.locator(el.selector).first());
+        if (submitLoc) {
+          await submitLoc.evaluate(form => {
             if (form.submit) form.submit();
             else form.closest('form')?.submit();
           });
@@ -619,8 +680,9 @@ async function main() {
         if (isNaN(idx) || !value) throw new Error('Usage: select <index> <value>');
         const el = getElement(idx);
         const { browser, page } = await connect();
-        const sel = el.selector.includes(':text(') ? null : el.selector;
-        if (sel) await page.locator(sel).first().selectOption(value);
+        const ariaLoc = await resolveAriaLocator(page, el.selector);
+        const selLoc = ariaLoc || (el.selector.includes(':text(') ? null : page.locator(el.selector).first());
+        if (selLoc) await selLoc.selectOption(value);
         out({ status: 'ok', action: `selected "${value}" in [${idx}]` });
         break;
       }
@@ -630,9 +692,10 @@ async function main() {
         if (isNaN(idx)) throw new Error('Usage: hover <index>');
         const el = getElement(idx);
         const { browser, page } = await connect();
-        const sel = el.selector.includes(':text(') ? null : el.selector;
-        if (sel) {
-          await page.locator(sel).first().hover({ timeout: 3000 });
+        const ariaLoc = await resolveAriaLocator(page, el.selector);
+        const hoverLoc = ariaLoc || (el.selector.includes(':text(') ? null : page.locator(el.selector).first());
+        if (hoverLoc) {
+          await hoverLoc.hover({ timeout: 3000 });
         } else if (el.rect) {
           await page.mouse.move(el.rect.x + el.rect.w / 2, el.rect.y + el.rect.h / 2);
         }

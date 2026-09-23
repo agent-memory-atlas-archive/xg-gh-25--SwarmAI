@@ -7,31 +7,19 @@
 - `browser-agent.mjs` [ENTRY]: browser-agent.mjs — DOM-based browser automation for SwarmAI (exists)
 
 
-DOM-based web automation: navigate websites, read compressed page content, click elements,
-fill forms, extract data, and take screenshots using Playwright.
+Accessibility-tree web automation: navigate websites, read page content as a
+Playwright-native a11y tree, click elements, fill forms, extract data, and take
+screenshots using Playwright.
 
-## MCP + Skill Routing
+## Perception model
 
-**If Playwright MCP is available** (check for `mcp__playwright__*` tools):
-- Use MCP for **simple tasks**: navigate, click, fill forms, read page via accessibility snapshot
-- MCP uses accessibility tree (like a screen reader) — stable and token-efficient
-- Prefer MCP as the default — it's structured, reliable, and zero-setup
-
-**Fall back to browser-agent script** for:
-- Multi-tab workflows (MCP doesn't support tab management)
-- Persistent sessions across commands (CDP keeps browser alive)
-- DOM extraction with CSS selectors (`extract` command)
-- Custom DOM compression with `[N]` element indices
-- Screenshots with specific viewport control
-- `eval` (arbitrary JS execution in page)
-
-**Decision tree:**
-```
-Need browser? → Is Playwright MCP loaded?
-  → YES: Simple task? → Use MCP tools
-          Complex/multi-tab/persistent? → Use browser-agent.mjs
-  → NO: Use browser-agent.mjs for everything
-```
+This skill uses **Playwright's library-native accessibility tree** (`ariaSnapshot()`)
+for perception — the same a11y-tree approach a screen reader (and Playwright MCP) uses,
+but WITHOUT any MCP server. `ariaSnapshot` is a public Playwright API; there is no need
+to mount `@playwright/mcp` (its ref-bearing snapshot is an MCP-server wrapper the
+library does not require). This skill is self-contained: it owns tab management,
+persistent CDP sessions, `extract`/`eval`, and screenshots — capabilities the MCP does
+not provide — on top of the same stable, token-efficient a11y perception.
 
 ---
 
@@ -272,29 +260,46 @@ so you can see what an action changed without re-reading the whole DOM.
 
 ## DOM Compression
 
-The `read` and `navigate` commands return a compressed DOM representation:
+The `read` and `navigate` commands return a **Playwright-native accessibility-tree**
+representation (via `ariaSnapshot()` — the a11y-tree perception school, NOT a self-built
+DOM traversal, and NOT @playwright/mcp). Perception is Playwright's own accessibility tree.
 
-### What Gets Kept
-- **Interactive elements** with `[N]` indices: links, buttons, inputs, selects, textareas
-- **Structural landmarks**: headers, nav, main, sections, forms, tables, lists, headings
-- **Semantic attributes**: href, type, name, placeholder, aria-label, role, value
-- **Visible text content** (truncated at 150 chars per node)
+### Body format
+```
+- main:
+  - heading "Welcome" [level=1]
+  - button "Send"
+  - textbox "Message"      ← contenteditable composers surface as textbox (name = aria-label)
+  - link "Docs": /url: /docs
 
-### What Gets Stripped
-- Scripts, styles, SVGs, canvases, iframes
-- Hidden/invisible elements (display:none, visibility:hidden, zero-size)
-- Non-semantic attributes: class, style, data-*, event handlers
-- Deeply nested non-landmark containers
-- Tracking/analytics attributes
+--- Interactive elements ---
+[1] button "Send"
+[2] textbox "Message"
+[3] link "Docs"
+```
+The top block is the raw a11y YAML tree (full structural context: role + accessible
+name + state + level + url). The `--- Interactive elements ---` block lists the
+actionable nodes with `[N]` indices for `click <N>` / `type <N>`.
 
-### Compression Ratio
-Typical: **95-99% reduction**. A 300KB HTML page compresses to ~3-5K tokens.
+### Why a11y perception
+- **role + accessible name** is BOTH the perception representation AND the locator key.
+  `click`/`type` resolve a node via `getByRole(role, {name})` (Playwright auto-wait),
+  falling back to CSS/coordinate only when needed.
+- **contenteditable rich-text composers** (e.g. ChatGPT's ProseMirror) surface cleanly
+  as `textbox` and are typed via the role locator — no hand-built CSS selector needed.
+- Duplicate role+name nodes are disambiguated by occurrence order (nth) internally.
+- New elements since the last read are still `*`-prefixed (`*[N] button "..."`).
 
 ### Element Index Rules
-- Indices `[1], [2], [3]...` are assigned to interactive elements in DOM order
+- Indices `[1], [2], [3]...` are assigned to interactive a11y nodes in document order
 - Indices are **ephemeral** — they reset on each `read`/`navigate`/`click`/`scroll`
-- Always use the most recent indices from the last DOM read
+- Always use the most recent indices from the last read
 - If an action changes the page, the response includes refreshed indices
+
+### Fallback
+If `ariaSnapshot` throws or yields no interactive nodes, perception falls back to the
+legacy self-built DOM traversal (`stats.perception` reports `compressDOM-fallback`).
+This is a strangler-fig safety net, not the default path.
 
 ---
 
@@ -307,16 +312,16 @@ Typical: **95-99% reduction**. A 300KB HTML page compresses to ~3-5K tokens.
 node BA launch &
 sleep 2
 node BA navigate https://example.com
-# See [3]<a href="/pricing">Pricing</a> in output
+# See [3] link "Pricing" in the interactive-elements list
 node BA click 3
-# Now on pricing page with new DOM
+# Now on pricing page with a fresh a11y read
 ```
 
 ### Fill a Form
 
 ```bash
 node BA navigate https://example.com/contact
-# DOM shows: [5]<input name="email" placeholder="Email"> [6]<input name="name"> [7]<textarea> [8]<button>Send</button>
+# a11y read shows: [5] textbox "Email"  [6] textbox "Name"  [7] textbox "Message"  [8] button "Send"
 node BA type 5 "user@example.com"
 node BA type 6 "John Doe"
 node BA type 7 "Hello, I have a question about..."

@@ -34,7 +34,8 @@ const FIXTURE = 'data:text/html,' + encodeURIComponent(`
     <h1>Hello</h1>
     <button id="btn" onclick="document.getElementById('out').textContent='clicked'">Click Me</button>
     <div id="out"></div>
-    <input id="inp" placeholder="type here" />
+    <input id="inp" aria-label="type here" placeholder="type here" />
+    <div id="composer" contenteditable="true" role="textbox" aria-label="Message"></div>
   </body></html>
 `);
 
@@ -59,20 +60,34 @@ try {
   ok(nav.json && typeof nav.json.dom === 'string' && nav.json.dom.includes('Click Me'), 'navigate DOM contains button text');
   ok(nav.json && 'newElements' in nav.json, 'navigate reports newElements (diff engine wired)');
 
-  console.log('[read]');
+  console.log('[read — a11y perception]');
   const rd = run(['read']);
   ok(rd.code === 0, `read exits 0 (got ${rd.code})`);
-  ok(rd.json && rd.json.dom.includes('type here'), 'read DOM contains input placeholder');
+  // a11y perception: body is the ariaSnapshot tree (role+name), not [idx]<tag> DOM.
+  ok(rd.json && rd.json.dom.includes('button "Click Me"'), 'read body contains a11y node button "Click Me" (ariaSnapshot perception)');
+  ok(rd.json && rd.json.stats && rd.json.stats.perception === 'aria', `read used aria perception layer (got ${rd.json && rd.json.stats && rd.json.stats.perception})`);
 
-  console.log('[click]');
-  // find the button index from read output
-  const m = rd.json.dom.match(/\*?\[(\d+)\]<button/);
-  ok(!!m, `found button index in DOM (${m ? m[1] : 'none'})`);
+  console.log('[click — via a11y role locator]');
+  // ariaPerceive body: `[N] button "Click Me"` — extract the index for the button node
+  const m = rd.json.dom.match(/\*?\[(\d+)\] button "Click Me"/);
+  ok(!!m, `found button node index in a11y body (${m ? m[1] : 'none'})`);
   if (m) {
     const clk = run(['click', m[1]]);
     ok(clk.code === 0, `click exits 0 (got ${clk.code})`);
     ok(clk.json && clk.json.status === 'ok', 'click returns status:ok');
     ok(clk.json && 'settled' in clk.json, 'click reports settled flag (waitForCompletion wired)');
+  }
+
+  console.log('[type — into contenteditable role=textbox via a11y locator (ChatGPT composer case)]');
+  const rd2 = run(['read']);
+  const tm = rd2.json.dom.match(/\*?\[(\d+)\] textbox "Message"/);
+  ok(!!tm, `found contenteditable textbox "Message" node in a11y body (${tm ? tm[1] : 'none'})`);
+  if (tm) {
+    const typ = run(['type', tm[1], 'hello world']);
+    ok(typ.code === 0 && typ.json && typ.json.status === 'ok', `type into contenteditable exits 0 (got ${typ.code})`);
+    // verify the text actually landed (a11y getByRole().fill() worked on contenteditable)
+    const verify = run(['extract', '#composer']);
+    ok(verify.code === 0 && verify.stdout.includes('hello world'), 'contenteditable received the typed text (a11y fill worked)');
   }
 
   console.log('[wait — bare ms back-compat]');
