@@ -31,6 +31,8 @@ const baseProps = {
   referencedFiles: { written: [] },
   collapse: { railed: false, outputsCollapsed: false },
   setCollapse: vi.fn(),
+  isOpen: true,
+  onRevealCanvas: vi.fn(),
 };
 
 const { MIN_WIDTH, MAX_WIDTH, STORAGE_KEY, DEFAULT_FRACTION } = PANEL_CONSTANTS;

@@ -134,6 +134,19 @@ type FileViewerPanelProps = Omit<FileViewerProps, 'variant'> & {
   /** Patch the active tab's collapse state (Bug 2). Must be referentially stable —
    *  this component is memo'd on stable props (see the memo note at the bottom). */
   setCollapse: (p: Partial<CanvasCollapse>) => void;
+  /** Whether Canvas is OPEN on the active tab (= slice.file || slice.manuallyOpen,
+   *  useCanvasHost.ts). The panel is now ALWAYS mounted by ChatPage (the former
+   *  `{canvas.isOpen && …}` gate is gone) so an EMPTY tab still shows a resident
+   *  entry rail instead of a vanished column. isOpen=false → resident rail;
+   *  isOpen=true → the existing railed/full behavior. This does NOT change isOpen's
+   *  SEMANTICS (ChatHeader pill + agent SENSE still read file||manuallyOpen) — it
+   *  only selects which of the three render branches shows. */
+  isOpen: boolean;
+  /** Reveal (manually open) Canvas on the active tab — fired by clicking the
+   *  resident empty-state rail. Wired to useCanvasHost.reveal (= manuallyOpen:true
+   *  via the same per-tab patch() chokepoint as swarm:open-canvas). Must be
+   *  referentially stable (memo). */
+  onRevealCanvas: () => void;
 };
 
 function FileViewerPanelImpl({
@@ -144,6 +157,8 @@ function FileViewerPanelImpl({
   referencedFiles,
   collapse,
   setCollapse,
+  isOpen,
+  onRevealCanvas,
   ...props
 }: FileViewerPanelProps) {
   // Rail scope key = the owning TAB id (run_26aa6caa). props.tabScopeKey (the same
@@ -384,6 +399,61 @@ function FileViewerPanelImpl({
   // ── Collapsed rail: the whole Canvas as a thin clickable vertical strip ──
   // Click anywhere on it → expand. Vertical "Canvas · Outputs" + count carry the
   // accent (var(--color-primary)) so it still reads as belonging to the active tab.
+  // ── EMPTY-STATE RESIDENT RAIL (isOpen=false) — always-present Canvas entry point ──
+  // ChatPage now ALWAYS mounts this panel (the former `{canvas.isOpen && …}` gate is
+  // gone), so an empty tab (no file, not manually opened) must NOT show a vanished
+  // column — it shows a resident 38px rail. This branch MUST early-return BEFORE the
+  // full-panel render below (Gate-1 condition b): falling through would mount the
+  // heavy FileViewer/FileEditorCore (~1780L, see the memo note) in the empty state.
+  // Distinct from the `if (railed)` branch below: that is the collapsed-AFTER-open
+  // rail (data-testid=canvas-rail); this is the never-opened resident rail
+  // (data-testid=canvas-resident-rail). Clicking reveals (manuallyOpen) the Canvas.
+  // CanvasOutputRail stays MOUNTED-but-hidden so the count ("N files") is live even
+  // when the user never opened Canvas (same self-suppressing-count guard as railed).
+  if (!isOpen) {
+    return (
+      <div
+        className="relative flex-shrink-0 canvas-width-reveal"
+        style={{ width: RAIL_WIDTH, marginRight: PANEL_CONSTANTS.RIGHT_GAP, '--spout-tint': canvasTint } as CSSProperties}
+        data-testid="file-viewer-panel"
+      >
+        <div className="canvas-spout" aria-hidden="true" data-testid="canvas-spout" />
+        <button
+          type="button"
+          onClick={onRevealCanvas}
+          className="canvas-rail group w-full h-full flex flex-col items-center gap-3 pt-3 cursor-pointer border-l border-[var(--canvas-edge)]"
+          title="Open Canvas"
+          aria-label="Open Canvas"
+          data-testid="canvas-resident-rail"
+        >
+          <span className="material-symbols-outlined text-[18px] text-[var(--color-text-muted)] group-hover:text-[var(--color-text)]">chevron_left</span>
+          <span className="canvas-rail-text text-[11px] font-bold tracking-[0.12em] uppercase text-[var(--color-text)]">Canvas · Outputs</span>
+          {counts.total > 0 && (
+            <span
+              className="canvas-rail-text text-[11px] text-[var(--color-text-muted)]"
+              title={canvasCountTitle(counts.neu, counts.upd) || undefined}
+            >
+              {counts.total} file{counts.total !== 1 ? 's' : ''}
+              {counts.neu > 0 && <span className="text-[var(--color-git-added)]"> · {counts.neu} new</span>}
+              {counts.upd > 0 && <span className="text-[var(--color-git-modified)]"> · {counts.upd} mod</span>}
+            </span>
+          )}
+        </button>
+        {/* Rail-count must stay LIVE while closed: CanvasOutputRail is the ONLY source
+            of counts (onCounts→setCounts). Keep it MOUNTED-but-hidden (display:none)
+            so a file produced while Canvas was never opened still bumps the strip's
+            "N files" — otherwise the count freezes at 0 (self-suppressing-count class,
+            IMPROVEMENT.md:7). Zero-size, no visual footprint. Same shape as the railed
+            branch below. */}
+        {railTabId !== undefined && (
+          <div className="hidden" aria-hidden="true">
+            <CanvasOutputRail files={referencedFiles} onCounts={setCounts} selectedPath={selectedPath} />
+          </div>
+        )}
+      </div>
+    );
+  }
+
   if (railed) {
     return (
       <div
@@ -661,7 +731,9 @@ function FileViewerPanelImpl({
 // freezing input whenever Canvas is open. All props from the ChatPage call site
 // are referentially stable across a keystroke render (useCanvasHost callbacks are
 // useCallback dep-[patch]/[patch,activeTabId]; file/pinned/muted/isOpen from slice
-// state; sessionId/tabScopeKey primitive), so the default shallow compare blocks
+// state; sessionId/tabScopeKey primitive; the always-mounted-panel props isOpen
+// (primitive bool) + onRevealCanvas (useCallback dep-[patch]) are likewise stable),
+// so the default shallow compare blocks
 // the re-render. Do NOT remove without eliminating the ChatPage keystroke
 // re-render at its source (the deferred lift-input-state-down refactor).
 export default memo(FileViewerPanelImpl);

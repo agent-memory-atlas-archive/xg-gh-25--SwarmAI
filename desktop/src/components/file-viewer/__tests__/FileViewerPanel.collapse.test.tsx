@@ -38,6 +38,8 @@ const baseProps = {
   muted: false,
   onToggleMute: vi.fn(),
   referencedFiles: { written: [] },
+  isOpen: true,
+  onRevealCanvas: vi.fn(),
 };
 
 /** Controlled harness — mirrors the ChatPage/useCanvasHost seam: holds the per-tab

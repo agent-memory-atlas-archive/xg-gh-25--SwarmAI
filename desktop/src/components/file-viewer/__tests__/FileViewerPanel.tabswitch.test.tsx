@@ -39,7 +39,10 @@ vi.mock('../../services/api', () => ({
   },
 }));
 
-/** Mirror of the ChatPage seam: per-tab canvas file + activeTabId, panel gated on isOpen. */
+/** Mirror of the ChatPage seam (run_a263e967): the panel is ALWAYS mounted and
+ *  receives isOpen — an empty tab renders the resident rail (no file), NOT a
+ *  vanished column. The bleed assertion still holds: on an empty tab, isOpen=false
+ *  → the resident rail shows and NO file content (alpha.md) is visible. */
 function Harness() {
   const [activeTabId, setActiveTabId] = useState('tab-A');
   // per-tab canvas file (like useCanvasHost's slice.file, restored on switch)
@@ -53,20 +56,20 @@ function Harness() {
       <button data-testid="open-A" onClick={() => setFileByTab((m) => ({ ...m, 'tab-A': { filePath: 'a/alpha.md', fileName: 'alpha.md' } }))}>openA</button>
       <button data-testid="to-B" onClick={() => setActiveTabId('tab-B')}>toB</button>
       <button data-testid="to-A" onClick={() => setActiveTabId('tab-A')}>toA</button>
-      {isOpen && (
-        <FileViewerPanel
-          tabScopeKey={activeTabId}
-          initialFile={canvasFile ?? undefined}
-          onClose={() => setFileByTab((m) => ({ ...m, [activeTabId]: null }))}
-          pinned={false}
-          onTogglePin={vi.fn()}
-          muted={false}
-          onToggleMute={vi.fn()}
-          referencedFiles={{ written: [] }}
-          collapse={{ railed: false, outputsCollapsed: false }}
-          setCollapse={() => {}}
-        />
-      )}
+      <FileViewerPanel
+        tabScopeKey={activeTabId}
+        initialFile={canvasFile ?? undefined}
+        onClose={() => setFileByTab((m) => ({ ...m, [activeTabId]: null }))}
+        pinned={false}
+        onTogglePin={vi.fn()}
+        muted={false}
+        onToggleMute={vi.fn()}
+        referencedFiles={{ written: [] }}
+        collapse={{ railed: false, outputsCollapsed: false }}
+        setCollapse={() => {}}
+        isOpen={isOpen}
+        onRevealCanvas={vi.fn()}
+      />
     </div>
   );
 }
@@ -116,20 +119,20 @@ function HarnessBoth() {
     <div>
       <button data-testid="open-A" onClick={() => setFileByTab((m) => ({ ...m, 'tab-A': { filePath: 'a/alpha.md', fileName: 'alpha.md' } }))}>openA</button>
       <button data-testid="open-B-and-switch" onClick={() => { setFileByTab((m) => ({ ...m, 'tab-B': { filePath: 'b/beta.md', fileName: 'beta.md' } })); setActiveTabId('tab-B'); }}>openB+switch</button>
-      {isOpen && (
-        <FileViewerPanel
-          tabScopeKey={activeTabId}
-          initialFile={canvasFile ?? undefined}
-          onClose={() => setFileByTab((m) => ({ ...m, [activeTabId]: null }))}
-          pinned={false}
-          onTogglePin={vi.fn()}
-          muted={false}
-          onToggleMute={vi.fn()}
-          referencedFiles={{ written: [] }}
-          collapse={{ railed: false, outputsCollapsed: false }}
-          setCollapse={() => {}}
-        />
-      )}
+      <FileViewerPanel
+        tabScopeKey={activeTabId}
+        initialFile={canvasFile ?? undefined}
+        onClose={() => setFileByTab((m) => ({ ...m, [activeTabId]: null }))}
+        pinned={false}
+        onTogglePin={vi.fn()}
+        muted={false}
+        onToggleMute={vi.fn()}
+        referencedFiles={{ written: [] }}
+        collapse={{ railed: false, outputsCollapsed: false }}
+        setCollapse={() => {}}
+        isOpen={isOpen}
+        onRevealCanvas={vi.fn()}
+      />
     </div>
   );
 }

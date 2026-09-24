@@ -36,6 +36,8 @@ const baseProps = {
   referencedFiles: { written: [] },
   collapse: { railed: false, outputsCollapsed: false },
   setCollapse: vi.fn(),
+  isOpen: true,
+  onRevealCanvas: vi.fn(),
 };
 
 describe('FileViewerPanel — shell-bar redesign', () => {

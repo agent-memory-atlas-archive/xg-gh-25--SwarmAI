@@ -52,6 +52,11 @@ const STABLE = {
   // `collapse` + useCallback `setCollapse` — the real call site's stability contract).
   collapse: { railed: false, outputsCollapsed: false },
   setCollapse: () => {},
+  // Always-mounted-panel contract (run_a263e967): isOpen=true so this memo test
+  // exercises the real FileViewer body (not the resident rail). onRevealCanvas is a
+  // module-scope stable ref — mirrors useCanvasHost.reveal's useCallback stability.
+  isOpen: true,
+  onRevealCanvas: () => {},
 };
 
 beforeEach(() => {

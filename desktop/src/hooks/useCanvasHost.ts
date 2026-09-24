@@ -140,6 +140,13 @@ export interface CanvasHostApi {
   toggleMute: () => void;
   /** Close Canvas on the active tab (clear file + manuallyOpen). */
   close: () => void;
+  /** Reveal (manually open) Canvas on the active tab — fired by clicking the
+   *  resident empty-state rail (FileViewerPanel, isOpen=false branch). Sets
+   *  manuallyOpen:true via the SAME per-tab patch() chokepoint as swarm:open-canvas,
+   *  so it lands on the active tab's slice and never bleeds cross-tab. Does NOT
+   *  change isOpen's semantics (still file||manuallyOpen) — it just flips the flag
+   *  the resident rail exists to flip. useCallback-stable (memo'd panel prop). */
+  reveal: () => void;
   /** Live, synchronous snapshot of Canvas state for the send-time SENSE read
    *  (beats the async canvas-state emit race). Null when nothing to report. */
   getCanvasSnapshot: () => CanvasSnapshot | null;
@@ -205,6 +212,11 @@ export function useCanvasHost({ activeTabId, sessionId, isStreaming }: UseCanvas
   // intentionally per-tab-persistent: closing the panel must not discard the
   // knowledge that N outputs were produced (the ChatHeader pill still shows them).
   const close = useCallback(() => patch({ file: null, manuallyOpen: false }), [patch]);
+  // reveal — manually open Canvas on the active tab (resident empty-state rail click).
+  // Reuses patch() (the per-tab write chokepoint keyed on activeTabId) so it lands on
+  // the correct tab's slice, mirroring the swarm:open-canvas handler's manuallyOpen
+  // write. useCallback dep-[patch] so FileViewerPanel's load-bearing memo stays intact.
+  const reveal = useCallback(() => patch({ manuallyOpen: true }), [patch]);
 
   const isOpen = !!(slice.file || slice.manuallyOpen);
 
@@ -437,6 +449,7 @@ export function useCanvasHost({ activeTabId, sessionId, isStreaming }: UseCanvas
     togglePin,
     toggleMute,
     close,
+    reveal,
     getCanvasSnapshot,
   };
 }

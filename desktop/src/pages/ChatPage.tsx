@@ -461,8 +461,12 @@ export default function ChatPage() {
     return () => window.removeEventListener('swarm:editor-file-changed', handler);
   }, [mergeUiState]);
   // (b) Canvas state — swarm:canvas-state carries a CanvasSnapshot (open/count/
-  //     pin/mute/collapsed). ThreeColumnLayout emits {open:false,...} on close so
-  //     a stale count never lingers (Gate-1 CRITICAL: panel unmounts when closed).
+  //     pin/mute/collapsed). The emit fires {open:false,...} on close so a stale
+  //     count never lingers. NOTE: the panel is now ALWAYS mounted (run_a263e967 —
+  //     the {canvas.isOpen &&} gate was removed so an empty tab shows a resident
+  //     rail instead of vanishing), so this no longer relies on unmount-on-close;
+  //     the open/false snapshot is emitted from the always-mounted useCanvasHost
+  //     (isOpen = file||manuallyOpen), independent of whether the panel is mounted.
   useEffect(() => {
     const handler = (e: Event) => {
       mergeUiState({ canvas: (e as CustomEvent).detail as CanvasSnapshot | null });
@@ -3494,9 +3498,13 @@ export default function ChatPage() {
         {/* Canvas — the session's output surface (bugs 2+3). Mounted HERE, inside
             the flex row BELOW ChatHeader and to the RIGHT of the chat area, so it
             visibly belongs to the CURRENT tab (the tab bar spans above it). State
-            is per-tab via useCanvasHost. Renders only when this tab has a file OR
-            Canvas was manually opened. */}
-        {canvas.isOpen && (
+            is per-tab via useCanvasHost. ALWAYS mounted (run_a263e967): the former
+            `{canvas.isOpen && …}` gate made the right column VANISH on an empty tab;
+            now the panel is always present and renders a resident 38px entry rail
+            when !isOpen (see FileViewerPanel's isOpen=false branch). isOpen is passed
+            as a prop — its SEMANTICS are unchanged (ChatHeader pill + agent SENSE
+            still read canvas.isOpen), it only selects the panel's render branch. */}
+        {(
           <FileViewerPanel
             // tabScopeKey (NOT a React `key`): FileViewer keeps its OWN internal
             // tab list (useFileViewerTabs, append-only) that must clear on chat-tab
@@ -3516,6 +3524,8 @@ export default function ChatPage() {
             // (memoized slice + useCallback) so the load-bearing memo below is intact.
             collapse={canvas.collapse}
             setCollapse={canvas.setCollapse}
+            isOpen={canvas.isOpen}
+            onRevealCanvas={canvas.reveal}
           />
         )}
 

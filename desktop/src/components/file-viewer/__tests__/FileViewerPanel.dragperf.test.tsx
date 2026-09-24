@@ -74,6 +74,8 @@ const STABLE = {
   referencedFiles: { written: [] },
   collapse: { railed: false, outputsCollapsed: false },
   setCollapse: () => {},
+  isOpen: true,
+  onRevealCanvas: () => {},
 };
 
 function setInnerWidth(px: number) {
