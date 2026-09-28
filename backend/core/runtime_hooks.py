@@ -1001,31 +1001,119 @@ def _repo_root_for(dir_path: str) -> Optional[str]:
         return None
 
 
+def _candidate_review_repos(dir_path: str) -> list[str]:
+    """The git repos whose working-tree changes count as 'what this run touched':
+    the sub-agent's cwd repo AND the SwarmWS workspace repo. Returned as de-duped
+    realpath roots (a repo present under both keys is scanned once).
+
+    Why a UNION (run_a5999658): a pipeline is launched from the swarmai SOURCE repo,
+    but a workspace-resident project's code lives in the SEPARATE SwarmWS repo. The
+    adversarial sub-agent inherits the launch cwd, so a cwd-only diff misses the
+    SwarmWS files BUILD changed — the marker then can't cover them and the commit
+    gate DENYs forever. Scanning both captures the changes wherever they landed.
+    The workspace root is derived via get_app_data_dir() (honors SWARM_DATA_DIR) —
+    never a hardcoded home path — so tests/sandboxes pin a scratch repo.
+    """
+    roots: list[str] = []
+    seen: set[str] = set()
+
+    def _add(candidate: Optional[str]) -> None:
+        root = _repo_root_for(candidate) if candidate else None
+        if root is not None and root not in seen:
+            seen.add(root)
+            roots.append(root)
+
+    _add(dir_path)
+    try:
+        from config import get_app_data_dir  # local import: avoids a load-time cycle
+        _add(str(get_app_data_dir() / "SwarmWS"))
+    except Exception:
+        pass  # workspace unresolvable → just scan the cwd repo (no fail-open change)
+    return roots
+
+
 def _reviewed_paths_at_head(dir_path: str) -> Optional[list[str]]:
-    """The set of file paths the reviewer's working tree changed vs HEAD, as
-    ABSOLUTE realpaths (repo-root-resolved). TRI-STATE — the caller stores the
-    result by KEY PRESENCE, never truthiness:
-      - None  → git unavailable / not a repo / error → caller OMITS reviewed_paths
-                (path-less marker = unbounded coverage, back-compat).
-      - []    → git ran, working tree clean → reviewed NOTHING → caller stores []
-                (bounds coverage to the empty set; NOT unbounded).
-      - [abs] → git ran, these paths changed.
+    """The set of file paths the review touched vs HEAD, as ABSOLUTE realpaths,
+    UNIONED across the candidate repos (cwd repo + SwarmWS workspace). TRI-STATE —
+    the caller stores the result by KEY PRESENCE, never truthiness:
+      - None  → EVERY candidate repo is git-unavailable / not a repo / error →
+                caller OMITS reviewed_paths (path-less marker = unbounded, back-compat).
+      - []    → at least one repo was reachable AND all reachable repos are clean →
+                reviewed NOTHING → bounds coverage to the empty set (NOT unbounded).
+      - [abs] → the union of changed paths across the reachable candidate repos.
+
+    Fail-open red-line (RP50 / the C2 hole): None is returned ONLY when NO candidate
+    repo could be queried at all — never to paper over one ambiguous/clean repo. A
+    reachable-but-clean repo yields [] (bounded), keeping the gate's diff-bind honest.
     """
     import os
-    root = _repo_root_for(dir_path)
-    if root is None:
-        return None
-    try:
-        r = subprocess.run(
-            ["git", "-C", root, "diff", "--name-only", "HEAD"],
-            capture_output=True, text=True, timeout=_GIT_CAPTURE_TIMEOUT,
-        )
+    roots = _candidate_review_repos(dir_path)
+    if not roots:
+        return None  # nothing resolvable → unbounded (back-compat)
+
+    union: list[str] = []
+    seen: set[str] = set()
+    any_reachable = False
+    for root in roots:
+        try:
+            # `git status --porcelain=v1 -z` — NOT `git diff HEAD` — so BUILD's NEW
+            # files (untracked) are captured too. A brand-new handler.py is untracked
+            # until something `git add`s it; `git diff HEAD` shows only tracked changes
+            # and would silently miss exactly the files a fresh BUILD creates.
+            #
+            # -z is LOAD-BEARING (Gate-2 HIGH): without it, git C-quotes paths with
+            # spaces/non-ASCII (`"my file.py"`) while the gate's PENDING side uses
+            # `git diff --name-only` which does NOT quote — the two absolute paths then
+            # differ by the quote chars, `covered` never contains the pending path, and
+            # a genuinely-reviewed commit is falsely DENIED. -z emits RAW unquoted paths
+            # NUL-separated, byte-for-byte matching the diff side.
+            r = subprocess.run(
+                ["git", "-C", root, "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                capture_output=True, text=True, timeout=_GIT_CAPTURE_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            # LOUD, never silent (SOUL P4): a timed-out candidate repo is skipped, which
+            # drops its changed files from coverage → a legitimately-reviewed commit in
+            # THAT repo would be DENIED (the original cross-repo bug, resurrected). On a
+            # huge workspace `git status --untracked-files=all` can exceed the cap; if
+            # this WARNs in production, raise _GIT_CAPTURE_TIMEOUT or narrow untracked
+            # scope — do NOT let the skip stay invisible.
+            logger.warning(
+                "[reviewed-paths] `git status` timed out (>%ss) for candidate repo %s — "
+                "its changed paths are EXCLUDED from adversarial coverage this marker; a "
+                "reviewed commit there may be falsely DENIED. Raise _GIT_CAPTURE_TIMEOUT "
+                "if this recurs.", _GIT_CAPTURE_TIMEOUT, root,
+            )
+            continue  # other candidates may still answer
+        except (OSError, subprocess.SubprocessError):
+            continue  # this repo unavailable → skip it, but others may answer
         if r.returncode != 0:
-            return None  # git couldn't answer → unbounded (distinct from clean=[])
-        rels = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
-        return [os.path.realpath(os.path.join(root, rel)) for rel in rels]
-    except (OSError, subprocess.SubprocessError):
-        return None
+            continue  # git couldn't answer for this repo → skip (not a global None)
+        any_reachable = True
+        # -z format: each entry is `XY <path>\0`; a rename/copy (R/C) is
+        # `XY <new>\0<old>\0` — the NEW path comes FIRST, then a separate NUL-terminated
+        # old path. We iterate NUL fields, take each status-bearing field's path, and
+        # skip the bare old-path field that trails a rename/copy.
+        fields = [f for f in r.stdout.split("\0") if f]
+        i = 0
+        while i < len(fields):
+            entry = fields[i]
+            status = entry[:2]
+            rel = entry[3:]  # 2 status chars + 1 space, then the RAW (unquoted) path
+            if rel:
+                abs_path = os.path.realpath(os.path.join(root, rel))
+                if abs_path not in seen:
+                    seen.add(abs_path)
+                    union.append(abs_path)
+            # a rename/copy consumes the following NUL field (the old path) — skip it
+            if status and (status[0] in ("R", "C") or status[1] in ("R", "C")):
+                i += 2
+            else:
+                i += 1
+
+    if not any_reachable:
+        return None  # EVERY candidate repo failed git → unbounded (back-compat)
+    return union  # possibly [] (all reachable repos clean) — bounded, never None
 
 
 def create_subagent_capture_hook(

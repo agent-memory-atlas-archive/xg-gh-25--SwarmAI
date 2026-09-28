@@ -46,6 +46,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2834,6 +2835,48 @@ def cmd_run_surface_changes(args, reg: ArtifactRegistry) -> None:
     print(json.dumps(buckets.as_dict()))
 
 
+def _rev_parse_toplevel(cwd: str) -> str | None:
+    """`git -C <cwd> rev-parse --show-toplevel`, or None if not a repo / git error."""
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd, capture_output=True, text=True, timeout=10,
+        )
+        return r.stdout.strip() if r.returncode == 0 else None
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def _repo_root_for_file(path: str) -> str | None:
+    """Resolve a files_touched entry to its owning git repo root.
+
+    ABSOLUTE path: resolve from the file's own parent (unchanged, back-compat).
+    RELATIVE path (run_a5999658): a files_touched entry recorded relative to a
+    workspace-resident project won't resolve against the process cwd (= the swarmai
+    launch repo). Try cwd first (back-compat), then the SwarmWS workspace, returning
+    the repo where the file ACTUALLY exists — so run-commit binds it to the owning
+    repo instead of dropping it as a ghost. get_app_data_dir() honors SWARM_DATA_DIR
+    (test/sandbox parity) — never a hardcoded home path.
+    """
+    p = Path(path)
+    if p.is_absolute():
+        return _rev_parse_toplevel(str(p.parent))
+    candidates = [str(Path.cwd())]
+    try:
+        from config import get_app_data_dir
+        candidates.append(str(get_app_data_dir() / "SwarmWS"))
+    except Exception:
+        pass
+    for base in candidates:
+        if (Path(base) / path).exists():
+            root = _rev_parse_toplevel(str((Path(base) / path).parent))
+            if root:
+                return root
+    # No candidate holds the file → cwd repo root (back-compat: a genuinely
+    # cwd-relative not-yet-existing file still resolves as before).
+    return _rev_parse_toplevel(str(Path.cwd()))
+
+
 def _path_exists_in_repo(f: str, root: str) -> bool:
     """True if the run-recorded path ``f`` exists on disk, anchored to the resolved
     repo ``root`` (run_14e560ed, Gate-2 HIGH).
@@ -2969,23 +3012,12 @@ def cmd_run_commit(args, reg: ArtifactRegistry) -> None:
         sys.exit(2)
 
     # ── Resolve each file to its git repo root; group so multi-repo runs get
-    #    one commit per repo. Never `git add -A`. ────────────────────────────
-    def _repo_root(path: str) -> str | None:
-        p = Path(path)
-        cwd = str(p.parent if p.is_absolute() else Path.cwd())
-        try:
-            r = subprocess.run(
-                ["git", "rev-parse", "--show-toplevel"],
-                cwd=cwd, capture_output=True, text=True, timeout=10,
-            )
-            return r.stdout.strip() if r.returncode == 0 else None
-        except (subprocess.TimeoutExpired, OSError):
-            return None
-
+    #    one commit per repo. Never `git add -A`. (Resolver is module-level
+    #    _repo_root_for_file — testable + shared; run_a5999658.) ───────────────
     by_repo: dict[str, list[str]] = defaultdict(list)
     unresolved: list[str] = []
     for f in files_touched:
-        root = _repo_root(f)
+        root = _repo_root_for_file(f)
         if root:
             by_repo[root].append(f)
         else:

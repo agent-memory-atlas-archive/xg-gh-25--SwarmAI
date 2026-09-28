@@ -2283,6 +2283,11 @@ class TestReviewedPathsCapture:
         import subprocess
         env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t", "HOME": str(d), "PATH": __import__("os").environ.get("PATH", "")}
         subprocess.run(["git", "init", "-q"], cwd=str(d), env=env, check=True)
+        # HOME is pointed at the repo dir (test isolation), so git-defender / tooling
+        # writes its cache + logs INTO the working tree. A real repo gitignores such
+        # tooling noise; mirror that so `git status --porcelain` (the marker's scan,
+        # run_a5999658) sees only real code changes, not .git-defender/*.log artifacts.
+        (d / ".gitignore").write_text(".git-defender/\n*.log\n.cache/\n")
         (d / "a.py").write_text("x = 1\n")
         (d / "b.py").write_text("y = 2\n")
         subprocess.run(["git", "add", "-A"], cwd=str(d), env=env, check=True)
@@ -2292,6 +2297,11 @@ class TestReviewedPathsCapture:
     @pytest.mark.asyncio
     async def test_reviewed_paths_captured_when_changes(self, tmp_path, monkeypatch):
         import core.runtime_hooks as rh, json, os
+        # Isolate the SwarmWS workspace candidate repo (run_a5999658 multi-repo scan):
+        # point get_app_data_dir() at a scratch dir with no SwarmWS repo, so this test
+        # exercises ONLY the cwd repo (its single-repo intent) — otherwise the real
+        # ~/.swarm-ai/SwarmWS working tree would union in and break the exact-match.
+        monkeypatch.setenv("SWARM_DATA_DIR", str(tmp_path / "no_workspace"))
         repo = tmp_path / "repo"; repo.mkdir()
         self._init_repo(repo)
         (repo / "a.py").write_text("x = 999\n")  # modify one tracked file
@@ -2311,6 +2321,9 @@ class TestReviewedPathsCapture:
     async def test_reviewed_paths_empty_on_clean_tree(self, tmp_path, monkeypatch):
         """git ok but no changes → reviewed_paths == [] (covers nothing, NOT unbounded)."""
         import core.runtime_hooks as rh, json
+        # Isolate the workspace candidate repo (see the sibling test) so a clean cwd
+        # repo yields [] rather than unioning the real ~/.swarm-ai/SwarmWS working tree.
+        monkeypatch.setenv("SWARM_DATA_DIR", str(tmp_path / "no_workspace"))
         repo = tmp_path / "repo"; repo.mkdir()
         self._init_repo(repo)  # clean tree after commit
         monkeypatch.setattr(rh, "_PIPELINE_AUDIT_DIR", tmp_path / "audit")
