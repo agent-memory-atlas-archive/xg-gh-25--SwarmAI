@@ -31,6 +31,7 @@ import anyio
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
+from core.needs_human_review import needs_human_review_batch
 from core.swarm_workspace_manager import swarm_workspace_manager
 from database import db
 
@@ -56,24 +57,13 @@ for _type_name, _extensions in EXTENSION_TYPE_MAP.items():
     for _ext in _extensions:
         _EXT_TO_TYPE[_ext] = _type_name
 
-# Directories that contain user-facing session output (positive filter).
-# Only files under these prefixes appear in the Radar Artifacts section.
-_ARTIFACT_DIRS: tuple[str, ...] = (
-    "Knowledge/",
-    "Designs/",
-    "Notes/",
-    "Projects/",
-    "Attachments/",
-)
-
-# Exact filenames to always exclude even if they match a directory above.
-_EXCLUDED_NAMES: set[str] = {
-    "L1_SYSTEM_PROMPTS.md",
-    "L0_SYSTEM_PROMPTS.md",
-}
-
-# Extensions to always exclude (logs, lockfiles, etc.).
-_EXCLUDED_EXTENSIONS: set[str] = {".log", ".lock", ".pyc"}
+# Membership scope is NOT a directory allowlist here. It is delegated to the SAME
+# source-of-truth the Canvas OUTPUTS rail uses — the `needs_human_review` `kind`
+# verdict (see _parse_git_log). This is deliberate: the Artifacts list is the
+# human-facing product list, so "what counts as a product" must be answered ONCE,
+# by the shared classifier, not by a second directory allowlist that drifts from the
+# rail. A former 5-dir allowlist (_ARTIFACT_DIRS) + _is_artifact_file lived here and
+# was removed for exactly that reason (P8: one brain, many doors — one entry rule).
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -124,48 +114,28 @@ def _classify_extension(file_path: str) -> str:
     return _EXT_TO_TYPE.get(ext, "other")
 
 
-def _is_artifact_file(file_path: str) -> bool:
-    """Return True if the file is a user-facing session output artifact.
-
-    Filters to files under Knowledge/, Designs/, Notes/, Projects/, or
-    Attachments/. Excludes log files, cache files, and system-generated
-    files like L1_SYSTEM_PROMPTS.md.
-    """
-    name = Path(file_path).name
-    ext = Path(file_path).suffix.lower()
-
-    # Exclude by extension
-    if ext in _EXCLUDED_EXTENSIONS:
-        return False
-
-    # Exclude specific system filenames
-    if name in _EXCLUDED_NAMES:
-        return False
-
-    # Exclude hidden directories (e.g. .context/, .claude/)
-    if any(part.startswith(".") for part in Path(file_path).parts):
-        return False
-
-    # Positive filter: must be under a known artifact directory.
-    # Use Path.parts[0] instead of str.startswith() to avoid false matches
-    # on paths like "Knowledge_backup/foo.md" matching "Knowledge/".
-    parts = Path(file_path).parts
-    if len(parts) < 2:
-        # Bare filename (no parent directory) — not under any artifact dir
-        return False
-    first_dir = parts[0] + "/"
-    return first_dir in _ARTIFACT_DIRS
-
-
-def _parse_git_log(raw_output: str) -> list[dict[str, str]]:
-    """Parse raw ``git log`` output into deduplicated artifact records.
+def _parse_git_log(raw_output: str, workspace_path: str) -> list[dict[str, str]]:
+    """Parse raw ``git log`` output into deduplicated, scope-filtered artifact records.
 
     The git log format ``--format=%aI`` produces alternating blocks:
     an ISO timestamp line followed by one or more file path lines,
     separated by blank lines.
 
+    **Membership scope = the Canvas OUTPUTS rail SSOT.** Rather than a private
+    directory allowlist, a candidate path is kept iff ``needs_human_review`` classifies
+    its ``kind`` as ``content`` or ``knowledge`` — exactly the human-facing set the
+    Canvas rail surfaces (``railSsot.isRailKind`` drops ``process`` and ``source``). A
+    ``source`` path (a bound-worktree code file) and a ``process`` path (dot-dir /
+    machine noise) are dropped, so the Artifacts list and the Canvas rail agree on what
+    a "product" is. Classification runs in ONE batch (one check-ignore subprocess per
+    tree) and fails CLOSED (an unclassifiable path → ``process`` → dropped).
+
     Args:
-        raw_output: Raw stdout from ``git log``.
+        raw_output: Raw stdout from ``git log`` (run with ``cwd=workspace_path``, so
+            paths are workspace-relative).
+        workspace_path: Absolute workspace root — passed as ``swarmws_root`` so the
+            relative paths resolve against the right tree (load-bearing; omitting it
+            would resolve paths against the process cwd and misclassify everything).
 
     Returns:
         List of dicts with ``path``, ``title``, ``type``, ``modified_at``
@@ -177,6 +147,8 @@ def _parse_git_log(raw_output: str) -> list[dict[str, str]]:
     # Strict ISO 8601 pattern: YYYY-MM-DDTHH:MM:SS±HH:MM (or Z)
     iso_pattern = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}')
 
+    # Phase 1 — collect EVERY candidate path (dedup by newest timestamp). No membership
+    # filter yet; that is a single batch call below.
     for line in raw_output.splitlines():
         stripped = line.strip()
         if not stripped:
@@ -199,12 +171,23 @@ def _parse_git_log(raw_output: str) -> list[dict[str, str]]:
 
         # File path line — only record if we have a timestamp
         if current_timestamp and stripped:
-            if stripped not in seen and _is_artifact_file(stripped):
+            if stripped not in seen:
                 seen[stripped] = current_timestamp
 
-    # Build response sorted by timestamp descending
+    if not seen:
+        return []
+
+    # Phase 2 — one batch classification; keep only human-facing product kinds
+    # (content/knowledge), matching the Canvas rail. `swarmws_root` is load-bearing:
+    # git-log paths are workspace-relative, so they must resolve against the workspace
+    # root, not the process cwd.
+    verdicts = needs_human_review_batch(list(seen.keys()), swarmws_root=workspace_path)
+
     artifacts = []
     for file_path, timestamp in seen.items():
+        verdict = verdicts.get(file_path)
+        if verdict is None or verdict.kind not in ("content", "knowledge"):
+            continue
         artifacts.append({
             "path": file_path,
             "title": Path(file_path).name,
@@ -290,7 +273,7 @@ async def get_recent_artifacts(
         )
         return []
 
-    artifacts = _parse_git_log(result.stdout)
+    artifacts = _parse_git_log(result.stdout, workspace_path)
     return [ArtifactResponse(**a) for a in artifacts[:limit]]
 
 
