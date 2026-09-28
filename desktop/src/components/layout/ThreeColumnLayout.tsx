@@ -225,7 +225,7 @@ function LeftSidebar() {
           title="History"
           data-testid="history-row"
         >
-          <span className="w-4 flex items-center justify-center opacity-85"><NavSvgIcon name="history" /></span>
+          <span data-testid="history-row-icon" className="w-4 flex items-center justify-center opacity-85"><NavSvgIcon name="history" /></span>
           <span className="flex-1 text-left text-[11.5px] font-mono tracking-wide">History</span>
           <span className="text-[13px] text-[var(--color-text-faint)]">›</span>
         </button>
@@ -239,7 +239,10 @@ function LeftSidebar() {
           title="Artifacts"
           data-testid="artifacts-row"
         >
-          <span className="w-4 flex items-center justify-center opacity-85"><NavSvgIcon name="inventory_2" /></span>
+          {/* Fixed accent color (always-on, theme-tracked) — emphasizes the new
+              twin entry vs the muted History icon. NavSvgIcon strokes currentColor,
+              so an inline color on the wrapper tints the glyph. */}
+          <span data-testid="artifacts-row-icon" className="w-4 flex items-center justify-center" style={{ color: 'var(--color-primary)' }}><NavSvgIcon name="inventory_2" /></span>
           <span className="flex-1 text-left text-[11.5px] font-mono tracking-wide">Artifacts</span>
           <span className="text-[13px] text-[var(--color-text-faint)]">›</span>
         </button>

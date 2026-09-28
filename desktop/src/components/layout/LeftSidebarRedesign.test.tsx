@@ -110,6 +110,19 @@ describe('LeftSidebar A10 — chat hero + history', () => {
     expect(history.compareDocumentPosition(artifacts) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
+  // AC1: the Artifacts entry icon carries a FIXED accent color (always-on, not
+  // hover/active-gated) — the new twin entry is emphasized vs the muted History
+  // icon. Verified by an inline accent color on the icon wrapper.
+  it('gives the Artifacts row icon a fixed accent color (History icon stays muted)', () => {
+    renderSidebar();
+    const artIcon = screen.getByTestId('artifacts-row-icon');
+    // Always-on accent color inline style (var-based so it tracks the theme).
+    expect(artIcon.getAttribute('style') || '').toContain('var(--color-primary)');
+    // History icon must NOT carry the accent — it stays the muted default.
+    const histIcon = screen.getByTestId('history-row-icon');
+    expect(histIcon.getAttribute('style') || '').not.toContain('var(--color-primary)');
+  });
+
   // run_2bdc68ad — the 🔔 Alerts "Needs You" pill lives in a fixed left-chrome
   // slot (ChatPage portals the pill into this node), not on the tab row.
   it('renders the Alerts "Needs You" portal slot in the sidebar header, above the nav zone', () => {

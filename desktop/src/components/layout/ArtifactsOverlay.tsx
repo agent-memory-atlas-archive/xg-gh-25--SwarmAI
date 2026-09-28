@@ -27,7 +27,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { radarService } from '../../services/radar';
 import type { RadarArtifact } from '../../pages/chat/components/RightSidebar/types';
-import { fileIcon } from '../../utils/fileUtils';
+import { fileIcon, fileIconColor } from '../../utils/fileUtils';
 
 /** The window CustomEvent that opens a file in the current tab's Canvas.
  *  Same name LibraryOverlay/BrainHub dispatch — do NOT rename (proprioception contract). */
@@ -298,20 +298,25 @@ export function ArtifactsContent({ close, fetchArtifacts }: ArtifactsContentProp
                   onClick={() => openRow(a)}
                   title={a.path}
                   data-testid="artifacts-row"
-                  className="group w-full flex items-center gap-2.5 h-9 px-2.5 rounded-lg hover:bg-[var(--color-hover)] transition-colors text-left"
+                  className="group w-full flex items-center gap-2.5 h-11 px-2.5 rounded-lg hover:bg-[var(--color-hover)] transition-colors text-left"
                 >
+                  {/* Per-file-type color via the existing fileIconColor() SSOT (same
+                      helper the Workspace Explorer uses) — same-type→same-color, so
+                      the list reads as "scan by type", not a rainbow. */}
                   <span
-                    className="material-symbols-outlined shrink-0 text-[16px] leading-none text-[var(--color-text-muted)]"
+                    data-testid={`artifacts-row-icon-${a.path}`}
+                    className="material-symbols-outlined shrink-0 text-[16px] leading-none"
+                    style={{ color: fileIconColor(baseName(a.path)) }}
                     aria-hidden="true"
                   >
                     {fileIcon(baseName(a.path))}
                   </span>
-                  <span className="flex flex-col min-w-0 flex-1">
-                    <span className="text-[12.5px] text-[var(--color-text)] truncate">
+                  <span className="flex flex-col min-w-0 flex-1 gap-0.5">
+                    <span className="text-[12.5px] text-[var(--color-text)] truncate leading-tight">
                       {baseName(a.path)}
                     </span>
                     {parentDir(a.path) && (
-                      <span className="text-[9.5px] text-[var(--color-text-faint)] truncate">
+                      <span className="text-[9px] text-[var(--color-text-faint)] opacity-[0.72] truncate leading-tight">
                         {parentDir(a.path)}
                       </span>
                     )}

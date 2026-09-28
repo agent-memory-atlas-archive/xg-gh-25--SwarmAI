@@ -119,6 +119,21 @@ describe('ArtifactsContent', () => {
     expect(screen.getAllByText('Knowledge/Reports').length).toBeGreaterThan(0);
   });
 
+  it('AC-color: each row icon is colored by fileIconColor(name) (reuses the Explorer SSOT, not hardcoded muted)', async () => {
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchArtifacts={fetchArtifacts} />);
+    await waitFor(() => expect(screen.getAllByTestId('artifacts-row').length).toBeGreaterThan(0));
+    // .py → python var; .md → markdown var; .png → image var — proves per-type coloring
+    // via the existing fileIconColor() helper, keyed by extension.
+    const pyIcon = screen.getByTestId('artifacts-row-icon-backend/routers/artifacts.py');
+    expect(pyIcon.getAttribute('style') || '').toContain('var(--color-icon-python)');
+    const mdIcon = screen.getByTestId('artifacts-row-icon-Projects/SwarmAI/TECH.md');
+    expect(mdIcon.getAttribute('style') || '').toContain('var(--color-icon-markdown)');
+    const pngIcon = screen.getByTestId('artifacts-row-icon-Attachments/banner.png');
+    expect(pngIcon.getAttribute('style') || '').toContain('var(--color-icon-image)');
+    // And NOT the old hardcoded muted class token as the color source.
+    expect(pyIcon.className).not.toContain('text-[var(--color-text-muted)]');
+  });
+
   it('AC3: clicking a row dispatches swarm:open-file with the path AND calls close()', async () => {
     const onOpen = vi.fn();
     document.addEventListener(OPEN_FILE_EVENT, onOpen as EventListener);
