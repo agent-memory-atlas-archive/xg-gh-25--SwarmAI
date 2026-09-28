@@ -80,6 +80,10 @@ UI_COMMAND_ALLOWLIST: dict[str, UiCommandEntry] = {
     "show-pipeline": {"event": "swarm:show-pipeline", "target": "window"},
     "show-pollinate": {"event": "swarm:show-pollinate", "target": "window"},
     "show-history": {"event": "swarm:show-history", "target": "window"},
+    # Artifacts — History's twin: opens the recent-artifacts selector overlay
+    # (read-only; a row click opens a file in the current-tab Canvas). Payload-less
+    # show-only, same safety class as show-history.
+    "show-artifacts": {"event": "swarm:show-artifacts", "target": "window"},
     "show-todo": {"event": "swarm:show-todo", "target": "window"},
     "show-jobs": {"event": "swarm:show-jobs", "target": "window"},
     # Capabilities domain (run_b5d98151) — opens the CapabilitiesOverlay

@@ -31,6 +31,7 @@ export const ALL_SHOW_EVENTS = [
   'swarm:show-pipeline',
   'swarm:show-pollinate',
   'swarm:show-history',
+  'swarm:show-artifacts',
   'swarm:show-todo',
   'swarm:show-jobs',
   'swarm:show-capabilities',

@@ -36,6 +36,7 @@ export const OVERLAY_IDS = [
   'new-brain',
   // WORK region
   'history',
+  'artifacts',
   'todo',
   'jobs',
   'pipeline',

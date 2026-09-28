@@ -17,6 +17,7 @@ import { CMBrainContent } from './CMBrainOverlay';
 import { LibraryContent } from './LibraryOverlay';
 import { NewBrainContent } from './NewBrainOverlay';
 import { HistoryContent } from './HistoryOverlay';
+import { ArtifactsContent } from './ArtifactsOverlay';
 import { ToDoContent } from './ToDoOverlay';
 import { NeedYouContent } from './NeedYouOverlay';
 import { CommunityContent } from './CommunityOverlay';
@@ -161,6 +162,20 @@ registerOverlay({
       close={close}
     />
   ),
+});
+
+// ── artifacts (recent-artifacts selector) ───────────────────────────────────────────────
+// History's twin: browses recent FILES (git-derived /artifacts/recent) instead of past
+// conversations. Pure SELECTOR — a row click dispatches swarm:open-file (→ current-tab
+// Canvas) then closes; no preview pane (Canvas is the sole file viewer). width:'m' fits
+// a single-column list + search + type chips (Gate-1 density call).
+registerOverlay({
+  id: 'artifacts',
+  title: 'Artifacts',
+  mode: 'ARTIFACTS',
+  width: 'm',
+  sourceCardTestId: 'artifacts-row',
+  render: ({ close }) => <ArtifactsContent close={close} />,
 });
 
 // ── WORKBENCH FOUR (M4) ───────────────────────────────────────────────────────────────

@@ -122,6 +122,10 @@ const SURFACES: Array<{ event: string; testid: string; label: string }> = [
   // Community (run_5165013e) — fetches via api.get (mocked reject-safe above), so
   // it mounts to its empty state; the ACT contract is "the event opens the surface".
   { event: 'swarm:show-community', testid: 'community-overlay', label: 'Community' },
+  // Artifacts (History's twin) — fetches recent artifacts via api.get (mocked
+  // reject-safe above → mounts to its error/empty state); the ACT contract is that
+  // the show-event opens the surface through the real registry.
+  { event: 'swarm:show-artifacts', testid: 'artifacts-overlay', label: 'Artifacts' },
 ];
 
 describe('OverlayHost E2E — swarm:show-<id> OPENS the mapped real surface (agent ACT contract)', () => {

@@ -101,6 +101,15 @@ describe('LeftSidebar A10 — chat hero + history', () => {
     expect(screen.getByTestId('history-row')).toBeInTheDocument();
   });
 
+  it('renders an Artifacts row (History twin) directly under the History row', () => {
+    renderSidebar();
+    const history = screen.getByTestId('history-row');
+    const artifacts = screen.getByTestId('artifacts-row');
+    expect(artifacts).toBeInTheDocument();
+    // Artifacts must follow History in DOM order (the twin sits directly under it).
+    expect(history.compareDocumentPosition(artifacts) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   // run_2bdc68ad — the 🔔 Alerts "Needs You" pill lives in a fixed left-chrome
   // slot (ChatPage portals the pill into this node), not on the tab row.
   it('renders the Alerts "Needs You" portal slot in the sidebar header, above the nav zone', () => {

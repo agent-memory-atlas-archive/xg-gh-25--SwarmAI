@@ -230,6 +230,20 @@ function LeftSidebar() {
           <span className="text-[13px] text-[var(--color-text-faint)]">›</span>
         </button>
 
+        {/* Artifacts row — History's twin: browses recent FILES (not conversations).
+            Opens the artifacts overlay via OverlayHost; the host re-derives this row's
+            rect from its testid (sourceCardTestId: 'artifacts-row') for the spout. */}
+        <button
+          className="a10-histrow mt-0.5 w-full flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-[var(--color-text-muted)] hover:bg-[var(--color-hover)] hover:text-[var(--color-text)] transition-colors"
+          onClick={() => { if (activeModal) closeModal(); openOverlay('artifacts'); }}
+          title="Artifacts"
+          data-testid="artifacts-row"
+        >
+          <span className="w-4 flex items-center justify-center opacity-85"><NavSvgIcon name="inventory_2" /></span>
+          <span className="flex-1 text-left text-[11.5px] font-mono tracking-wide">Artifacts</span>
+          <span className="text-[13px] text-[var(--color-text-faint)]">›</span>
+        </button>
+
         {/* 🔔 Alerts "Needs You" slot — a stable, fixed-width portal target
             (run_2bdc68ad). The AlertsPill itself is owned + rendered by ChatPage
             (which holds the useRadarAttention poll + the tab callbacks) and
