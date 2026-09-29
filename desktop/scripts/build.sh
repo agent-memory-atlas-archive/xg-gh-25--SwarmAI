@@ -78,9 +78,16 @@ echo "----------------------------------------"
 # stays mounted and blocks future builds (hdiutil can't convert while mounted).
 if [[ "$OSTYPE" == "darwin"* ]]; then
     echo "Checking for stale DMG mounts..."
-    stale_devs=$(hdiutil info 2>/dev/null | awk -v pat="rw\\..*SwarmAI" '
+    # Match any volume whose image-path points at a SwarmAI .dmg under this repo's
+    # bundle dir — covers BOTH tauri's temp `rw.*.dmg` (blocks hdiutil convert
+    # mid-build) AND the FINAL product volume `SwarmAI` from a prior build (which
+    # the old `rw\..*SwarmAI` pattern missed, so it survived across builds and got
+    # re-opened stale — run_a8af14f2). Scoped to this repo's bundle path so a
+    # user's Downloads-copy volume of the same name is never detached.
+    bundle_dir="$PROJECT_ROOT/src-tauri/target/release/bundle"
+    stale_devs=$(hdiutil info 2>/dev/null | awk -v pat="$bundle_dir" '
         /^===/ { in_section=0 }
-        $0 ~ pat { in_section=1 }
+        /^image-path/ { in_section = (index($0, pat) > 0) }
         in_section && /^\/dev\/disk/ { print $1 }
     ' | sed 's/s[0-9]*$//' | sort -u || true)
     if [[ -n "$stale_devs" ]]; then
@@ -143,27 +150,62 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     if [ -z "$CI" ] && [ -z "$SWARMAI_SKIP_DMG_OPEN" ] && [ -d "$DMG_PATH" ]; then
         dmg_file="$(ls -t "$DMG_PATH"/*.dmg 2>/dev/null | head -1)"
         if [ -n "$dmg_file" ]; then
-            # Reuse an existing mount of this exact image rather than stacking a
-            # second "SwarmAI 1" volume next to it.
-            mount_point="$(hdiutil info 2>/dev/null | awk -v img="$dmg_file" '
+            # ── STALE-VOLUME ROOT FIX (run_a8af14f2) ──────────────────────────
+            # The DMG filename is CONSTANT (SwarmAI_<ver>_<arch>.dmg, from tauri
+            # productName+version) and rebuilt IN-PLACE. A volume mounted from a
+            # PRIOR build therefore reports the SAME `image-path` string as the
+            # freshly-overwritten dmg_file — so the old "reuse the mount whose
+            # image-path == dmg_file" logic re-opened the STALE volume (old app
+            # contents) and never saw the new bytes on disk. Overwriting a file
+            # does NOT re-mount an already-mounted volume.
+            #
+            # Fix: DETACH any volume mounted from this exact image-path FIRST
+            # (matched by path, so a same-named Downloads-copy volume pointing at
+            # a different .dmg is never touched), VERIFY it is gone, THEN attach
+            # the fresh file. If detach fails (Finder is holding the volume open),
+            # do NOT attach — a force-attach would stack a second "SwarmAI 1"
+            # volume (worse than the bug). Tell the user to eject + retry instead.
+            stale_dev="$(hdiutil info 2>/dev/null | awk -v img="$dmg_file" '
                 /^image-path/ { p = $0; sub(/^image-path[ \t]*:[ \t]*/, "", p); cur = (p == img) }
-                cur && /^\/dev\/disk/ && index($0, "/Volumes/") {
-                    mp = $0; sub(/^.*\/Volumes\//, "/Volumes/", mp); print mp; exit
-                }
-            ')" || mount_point=""
-            if [ -z "$mount_point" ]; then
+                cur && /^\/dev\/disk/ { print $1; exit }
+            ')" || stale_dev=""
+            detach_failed=""
+            if [ -n "$stale_dev" ]; then
+                hdiutil detach "$stale_dev" -force >/dev/null 2>&1 || true
+                # Verify the mount for this image-path is actually gone before we
+                # attach — never trust detach's exit code alone.
+                still_mounted="$(hdiutil info 2>/dev/null | awk -v img="$dmg_file" '
+                    /^image-path/ { p = $0; sub(/^image-path[ \t]*:[ \t]*/, "", p); cur = (p == img) }
+                    cur && /^\/dev\/disk/ { print $1; exit }
+                ')" || still_mounted=""
+                [ -n "$still_mounted" ] && detach_failed=1
+            fi
+            echo ""
+            if [ -n "$detach_failed" ]; then
+                echo "⚠️  A stale SwarmAI volume is still mounted (Finder may be holding it open)."
+                echo "    Eject it, then run:  open \"$dmg_file\""
+            else
+                # No stale mount (or it was detached cleanly) → attach the FRESH file.
                 mount_point="$(hdiutil attach "$dmg_file" 2>/dev/null \
                     | awk -F'\t' '/^\/dev\/disk/ && NF >= 3 { mp = $NF } END { print mp }')" \
                     || mount_point=""
-            fi
-            echo ""
-            if [ -n "$mount_point" ] && [ -d "$mount_point" ]; then
-                open "$mount_point" 2>/dev/null || true
-                echo "Installer window opened: $mount_point"
-                echo "  → Drag SwarmAI.app onto the Applications shortcut to install."
-            else
-                echo "Could not auto-open the installer. Run manually:"
-                echo "  open \"$dmg_file\""
+                if [ -n "$mount_point" ] && [ -d "$mount_point" ]; then
+                    open "$mount_point" 2>/dev/null || true
+                    echo "Installer window opened: $mount_point"
+                    # A SwarmAI-named volume from ELSEWHERE (e.g. a re-downloaded
+                    # Releases copy in ~/Downloads) has a different image-path, so
+                    # we deliberately don't detach it — but warn, since the user
+                    # would otherwise see it and think the build "looks old".
+                    other_vols="$(ls -d /Volumes/SwarmAI* 2>/dev/null | grep -v "^${mount_point}\$" || true)"
+                    if [ -n "$other_vols" ]; then
+                        echo "  ⓘ Other SwarmAI volume(s) still mounted (not from this build) — eject if stale:"
+                        echo "$other_vols" | sed 's/^/      /'
+                    fi
+                    echo "  → Drag SwarmAI.app onto the Applications shortcut to install."
+                else
+                    echo "Could not auto-open the installer. Run manually:"
+                    echo "  open \"$dmg_file\""
+                fi
             fi
         fi
     fi
