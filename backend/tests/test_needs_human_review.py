@@ -310,3 +310,49 @@ def test_batch_git_error_fails_CLOSED(swarmws: Path, monkeypatch, caplog):
     assert b[paths[1]].review_worthy is False
     assert any("check-ignore errored" in r.message for r in caplog.records), \
         "batch git-error must WARN (GUI98), not swallow silently"
+
+
+# ── run_d25d72be: automated-job / machine output → process (not content) ─────
+# A scheduled job commits its output (git-tracked, non-dot-dir, non-knowledge),
+# so review_worthy's check-ignore + dot-segment layers pass it through to
+# _classify_kind — where the `content` catch-all wrongly surfaced it as a human
+# artifact in BOTH consumers (Artifacts list + Canvas rail). These paths must be
+# `process` (which both consumers drop). Structural signal, not a per-job blacklist.
+
+def test_services_job_output_md_is_process(swarmws: Path):
+    """A stock-analysis-style report under Services/ is automated job output → process."""
+    p = _write(swarmws, "Services/stock-analysis/reports/2026-09-28-000002-foo.md")
+    v = needs_human_review(str(p.resolve()), "written", swarmws_root=swarmws)
+    assert v.kind == "process", "Services/ job output must be process, not content"
+
+
+def test_jobresults_md_is_process(swarmws: Path):
+    """Knowledge/JobResults/*.md are job run logs → process."""
+    p = _write(swarmws, "Knowledge/JobResults/2026-09-28-docs-freshness-audit.md")
+    v = needs_human_review(str(p.resolve()), "written", swarmws_root=swarmws)
+    assert v.kind == "process", "JobResults job log must be process, not content"
+
+
+def test_jsonl_machine_data_is_process(swarmws: Path):
+    """A .jsonl machine-data file (not under a dot-dir) → process, not content."""
+    p = _write(swarmws, "Knowledge/JobResults/2026-09-28-run.jsonl")
+    v = needs_human_review(str(p.resolve()), "written", swarmws_root=swarmws)
+    assert v.kind == "process", ".jsonl machine data must be process"
+
+
+def test_human_deliverables_unaffected_by_job_rule(swarmws: Path):
+    """The job-output rule must NOT demote real human artifacts. Designs/Reports/
+    Notes .md stay content; 2-understanding DDD docs stay knowledge; Attachments
+    stay content."""
+    keep = {
+        "Knowledge/Designs/2026-09-28-mock.html": "content",
+        "Knowledge/Reports/weekly.md": "content",
+        "Knowledge/Notes/idea.md": "content",
+        "Projects/SwarmAI/2-understanding/TECH.md": "knowledge",
+        "Attachments/2026-09-28/pic.png": "content",
+    }
+    for rel, expected in keep.items():
+        p = _write(swarmws, rel)
+        v = needs_human_review(str(p.resolve()), "written", swarmws_root=swarmws)
+        assert v.kind == expected, f"{rel}: expected {expected}, got {v.kind} (job rule over-reached)"
+        assert v.review_worthy is True, f"{rel} must stay review_worthy"

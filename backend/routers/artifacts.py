@@ -233,7 +233,14 @@ async def get_recent_artifacts(
     def _run_git_log() -> subprocess.CompletedProcess:
         return subprocess.run(
             [
-                "git", "log",
+                # -c core.quotepath=false: emit paths as raw UTF-8, NOT git's
+                # default C-style octal-escaped + double-quote-wrapped form for
+                # non-ASCII names. Without it a CJK-named file (e.g. a
+                # stock-analysis report "…歌尔股份.md") arrives as
+                # `"Services/…\346\255\214…"` — the leading quote breaks EVERY
+                # downstream consumer: the kind classifier's first-segment match,
+                # dedup, extension typing, and baseName display (run_d25d72be).
+                "git", "-c", "core.quotepath=false", "log",
                 "--diff-filter=ACMR",
                 "--name-only",
                 f"--format=%aI",

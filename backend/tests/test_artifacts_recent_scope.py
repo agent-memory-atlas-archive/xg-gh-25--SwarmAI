@@ -90,6 +90,50 @@ def test_scope_empty_log_returns_empty(_patched_classifier):
     assert art._parse_git_log("", "/fake/workspace") == []
 
 
+# ── run_d25d72be: CJK-named job output must be dropped end-to-end (NO mock) ───
+# The real bug SMOKE caught: git log C-style-quotes a non-ASCII path
+# (`"Services/…\346…"`), and the leading quote made the kind classifier's
+# first-segment `Services` match fail → the file leaked back as `content`. The
+# fix is `-c core.quotepath=false` on the git command. This test builds a REAL
+# git repo with a CJK-named Services/ file and runs the REAL classifier (no mock)
+# so it locks BOTH the quotepath flag and the job-output → process rule.
+def test_cjk_named_services_job_output_dropped_end_to_end(tmp_path):
+    import subprocess
+    from core.project_registry import get_swarmws  # noqa: F401 (import parity)
+
+    root = tmp_path / ".swarm-ai" / "SwarmWS"
+    root.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=root, check=True)
+    (root / ".gitignore").write_text("*.db\n", encoding="utf-8")
+    # a CJK-named automated job report + a real human deliverable
+    job = root / "Services" / "stock-analysis" / "reports" / "2026-09-28-000002-歌尔股份.md"
+    job.parent.mkdir(parents=True)
+    job.write_text("machine output", encoding="utf-8")
+    human = root / "Knowledge" / "Reports" / "weekly.md"
+    human.parent.mkdir(parents=True)
+    human.write_text("human report", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "seed"], cwd=root, check=True)
+
+    # Same command shape as _run_git_log — INCLUDING the quotepath flag under test.
+    raw = subprocess.run(
+        ["git", "-c", "core.quotepath=false", "log", "--diff-filter=ACMR",
+         "--name-only", "--format=%aI", "--since=30.days", "-n50", "--no-merges"],
+        cwd=root, capture_output=True, text=True, check=True,
+    ).stdout
+    # Guard: the flag actually produced a raw-UTF-8 (unquoted) path.
+    assert "歌尔股份" in raw and '"Services' not in raw, \
+        "quotepath=false must emit raw UTF-8, not a C-quoted path"
+
+    rows = art._parse_git_log(raw, str(root))  # REAL classifier, no mock
+    paths = {r["path"] for r in rows}
+    assert not any("stock-analysis" in p for p in paths), \
+        "CJK-named Services/ job output must be dropped (process), not surfaced"
+    assert "Knowledge/Reports/weekly.md" in paths, "human deliverable must survive"
+
+
 def test_no_directory_allowlist_authority_remains():
     """The 5-dir allowlist must no longer be the membership authority (defect fix)."""
     assert not hasattr(art, "_is_artifact_file"), "_is_artifact_file should be removed"

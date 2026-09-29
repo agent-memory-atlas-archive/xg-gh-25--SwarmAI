@@ -122,6 +122,42 @@ def _is_surfaceable_knowledge(rel_path: str) -> bool:
     return False
 
 
+def _is_automated_job_output(rel_path: str) -> bool:
+    """True if this SwarmWS path is automated-job / machine output — NOT a human
+    artifact — so it classifies as ``process`` (which BOTH consumers of the kind
+    verdict, the Artifacts list and the Canvas rail, drop).
+
+    The negative twin of ``_is_surfaceable_knowledge`` above: a whole-path
+    STRUCTURAL rule (convention dir / data-format extension), NOT a per-job path
+    blacklist — so a NEW scheduled job's output is excluded by construction, never
+    a "patch per miss" (the whitelist-inverted anti-pattern this module was built
+    to end). Three structural signals, verified against the live tree (run_d25d72be):
+
+      1. First segment ``Services`` — the convention root for services + their job
+         output (pollinate-studio, signals, stock-analysis, swarm-jobs, swarm-backup);
+         holds no human-authored ``.md`` deliverables.
+      2. Any segment ``JobResults`` — job run-logs (``Knowledge/JobResults/*``); the
+         name carries the semantics.
+      3. ``.jsonl`` extension — machine data-log format, not human-readable prose.
+
+    SwarmWS-tree only: called from ``_classify_kind`` on the SwarmWS-relative path
+    for the ``repo is None`` (non-bound-worktree) case. Deliberately NOT covering
+    ``Knowledge/{DailyActivity,DailyBriefs,Signals}`` — those are also automated but
+    whether they belong on the human artifact surface is a separate decision
+    (run_d25d72be REPORT § Known Gaps), left out of this scope on purpose.
+    """
+    parts = [p for p in Path(rel_path).parts if p not in (".", "")]
+    if not parts:
+        return False
+    if parts[0] == "Services":
+        return True
+    if "JobResults" in parts:
+        return True
+    if parts[-1].endswith(".jsonl"):
+        return True
+    return False
+
+
 def _has_dot_segment(rel_path: str) -> bool:
     """True if ANY path segment of the TREE-RELATIVE path is dot-prefixed (hidden).
 
@@ -274,7 +310,10 @@ def _classify_kind(rel_path: str, repo: Optional[str]) -> Kind:
     """AC4 precedence (order matters):
     (1) dot-segment → process; (2) knowledge md → knowledge (BEFORE source, so a
     DDD doc inside a bound worktree is knowledge not source); (3) inside a bound
-    worktree → source; (4) else → content.
+    worktree → source; (3.5, run_d25d72be) SwarmWS automated-job/machine output →
+    process (checked AFTER knowledge so a real DDD ``.md`` is never demoted, and
+    only for the ``repo is None`` SwarmWS case so a bound-repo file still gets
+    ``source``); (4) else → content.
     """
     if _has_dot_segment(rel_path):
         return "process"
@@ -285,6 +324,10 @@ def _classify_kind(rel_path: str, repo: Optional[str]) -> Kind:
         return "knowledge"
     if repo is not None:
         return "source"
+    # SwarmWS automated-job / machine output is NOT a human artifact → process,
+    # which both the Artifacts list and the Canvas rail drop (run_d25d72be).
+    if _is_automated_job_output(rel_path):
+        return "process"
     return "content"
 
 
