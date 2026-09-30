@@ -453,6 +453,7 @@ class ProductResponse(BaseModel):
     firstProduced: str
     lastTouched: str
     displayLabel: str    # Run-3 AC8: human label — task name for Pipeline rows, basename otherwise
+    starred: bool        # run_2b7230be: user favorite (persisted in products.json)
 
 
 # ── loading-B: day-one backfill runs in the BACKGROUND, never on the read path ──
@@ -601,9 +602,45 @@ async def get_products(
             firstProduced=p.first_produced,
             lastTouched=p.last_touched,
             displayLabel=_display_label(p, workspace_path, label_cache),
+            starred=bool(getattr(p, "starred", False)),
         )
         for p in products
     ]
+
+
+class StarRequest(BaseModel):
+    """Body for PUT /artifacts/products/star — toggle a product's favorite flag."""
+
+    path: str
+    starred: bool
+
+
+@router.put("/artifacts/products/star")
+async def set_product_starred(
+    body: StarRequest,
+    workspace_id: str = Query(..., description="Workspace identifier (resolved via DB)"),
+) -> dict:
+    """run_2b7230be: toggle the `starred` favorite flag on an EXISTING product.
+
+    Confined-by-construction: reuses the SAME single DB-resolved workspace as
+    get_products, and delegates to ProductRegistry.set_starred, which flips ONLY the
+    boolean on a row matched by EXACT path equality (no filesystem resolution, no
+    create). An unknown/traversal path matches nothing → 404, never appends a row.
+    """
+    from core.product_registry import ProductRegistry
+
+    try:
+        workspace_path = await _get_workspace_path()
+    except HTTPException:
+        raise
+
+    def _toggle() -> bool:
+        return ProductRegistry(workspace_path).set_starred(body.path, body.starred)
+
+    matched = await anyio.to_thread.run_sync(_toggle)
+    if not matched:
+        raise HTTPException(status_code=404, detail="product not found")
+    return {"path": body.path, "starred": body.starred}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

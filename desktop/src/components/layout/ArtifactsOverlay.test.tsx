@@ -299,3 +299,107 @@ describe('ArtifactsContent — time-grouped list', () => {
     expect(screen.getByText(/No products match/i)).toBeInTheDocument();
   });
 });
+
+// ─────────────────────────── star / favorite (run_2b7230be) ───────────────────────────
+
+describe('ArtifactsContent — star/favorite', () => {
+  let fetchProducts: ReturnType<typeof vi.fn>;
+  let setStarred: ReturnType<typeof vi.fn>;
+  let closeSpy: ReturnType<typeof vi.fn>;
+
+  // A fixture with a starred row that is OLD (>14d → Earlier) so the starred view
+  // must ignore the time window to show it.
+  const STARRED_FIXTURE: Product[] = [
+    prod('Projects/AIDLC/assets/2026-09-29-ai-native-deck.html', 'Deliverables', { lastTouched: daysAgo(1) }),
+    prod('Knowledge/Library/2026-06-01-old-flagship-deck.html', 'Deliverables', { lastTouched: daysAgo(120), starred: true }),
+    prod('Projects/SwarmAI/2-understanding/TECH.md', 'Knowledge', { kind: 'knowledge', lastTouched: daysAgo(3), starred: true }),
+  ];
+
+  beforeEach(() => {
+    fetchProducts = vi.fn().mockResolvedValue(STARRED_FIXTURE);
+    setStarred = vi.fn().mockResolvedValue(undefined);
+    closeSpy = vi.fn();
+  });
+
+  it('AC5: renders the ★ Starred chip FIRST in the chip row, with the starred count', async () => {
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} setStarred={setStarred} now={NOW} />);
+    // wait for DATA to load (the chip renders during loading with count 0)
+    await waitFor(() => expect(screen.getByTestId('artifacts-chip-Starred').textContent).toMatch(/2/));
+    const chipRow = screen.getByTestId('artifacts-rolefilter');
+    // Starred chip is the FIRST child of the chip row
+    expect(chipRow.firstElementChild).toBe(screen.getByTestId('artifacts-chip-Starred'));
+  });
+
+  it('AC5: clicking the Starred chip shows ONLY starred rows AND ignores the time window (a 120-day-old starred deck appears)', async () => {
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} setStarred={setStarred} now={NOW} />);
+    await waitFor(() => expect(screen.getByText('Ai Native Deck')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('artifacts-chip-Starred'));
+    // the 120-day-old starred deck (Earlier) is now visible — window ignored
+    await waitFor(() => expect(screen.getByText('Old Flagship Deck')).toBeInTheDocument());
+    // the unstarred recent deck is gone (starred-only)
+    expect(screen.queryByText('Ai Native Deck')).toBeNull();
+    // the starred Knowledge row (cross-role) also shows
+    expect(screen.getByText('TECH')).toBeInTheDocument();
+    // window chip reads as ignored
+    expect(screen.getByTestId('artifacts-window-chip').textContent).toMatch(/收藏时忽略|ignore/i);
+  });
+
+  it('AC5: a per-row star toggle calls setStarred with the negated state and optimistically lights up', async () => {
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} setStarred={setStarred} now={NOW} />);
+    await waitFor(() => expect(screen.getByText('Ai Native Deck')).toBeInTheDocument());
+    // the recent deck is unstarred → its row star toggles it ON
+    const rows = screen.getAllByTestId('artifacts-row');
+    const deckRow = rows.find((r) => r.textContent?.includes('Ai Native Deck'))!;
+    const star = deckRow.querySelector('[data-testid="artifacts-row-star"]') as HTMLElement;
+    fireEvent.click(star);
+    expect(setStarred).toHaveBeenCalledWith('default', 'Projects/AIDLC/assets/2026-09-29-ai-native-deck.html', true);
+  });
+
+  it('AC5: clicking a row star does NOT also open the file (stopPropagation — RP20)', async () => {
+    const onOpen = vi.fn();
+    document.addEventListener(OPEN_FILE_EVENT, onOpen as EventListener);
+    try {
+      renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} setStarred={setStarred} now={NOW} />);
+      await waitFor(() => expect(screen.getByText('Ai Native Deck')).toBeInTheDocument());
+      const rows = screen.getAllByTestId('artifacts-row');
+      const deckRow = rows.find((r) => r.textContent?.includes('Ai Native Deck'))!;
+      const star = deckRow.querySelector('[data-testid="artifacts-row-star"]') as HTMLElement;
+      fireEvent.click(star);
+      expect(onOpen).not.toHaveBeenCalled(); // star click did not open the file
+      expect(closeSpy).not.toHaveBeenCalled();
+    } finally {
+      document.removeEventListener(OPEN_FILE_EVENT, onOpen as EventListener);
+    }
+  });
+
+  it('AC5: an optimistic star lights immediately, then ROLLS BACK when the endpoint rejects', async () => {
+    setStarred = vi.fn().mockRejectedValue(new Error('network down'));
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} setStarred={setStarred} now={NOW} />);
+    await waitFor(() => expect(screen.getByText('Ai Native Deck')).toBeInTheDocument());
+    const rows = screen.getAllByTestId('artifacts-row');
+    const deckRow = rows.find((r) => r.textContent?.includes('Ai Native Deck'))!;
+    const star = deckRow.querySelector('[data-testid="artifacts-row-star"]') as HTMLButtonElement;
+    // unstarred initially
+    expect(star.getAttribute('aria-pressed')).toBe('false');
+    fireEvent.click(star);
+    expect(setStarred).toHaveBeenCalledWith('default', 'Projects/AIDLC/assets/2026-09-29-ai-native-deck.html', true);
+    // after the rejection settles, the optimistic patch is rolled back → back to unstarred
+    await waitFor(() => {
+      const r = screen.getAllByTestId('artifacts-row').find((x) => x.textContent?.includes('Ai Native Deck'))!;
+      const s = r.querySelector('[data-testid="artifacts-row-star"]') as HTMLButtonElement;
+      expect(s.getAttribute('aria-pressed')).toBe('false');
+    });
+  });
+
+  it('AC6: Starred view with 0 favorites shows the star guide, not the generic empty state', async () => {
+    fetchProducts.mockResolvedValue([
+      prod('Projects/AIDLC/assets/deck.html', 'Deliverables', { lastTouched: daysAgo(1) }), // none starred
+    ]);
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} setStarred={setStarred} now={NOW} />);
+    await waitFor(() => expect(screen.getByText('Deck')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('artifacts-chip-Starred'));
+    await waitFor(() => expect(screen.getByTestId('artifacts-starred-empty')).toBeInTheDocument());
+    expect(screen.queryByTestId('artifacts-empty')).toBeNull();
+    expect(screen.getByText(/click ☆|favorites/i)).toBeInTheDocument();
+  });
+});

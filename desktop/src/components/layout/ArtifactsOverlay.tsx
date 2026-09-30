@@ -23,8 +23,8 @@
  * @exports parentRunLabel — pure Pipeline-row fallback label
  * @exports OPEN_FILE_EVENT — the swarm:open-file event name (shared with the row-click contract)
  */
-import { useEffect, useMemo, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { radarService } from '../../services/radar';
 import type { Product, ProductRole } from '../../services/radar';
 import { fileIcon, fileIconColor } from '../../utils/fileUtils';
@@ -235,17 +235,24 @@ export interface ArtifactsContentProps {
   fetchProducts?: (wsId: string) => Promise<Product[]>;
   /** Test seam: inject "now" so time buckets are deterministic. */
   now?: number;
+  /** Test seam: override the star-toggle call (defaults to radarService.setStarred). */
+  setStarred?: (wsId: string, path: string, starred: boolean) => Promise<void>;
 }
+
+/** react-query key for the products list — shared by the fetch + the optimistic star patch. */
+const PRODUCTS_QUERY_KEY = ['workspace-products'] as const;
 
 /**
  * The Artifacts retrieval body (the host wraps it in scrim + panel + header chrome).
  */
-export function ArtifactsContent({ close, fetchProducts, now }: ArtifactsContentProps) {
+export function ArtifactsContent({ close, fetchProducts, now, setStarred }: ArtifactsContentProps) {
   const fetcher = fetchProducts ?? radarService.fetchProducts;
+  const starrer = setStarred ?? radarService.setStarred;
   const nowMs = now ?? Date.now();
+  const queryClient = useQueryClient();
 
   const { data, isLoading, isError } = useQuery({
-    queryKey: ['workspace-products'],
+    queryKey: PRODUCTS_QUERY_KEY,
     queryFn: () => fetcher(WS_PLACEHOLDER),
     staleTime: 30_000,
     refetchInterval: (query) => {
@@ -261,10 +268,43 @@ export function ArtifactsContent({ close, fetchProducts, now }: ArtifactsContent
   const [search, setSearch] = useState('');
   // The PRIMARY role shown time-grouped (default Deliverables — the products you reopen).
   const [primaryRole, setPrimaryRole] = useState<ProductRole>('Deliverables');
+  // Starred-only view (the ★ Starred chip). A SEPARATE filter axis from primaryRole:
+  // when on, it flattens ALL starred products across every role AND ignores the time
+  // window (a favorite is retrieved regardless of recency — the 3rd retrieval path).
+  const [starredOnly, setStarredOnly] = useState(false);
   // Earlier-fold expanded?
   const [foldOpen, setFoldOpen] = useState(false);
   // Which demoted drawers are open.
   const [openDrawers, setOpenDrawers] = useState<Record<string, boolean>>({});
+
+  // Optimistic star toggle: patch the cached row immediately (Doherty — instant feel),
+  // fire the PUT, invalidate to reconcile, and roll back the patch on error.
+  // Derives `next` from the LIVE cache row (not the closed-over `p` prop) so two rapid
+  // clicks before the server reconciles don't both compute off a stale pre-patch render
+  // (UX-review LOW: read live state, never a snapshot — RP57/RP58-adjacent).
+  const toggleStar = useCallback(
+    async (p: Product) => {
+      const prev = queryClient.getQueryData<Product[]>(PRODUCTS_QUERY_KEY);
+      const liveRow = prev?.find((r) => r.path === p.path);
+      const next = !((liveRow ?? p).starred ?? false);
+      queryClient.setQueryData<Product[]>(PRODUCTS_QUERY_KEY, (rows) =>
+        (rows ?? []).map((r) => (r.path === p.path ? { ...r, starred: next } : r)),
+      );
+      try {
+        await starrer(WS_PLACEHOLDER, p.path, next);
+        queryClient.invalidateQueries({ queryKey: PRODUCTS_QUERY_KEY });
+      } catch {
+        // roll back the optimistic patch on failure
+        if (prev) queryClient.setQueryData<Product[]>(PRODUCTS_QUERY_KEY, prev);
+      }
+    },
+    [queryClient, starrer],
+  );
+
+  const starredCount = useMemo(
+    () => (Array.isArray(data) ? data.filter((p) => p.starred).length : 0),
+    [data],
+  );
 
   useEffect(() => {
     const t = setTimeout(() => setSearch(searchRaw.trim().toLowerCase()), SEARCH_DEBOUNCE_MS);
@@ -282,35 +322,44 @@ export function ArtifactsContent({ close, fetchProducts, now }: ArtifactsContent
     return hay.includes(search);
   };
 
-  // Rows of the primary role. When searching, the window is ignored (all time); otherwise
-  // time-grouped and the Earlier bucket is foldable.
+  // PRIMARY rows. In starred-only view: ALL starred products across every role, window
+  // ignored (a favorite crosses time). Otherwise: the primary role's rows (search still
+  // matches across all time; else time-grouped with a foldable Earlier bucket).
   const primaryProducts = useMemo(
-    () => all.filter((p) => p.role === primaryRole && searchMatch(p)),
-    [all, primaryRole, search],
+    () =>
+      starredOnly
+        ? all.filter((p) => p.starred && searchMatch(p))
+        : all.filter((p) => p.role === primaryRole && searchMatch(p)),
+    [all, primaryRole, starredOnly, search],
   );
   const primaryGroups = useMemo(() => groupByTime(primaryProducts, nowMs), [primaryProducts, nowMs]);
 
-  // Demoted drawers = the other three roles (filtered by search when searching).
-  const drawerRoles = ROLE_ORDER.filter((r) => r !== primaryRole);
+  // Demoted drawers = the other three roles — HIDDEN in starred-only view (the starred
+  // list is a flat cross-role view, drawers would be redundant/confusing there).
+  const drawerRoles = starredOnly ? [] : ROLE_ORDER.filter((r) => r !== primaryRole);
   const drawerProducts = (role: ProductRole) =>
     all
       .filter((p) => p.role === role && searchMatch(p))
       .sort((a, b) => (b.lastTouched || '').localeCompare(a.lastTouched || ''));
 
-  const totalShown =
-    all.filter(searchMatch).length; // any role, for the empty-state decision
+  // Empty-state decision. In starred-only view it is scoped to starred rows (so 0 starred
+  // shows the star guide, not the generic "no products").
+  const totalShown = starredOnly
+    ? primaryProducts.length
+    : all.filter(searchMatch).length;
 
   const openRow = (p: Product) => {
     dispatchOpenFile(p.path);
     close();
   };
 
-  // Split the primary groups into the WINDOW (This week + Last week) vs Earlier (folded),
-  // unless searching (then everything shows, ungrouped-by-window).
-  const windowGroups = searching
+  // Split the primary groups into the WINDOW (This week + Last week) vs Earlier (folded).
+  // Searching OR starred-only both IGNORE the window (show everything across all time).
+  const ignoreWindow = searching || starredOnly;
+  const windowGroups = ignoreWindow
     ? primaryGroups
     : primaryGroups.filter((g) => g.bucket !== 'Earlier');
-  const earlierGroup = searching ? undefined : primaryGroups.find((g) => g.bucket === 'Earlier');
+  const earlierGroup = ignoreWindow ? undefined : primaryGroups.find((g) => g.bucket === 'Earlier');
   const earlierCount = earlierGroup?.products.length ?? 0;
 
   return (
@@ -326,12 +375,30 @@ export function ArtifactsContent({ close, fetchProducts, now }: ArtifactsContent
           className="w-full px-3 py-2 rounded-lg bg-[var(--color-input-bg,var(--color-bg-secondary))] border border-[var(--color-border)] text-[12.5px] text-[var(--color-text)] placeholder:text-[var(--color-text-faint)] outline-none focus:border-[var(--color-primary)]"
         />
         <div className="flex items-center gap-1.5 mt-2 flex-wrap" data-testid="artifacts-rolefilter">
+          {/* ★ Starred chip — FIRST (mockup): a separate filter axis. Click toggles a
+              starred-only, cross-role, window-ignoring view. Clicking it OFF returns to
+              the role view. */}
+          <button
+            onClick={() => setStarredOnly((v) => !v)}
+            data-testid="artifacts-chip-Starred"
+            aria-pressed={starredOnly}
+            className={`flex items-center gap-1 text-[10.5px] px-2.5 py-1 rounded-full border transition-colors ${
+              starredOnly
+                ? 'border-[var(--color-git-modified,#d59a26)] text-[var(--color-git-modified,#d59a26)] bg-[color-mix(in_srgb,var(--color-git-modified,#d59a26)_14%,transparent)]'
+                : 'border-[var(--color-git-modified,#d59a26)] text-[var(--color-git-modified,#d59a26)] hover:bg-[color-mix(in_srgb,var(--color-git-modified,#d59a26)_8%,transparent)]'
+            }`}
+          >
+            <span aria-hidden="true">★</span> Starred · {starredCount}
+          </button>
           {ROLE_ORDER.map((role) => {
-            const on = primaryRole === role;
+            const on = !starredOnly && primaryRole === role;
             return (
               <button
                 key={role}
-                onClick={() => setPrimaryRole(role)}
+                onClick={() => {
+                  setStarredOnly(false);
+                  setPrimaryRole(role);
+                }}
                 data-testid={`artifacts-chip-${role}`}
                 aria-pressed={on}
                 className={`flex items-center gap-1.5 text-[10.5px] px-2.5 py-1 rounded-full border transition-colors ${
@@ -353,10 +420,10 @@ export function ArtifactsContent({ close, fetchProducts, now }: ArtifactsContent
           <span
             data-testid="artifacts-window-chip"
             className={`ml-auto text-[10.5px] px-2.5 py-1 rounded-full border border-[var(--color-border)] ${
-              searching ? 'text-[var(--color-text-faint)] opacity-60' : 'text-[var(--color-text-muted)]'
+              ignoreWindow ? 'text-[var(--color-text-faint)] opacity-60' : 'text-[var(--color-text-muted)]'
             }`}
           >
-            {searching ? '时间窗 · 搜索时忽略' : '时间窗 · 过去两周'}
+            {starredOnly ? '时间窗 · 收藏时忽略' : searching ? '时间窗 · 搜索时忽略' : '时间窗 · 过去两周'}
           </span>
         </div>
       </div>
@@ -373,6 +440,13 @@ export function ArtifactsContent({ close, fetchProducts, now }: ArtifactsContent
           <div className="flex flex-col items-center justify-center gap-2 px-3 py-10 text-center" data-testid="artifacts-error">
             <span className="text-[22px]" aria-hidden="true">🐝</span>
             <p className="text-[11px] text-[var(--color-text-muted)]">Couldn't load products. Try again in a moment.</p>
+          </div>
+        ) : totalShown === 0 && starredOnly ? (
+          <div className="flex flex-col items-center justify-center gap-2 px-3 py-10 text-center" data-testid="artifacts-starred-empty">
+            <span className="text-[22px]" aria-hidden="true">★</span>
+            <p className="text-[11px] text-[var(--color-text-muted)] max-w-[240px]">
+              No favorites yet. Hover any row and click ☆ to star the products you reopen often — they show here across all time.
+            </p>
           </div>
         ) : totalShown === 0 ? (
           <div className="flex flex-col items-center justify-center gap-2 px-3 py-10 text-center" data-testid="artifacts-empty">
@@ -394,13 +468,13 @@ export function ArtifactsContent({ close, fetchProducts, now }: ArtifactsContent
                   <span className="flex-1 h-px bg-[var(--color-border)] opacity-40" />
                 </div>
                 {g.products.map((p) => (
-                  <ArtifactRow key={p.path} p={p} now={nowMs} onOpen={openRow} />
+                  <ArtifactRow key={p.path} p={p} now={nowMs} onOpen={openRow} onStar={toggleStar} />
                 ))}
               </section>
             ))}
 
             {/* Earlier fold (hidden while searching) */}
-            {!searching && earlierCount > 0 && (
+            {!ignoreWindow && earlierCount > 0 && (
               foldOpen ? (
                 <section data-testid="artifacts-timegroup-Earlier">
                   <div className="flex items-center gap-2 px-1 pt-4 pb-1.5 text-[10.5px] uppercase tracking-wide text-[var(--color-text-faint)]">
@@ -409,7 +483,7 @@ export function ArtifactsContent({ close, fetchProducts, now }: ArtifactsContent
                     <span className="flex-1 h-px bg-[var(--color-border)] opacity-40" />
                   </div>
                   {earlierGroup!.products.map((p) => (
-                    <ArtifactRow key={p.path} p={p} now={nowMs} onOpen={openRow} />
+                    <ArtifactRow key={p.path} p={p} now={nowMs} onOpen={openRow} onStar={toggleStar} />
                   ))}
                 </section>
               ) : (
@@ -451,7 +525,7 @@ export function ArtifactsContent({ close, fetchProducts, now }: ArtifactsContent
                     {open && (
                       <div className="flex flex-col pb-1">
                         {items.map((p) => (
-                          <ArtifactRow key={p.path} p={p} now={nowMs} onOpen={openRow} />
+                          <ArtifactRow key={p.path} p={p} now={nowMs} onOpen={openRow} onStar={toggleStar} />
                         ))}
                       </div>
                     )}
@@ -467,15 +541,37 @@ export function ArtifactsContent({ close, fetchProducts, now }: ArtifactsContent
 }
 
 // ── A single list row (mockup .row) ─────────────────────────────────────────
-function ArtifactRow({ p, now, onOpen }: { p: Product; now: number; onOpen: (p: Product) => void }) {
+// The row is a <div role="button"> (NOT a <button>) so the star control can be a real
+// nested <button> — nesting a button inside a button is invalid HTML. The star's onClick
+// calls stopPropagation so a star toggle never also opens the file (RP20 nested-clickable).
+function ArtifactRow({
+  p,
+  now,
+  onOpen,
+  onStar,
+}: {
+  p: Product;
+  now: number;
+  onOpen: (p: Product) => void;
+  onStar: (p: Product) => void;
+}) {
   const { badge, color } = fileBadge(p.path);
   const label = rowLabel(p);
+  const starred = p.starred ?? false;
   return (
-    <button
+    <div
+      role="button"
+      tabIndex={0}
       onClick={() => onOpen(p)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onOpen(p);
+        }
+      }}
       title={p.path}
       data-testid="artifacts-row"
-      className="group w-full flex items-center gap-3 px-2 py-2 rounded-lg hover:bg-[var(--color-hover)] transition-colors text-left"
+      className="group w-full flex items-center gap-3 px-2 py-2 rounded-lg hover:bg-[var(--color-hover)] transition-colors text-left cursor-pointer"
     >
       <span
         data-testid="artifacts-row-badge"
@@ -508,7 +604,27 @@ function ArtifactRow({ p, now, onOpen }: { p: Product; now: number; onOpen: (p: 
       >
         {absoluteTime(p.lastTouched)}
       </span>
-    </button>
+      {/* Star toggle — hover-visible when unstarred, always-lit gold when starred (Tufte
+          deference). stopPropagation so a star click never also opens the file (RP20). */}
+      <button
+        type="button"
+        data-testid="artifacts-row-star"
+        aria-pressed={starred}
+        aria-label={starred ? 'Unstar' : 'Star'}
+        title={starred ? 'Starred' : 'Star'}
+        onClick={(e) => {
+          e.stopPropagation();
+          onStar(p);
+        }}
+        className={`shrink-0 w-5 text-center text-[14px] leading-none transition-opacity ${
+          starred
+            ? 'text-[var(--color-git-modified,#d59a26)] opacity-100'
+            : 'text-[var(--color-text-faint)] opacity-0 group-hover:opacity-100 hover:text-[var(--color-git-modified,#d59a26)]'
+        }`}
+      >
+        {starred ? '★' : '☆'}
+      </button>
+    </div>
   );
 }
 

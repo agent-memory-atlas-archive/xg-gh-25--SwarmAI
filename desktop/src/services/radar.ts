@@ -58,6 +58,10 @@ export interface Product {
    *  so an old-backend / rolled-back response degrades gracefully. The type matches
    *  that runtime contract rather than lying about a hard requirement. */
   displayLabel?: string;
+  /** run_2b7230be: user favorite. OPTIONAL by type (same defensive contract as
+   *  displayLabel) — the backend always emits it now, but an old/rolled-back
+   *  response is treated as `false` via `p.starred ?? false` at the render site. */
+  starred?: boolean;
 }
 
 export const radarService = {
@@ -84,6 +88,15 @@ export const radarService = {
     // (backend hiccup / rolled-back shape) must degrade to [] so the Promise<Product[]>
     // contract holds — otherwise the overlay's `data.filter` crashes on a non-iterable.
     return Array.isArray(response.data) ? (response.data as Product[]) : [];
+  },
+
+  /** run_2b7230be: toggle a product's `starred` favorite flag. PUT /artifacts/products/star
+   *  flips ONLY the boolean on an existing product row (404 on unknown path — never creates).
+   *  The overlay calls this on a per-row star click with an optimistic cache update. */
+  async setStarred(workspaceId: string, path: string, starred: boolean): Promise<void> {
+    const params = new URLSearchParams();
+    params.append('workspace_id', workspaceId);
+    await api.put(`/artifacts/products/star?${params.toString()}`, { path, starred });
   },
 
   /**

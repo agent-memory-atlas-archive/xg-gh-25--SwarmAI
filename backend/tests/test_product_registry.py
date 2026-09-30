@@ -1014,3 +1014,133 @@ class TestPurgeExcludedOnRebackfill:
             "Projects/SwarmAI/.artifacts/runs/run_x/REPORT.md",  # re-derive keeps it despite stale role
             "Knowledge/Designs/mock.html",
         }
+
+
+class TestStarred:
+    """run_2b7230be: the `starred` favorite field + set_starred toggle.
+
+    Persistence lives in products.json (skeptic-rejected a sidecar). The field
+    carries a `= False` default so Product(**legacy_row) never crashes; set_starred
+    toggles the boolean on an EXISTING matched row via the flock-guarded _mutate
+    (no append on an unknown path); starred survives a re-register; and a starred
+    row is NEVER evicted by the MAX_PRODUCTS cap (a favorite is permanent).
+    """
+
+    def _seed(self, ws, rows):
+        """rows: list of (path, starred). Writes a store directly."""
+        import json as _json
+        store = ws / ".artifacts"
+        store.mkdir(parents=True, exist_ok=True)
+        (store / "products.json").write_text(_json.dumps({
+            "version": 1,
+            "products": [
+                {"path": p, "role": "Deliverables", "kind": "content",
+                 "gitignored": False, "first_produced": "2026-01-01T00:00:00+00:00",
+                 "last_touched": "2026-01-01T00:00:00+00:00",
+                 **({"starred": s} if s is not None else {})}
+                for p, s in rows
+            ],
+        }))
+
+    def test_legacy_row_without_starred_key_loads(self, ws):
+        """AC1: a LEGACY row (no starred key) must load — Product(**e) with the
+        `= False` default supplies it, never a TypeError."""
+        from core.product_registry import ProductRegistry
+        self._seed(ws, [("Knowledge/Designs/x.html", None)])  # None => no starred key
+        products = ProductRegistry(ws).list_products()
+        assert len(products) == 1
+        assert products[0].starred is False  # default applied, no crash
+
+    def test_set_starred_matches_existing_path(self, ws):
+        """AC2: set_starred flips the boolean on a matched path, returns True, persists."""
+        import json as _json
+        from core.product_registry import ProductRegistry
+        self._seed(ws, [("Knowledge/Designs/x.html", False)])
+        reg = ProductRegistry(ws)
+        assert reg.set_starred("Knowledge/Designs/x.html", True) is True
+        data = _json.loads((ws / ".artifacts" / "products.json").read_text())
+        assert data["products"][0]["starred"] is True
+        # toggle back off
+        assert reg.set_starred("Knowledge/Designs/x.html", False) is True
+        data = _json.loads((ws / ".artifacts" / "products.json").read_text())
+        assert data["products"][0]["starred"] is False
+
+    def test_set_starred_unknown_path_is_noop_never_appends(self, ws):
+        """AC2: an unknown path returns False and does NOT append a row (no create)."""
+        import json as _json
+        from core.product_registry import ProductRegistry
+        self._seed(ws, [("Knowledge/Designs/x.html", False)])
+        reg = ProductRegistry(ws)
+        assert reg.set_starred("Projects/evil/../../etc/passwd", True) is False
+        data = _json.loads((ws / ".artifacts" / "products.json").read_text())
+        assert len(data["products"]) == 1  # no append
+        assert data["products"][0]["path"] == "Knowledge/Designs/x.html"
+
+    def test_starred_survives_reregister(self, ws):
+        """AC3: a live re-touch (register_batch) of a starred row keeps starred=True."""
+        import json as _json
+        from core.product_registry import ProductRegistry
+        (ws / "Knowledge" / "Designs").mkdir(parents=True, exist_ok=True)
+        f = ws / "Knowledge" / "Designs" / "deck.html"
+        f.write_text("<html></html>")
+        reg = ProductRegistry(ws)
+        reg.register_batch([str(f)])
+        assert reg.set_starred("Knowledge/Designs/deck.html", True) is True
+        # re-touch the same path (live watcher path — no historical ts)
+        reg.register_batch([str(f)])
+        data = _json.loads((ws / ".artifacts" / "products.json").read_text())
+        row = next(e for e in data["products"] if e["path"] == "Knowledge/Designs/deck.html")
+        assert row["starred"] is True, "a re-register must preserve the star (favorite is durable)"
+
+    def test_starred_row_is_never_purged(self, ws):
+        """run_2b7230be meta-review: _purge_excluded must NOT drop a starred row even
+        when its path now classifies to OTHER (noise) — a favorite is permanent, the
+        same invariant eviction honors (P8: the two row-dropping doors agree). A user
+        can unstar genuine noise; the system never revokes a deliberate favorite."""
+        import json as _json
+        from core.product_registry import ProductRegistry
+        # an assets image (derive_role → OTHER, normally purged) but STARRED
+        self._seed(ws, [
+            ("Projects/AIDLC/assets/slide-2x.png", True),   # noise-by-path BUT starred → kept
+            ("Projects/AIDLC/assets/other.png", False),     # noise-by-path, unstarred → purged
+            ("Knowledge/Designs/real.html", False),         # real product → kept
+        ])
+        removed = ProductRegistry(ws)._purge_excluded()
+        assert removed == 1, f"only the unstarred noise row is purged, removed {removed}"
+        data = _json.loads((ws / ".artifacts" / "products.json").read_text())
+        paths = {e["path"] for e in data["products"]}
+        assert "Projects/AIDLC/assets/slide-2x.png" in paths, "a starred row must survive purge"
+        assert "Projects/AIDLC/assets/other.png" not in paths
+        assert "Knowledge/Designs/real.html" in paths
+
+    def test_starred_row_is_never_evicted(self, ws):
+        """AC7 (Gate-1 finding): the MAX_PRODUCTS cap evicts oldest-by-last_touched,
+        but a STARRED row must survive even if it is the oldest/untouched — a favorite
+        is permanent. Seed a starred OLD row + fill past the cap with newer rows;
+        the starred row must remain."""
+        import json as _json
+        import core.product_registry as pr
+        from core.product_registry import ProductRegistry
+        # shrink the cap for the test
+        old_cap = pr.MAX_PRODUCTS
+        pr.MAX_PRODUCTS = 5
+        try:
+            store = ws / ".artifacts"
+            store.mkdir(parents=True, exist_ok=True)
+            rows = [{"path": "Knowledge/fav.html", "role": "Deliverables", "kind": "content",
+                     "gitignored": False, "first_produced": "2020-01-01T00:00:00+00:00",
+                     "last_touched": "2020-01-01T00:00:00+00:00", "starred": True}]  # OLDEST + starred
+            (store / "products.json").write_text(_json.dumps({"version": 1, "products": rows}))
+            # register 10 fresh files (all newer) → forces eviction past cap=5
+            (ws / "Knowledge" / "Designs").mkdir(parents=True, exist_ok=True)
+            fresh = []
+            for i in range(10):
+                f = ws / "Knowledge" / "Designs" / f"n{i}.html"
+                f.write_text("x")
+                fresh.append(str(f))
+            ProductRegistry(ws).register_batch(fresh)
+            data = _json.loads((store / "products.json").read_text())
+            paths = {e["path"] for e in data["products"]}
+            assert "Knowledge/fav.html" in paths, "a starred row must NEVER be evicted, even as oldest"
+        finally:
+            pr.MAX_PRODUCTS = old_cap

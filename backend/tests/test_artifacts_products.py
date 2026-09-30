@@ -333,3 +333,63 @@ async def test_non_pipeline_row_display_label_is_basename(app_with_ws):
     deliv = [r for r in data if r["role"] == "Deliverables"]
     assert deliv, "the deck must project as Deliverables"
     assert deliv[0]["displayLabel"] == "my-deck.html"
+
+
+# ── run_2b7230be: star/favorite endpoint (PUT /artifacts/products/star) ──
+
+async def _put_star(app, path: str, starred: bool):
+    transport = ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        return await client.put(
+            "/artifacts/products/star",
+            params={"workspace_id": "default"},
+            json={"path": path, "starred": starred},
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_products_projects_starred(app_with_ws):
+    """AC4: the GET projection carries `starred` (default False for a fresh row)."""
+    app, ws = app_with_ws
+    from core.product_registry import ProductRegistry
+    (ws / "Knowledge" / "Designs").mkdir(parents=True, exist_ok=True)
+    deck = ws / "Knowledge" / "Designs" / "d.html"
+    deck.write_text("<html></html>")
+    ProductRegistry(ws).register_batch([str(deck)])
+    data = await _get_products(app)
+    assert data, "row should project"
+    assert data[0]["starred"] is False  # default, camelCase key present
+
+
+@pytest.mark.asyncio
+async def test_put_star_matches_existing_then_reflects_in_get(app_with_ws):
+    """AC2/AC4: PUT star on an existing path → 200 + persisted; GET reflects starred=True."""
+    app, ws = app_with_ws
+    from core.product_registry import ProductRegistry
+    (ws / "Knowledge" / "Designs").mkdir(parents=True, exist_ok=True)
+    deck = ws / "Knowledge" / "Designs" / "d.html"
+    deck.write_text("<html></html>")
+    ProductRegistry(ws).register_batch([str(deck)])
+    resp = await _put_star(app, "Knowledge/Designs/d.html", True)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["starred"] is True and body["path"] == "Knowledge/Designs/d.html"
+    data = await _get_products(app)
+    assert data[0]["starred"] is True
+
+
+@pytest.mark.asyncio
+async def test_put_star_unknown_path_404_no_append(app_with_ws):
+    """AC2: PUT star on an unknown path → 404, and NO new row is appended."""
+    import json as _json
+    app, ws = app_with_ws
+    from core.product_registry import ProductRegistry
+    (ws / "Knowledge" / "Designs").mkdir(parents=True, exist_ok=True)
+    deck = ws / "Knowledge" / "Designs" / "d.html"
+    deck.write_text("<html></html>")
+    ProductRegistry(ws).register_batch([str(deck)])
+    resp = await _put_star(app, "Projects/../../etc/passwd", True)
+    assert resp.status_code == 404
+    data = _json.loads((ws / ".artifacts" / "products.json").read_text())
+    assert len(data["products"]) == 1  # no append
+    assert data["products"][0]["path"] == "Knowledge/Designs/d.html"

@@ -357,6 +357,12 @@ class Product:
     gitignored: bool
     first_produced: str  # ISO 8601
     last_touched: str    # ISO 8601
+    # run_2b7230be: user favorite. The `= False` DEFAULT is load-bearing — list_products
+    # spreads every stored row via Product(**e), and a LEGACY row (written before this
+    # field existed) carries no `starred` key, so without a default that spread raises
+    # TypeError on every pre-existing product. Must remain the LAST field (dataclass
+    # forbids a defaulted field before a required one).
+    starred: bool = False
 
 
 class ProductRegistry:
@@ -388,6 +394,28 @@ class ProductRegistry:
 
     def list_products(self) -> list[Product]:
         return [Product(**e) for e in self._read().get("products", [])]
+
+    def set_starred(self, path: str, starred: bool) -> bool:
+        """run_2b7230be: toggle the `starred` favorite flag on an EXISTING product row.
+
+        SUBTRACTIVE-SAFE + no-create: matches a stored row by EXACT path equality (the
+        stored path is already the sanitized SwarmWS-relative key — no filesystem
+        resolution/join here, so a traversal or unknown path simply matches nothing and
+        is a no-op, never appends a row). Sets ONLY the boolean; every other field is
+        untouched. flock-guarded via _mutate (P8: the same single-writer primitive the
+        watcher/backfill/purge use). Returns True iff a row matched (caller → 200/404).
+        """
+        matched = {"hit": False}
+
+        def _toggle(data: dict) -> None:
+            for e in data.get("products", []):
+                if e.get("path") == path:
+                    e["starred"] = bool(starred)
+                    matched["hit"] = True
+                    break
+
+        self._mutate(_toggle)
+        return matched["hit"]
 
     def has_backfilled(self) -> bool:
         """True once backfill_from_gitlog has run WITH THE CURRENT backfill version.
@@ -651,7 +679,10 @@ class ProductRegistry:
             for prod in classified:
                 existing = by_path.get(prod.path)
                 if existing is not None:
-                    # Refresh mutable fields.
+                    # Refresh mutable fields. NOTE: starred is deliberately NOT in this
+                    # refresh set — a re-touch (register_batch) mutates `existing` in
+                    # place, so the user's stored `starred` survives untouched
+                    # (run_2b7230be: a favorite is durable across re-registration).
                     existing["role"] = prod.role.value
                     existing["kind"] = prod.kind
                     existing["gitignored"] = prod.gitignored
@@ -669,9 +700,19 @@ class ProductRegistry:
             # inside the SAME flock (P8: no parallel writer). A just-refreshed live
             # product has the newest last_touched, so eviction removes only genuinely
             # stale rows; a re-touched or backfilled product re-enters on next write.
+            # run_2b7230be (Gate-1 finding): a STARRED row is NEVER evicted — a favorite
+            # is permanent, so a starred-but-untouched row must survive the cap even as
+            # the oldest. Sort key puts starred rows LAST (unevictable); among the rest,
+            # oldest-by-last_touched is evicted first. If starred rows alone exceed the
+            # cap the store may exceed MAX_PRODUCTS — deliberate: never drop a favorite.
             if len(products) > MAX_PRODUCTS:
-                products.sort(key=lambda e: e.get("last_touched", ""))
-                del products[: len(products) - MAX_PRODUCTS]
+                products.sort(key=lambda e: (bool(e.get("starred", False)), e.get("last_touched", "")))
+                # evict only from the unstarred, oldest-first prefix
+                n_evict = len(products) - MAX_PRODUCTS
+                evictable = [i for i, e in enumerate(products) if not e.get("starred", False)]
+                for i in evictable[:n_evict]:
+                    products[i] = None  # tombstone
+                products[:] = [e for e in products if e is not None]
 
         self._mutate(_upsert)
 
@@ -782,6 +823,14 @@ class ProductRegistry:
         RE-derives, does NOT trust the stored role: a stale role=Deliverables (written
         before the exclusion shipped) must not shield a noise row from purge.
 
+        run_2b7230be (meta-review MEDIUM): a STARRED row is never purged — the same
+        "a favorite is permanent" invariant the eviction cap honors (AC7). Otherwise the
+        two row-dropping doors would DISAGREE about whether a favorite is sacrosanct
+        (eviction protects it, purge silently removes it on the next version-bump
+        re-backfill if its path later classifies to OTHER — the P8 seam inconsistency).
+        A user who starred something that is genuinely noise can unstar it; the system
+        never revokes a deliberate favorite behind their back.
+
         SUBTRACTIVE + SAFE: only removes rows the classifier no longer considers
         products; never adds, never rewrites a kept row. flock-guarded via _mutate.
         Returns the number of rows removed (for logging/tests).
@@ -792,7 +841,8 @@ class ProductRegistry:
             products = data.get("products", [])
             kept = [
                 e for e in products
-                if not (
+                if bool(e.get("starred", False))  # a favorite is permanent (mirrors eviction)
+                or not (
                     _is_garbage(e.get("path", ""))
                     or derive_role(e.get("path", ""), None) == Role.OTHER
                 )
