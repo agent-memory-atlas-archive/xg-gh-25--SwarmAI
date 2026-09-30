@@ -408,8 +408,8 @@ function DeliverablesGallery({
       <div className="text-[10px] uppercase tracking-wide text-[var(--color-text-muted)] font-semibold px-0.5 pb-2">
         {group.label}
       </div>
-      {/* AC3: 3-column thumbnail-tile gallery (mockup .gallery repeat(3,1fr) gap 14px) */}
-      <div className="grid grid-cols-3 gap-3.5">
+      {/* run_fe228bc0: 4-column gallery (was 3) — denser tile wall scans faster. */}
+      <div className="grid grid-cols-4 gap-3">
         {group.products.map((p) => {
           const { kind, badge } = thumbKind(p.path);
           const title = friendlyTitle(p.path);
@@ -421,10 +421,10 @@ function DeliverablesGallery({
               data-testid="artifacts-card"
               className="group flex flex-col rounded-[10px] overflow-hidden border border-transparent bg-[var(--color-bg-secondary,var(--color-hover))] hover:border-[var(--color-primary)]/50 hover:bg-[var(--color-hover)] transition-colors text-left"
             >
-              {/* AC1/AC2: 16:10 thumbnail zone with a type-differentiated faux-preview + badge */}
+              {/* AC1/AC2: flatter 16:7 thumbnail zone (was 16:10) — shorter card, denser wall */}
               <span
                 data-testid="artifacts-card-thumb"
-                className="relative block aspect-[16/10] w-full overflow-hidden"
+                className="relative block aspect-[16/7] w-full overflow-hidden"
                 style={{ background: 'linear-gradient(135deg,#232838,#1a1e28)' }}
               >
                 <ThumbPreview kind={kind} name={baseName(p.path)} />

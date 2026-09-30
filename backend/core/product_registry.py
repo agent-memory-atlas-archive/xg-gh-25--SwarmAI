@@ -88,7 +88,7 @@ _STORE_VERSION = 1
 # constant invalidates a store whose stored backfill_version is older → has_backfilled()
 # returns False once → the endpoint re-runs backfill with the new logic, correcting the
 # stale data. Bump this whenever backfill/scan/classification OUTPUT changes.
-_BACKFILL_VERSION = 2
+_BACKFILL_VERSION = 3  # run_fe228bc0: bumped so the noise-exclusion reclassifies the existing ~637 rows on deploy
 
 # Run 2 AC4: bounded store. Registering past this cap evicts the OLDEST entries by
 # last_touched inside the same flock-guarded _upsert (never a parallel writer, P8).
@@ -104,7 +104,9 @@ MAX_PRODUCTS = 2000
 # a sibling like "assets-backup").
 _PRODUCT_DIR_SEGMENTS: tuple[str, ...] = (
     "assets",        # Projects/*/assets/** — decks, generated media
-    "Attachments",   # Attachments/** — user-attached / produced images
+    # NOTE (run_fe228bc0): "Attachments" was REMOVED — Attachments/** is INPUT
+    # (chat attachments the user sent us), NOT a product OUTPUT the user reopens.
+    # The whole tree is excluded via _is_excluded_path (XG decision).
     "Library",       # Knowledge/Library/** — published decks/reports (Run-3 AC3)
     "Pollinate",     # Knowledge/Pollinate/** — Pollinate content packages (Run-3 AC3)
     "deliverables",  # Projects/*/deliverables/** — project deliverables (Run-3 AC3)
@@ -186,6 +188,51 @@ _GARBAGE_MARKERS: tuple[str, ...] = (
     ".bak", ".broken", ".tmp", ".temp", ".corrupt", ".orig", ".swp", ".old",
 )
 
+# run_fe228bc0: image extensions that, when nested under an assets/ dir, are a deck's
+# INTERMEDIATE parts (slide-2x / raw / preview), not the deck itself. The deck MAIN
+# product (.html/.pdf/.pptx/.md) under assets/ is kept; only these loose images drop.
+_ASSET_IMAGE_EXTENSIONS: frozenset[str] = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".avif",
+})
+
+
+def _is_excluded_path(rel_path: str) -> bool:
+    """True iff rel_path is NOISE that must never enter the registry (run_fe228bc0).
+
+    Three exclusion classes, checked at the shared classification seam so every door
+    (live watcher, backfill, fs-scan) agrees (P8):
+      (1) ANY dot-folder segment (.claude/, .git/, any `.xxx/`) — infra/internal
+          resources, never a user product. Checked on every segment EXCEPT the
+          basename (a dotfile that IS the product, e.g. `.env`, is handled by the
+          Other/secret guards, not here; here we drop dot-DIRECTORIES).
+      (2) an image file nested under an `assets/` dir — a deck's intermediate part,
+          not the deliverable. The deck MAIN product (.html/.pdf/.pptx/.md) is kept.
+      (3) the entire `Attachments/` tree — INPUT (chat attachments), not a product
+          OUTPUT (XG decision).
+    Purely SUBTRACTIVE: only ever REMOVES paths, so it cannot surface a new file and
+    cannot weaken the existing secret defenses.
+    """
+    norm = rel_path.replace("\\", "/")
+    parts = [p for p in norm.split("/") if p not in ("", ".")]
+    if not parts:
+        return False
+    # (3) Attachments tree — first segment. Case-insensitive (macOS/APFS is
+    # case-insensitive, so `attachments/` is the same dir as `Attachments/`; match
+    # the intent, not the exact casing — consistent with the assets check below).
+    if parts[0].lower() == "attachments":
+        return True
+    # (1) dot-folder DIRECTORY segment (exclude the basename at index -1).
+    for seg in parts[:-1]:
+        if seg.startswith("."):
+            return True
+    # (2) image nested under an assets/ dir.
+    lower_parts = {p.lower() for p in parts[:-1]}
+    if "assets" in lower_parts:
+        ext = norm[norm.rfind("."):].lower() if "." in parts[-1] else ""
+        if ext in _ASSET_IMAGE_EXTENSIONS:
+            return True
+    return False
+
 
 def _is_garbage(rel_path: str) -> bool:
     """True iff rel_path is a backup/temp/corrupt byproduct — never a product.
@@ -254,10 +301,17 @@ def derive_role(rel_path: str, repo: Optional[str]) -> Role:
     """
     parts = [p for p in Path(rel_path).parts if p not in (".", "")]
 
-    # Pipeline: a run REPORT under .artifacts/runs/ — check BEFORE kind, because the
-    # dot-segment (.artifacts) would make _classify_kind return "process".
+    # Pipeline: a run REPORT under .artifacts/runs/ — check BEFORE the exclusion +
+    # kind, because the dot-segment (.artifacts) would otherwise be dropped by the
+    # dot-folder exclusion AND make _classify_kind return "process".
     if ".artifacts" in parts and "runs" in parts and parts[-1] == "REPORT.md":
         return Role.PIPELINE
+
+    # run_fe228bc0: noise exclusion (dot-folders / assets-images / Attachments) →
+    # Other, so _classify drops it. Runs AFTER the Pipeline REPORT short-circuit
+    # (a REPORT under .artifacts/runs is a legit product despite the dot-folder).
+    if _is_excluded_path(rel_path):
+        return Role.OTHER
 
     # Activity: automated per-day logs.
     if "DailyActivity" in parts or "Signals" in parts or "DailyBriefs" in parts:
@@ -743,6 +797,19 @@ class ProductRegistry:
                         if _is_secretish_name(fn):
                             continue
                         fp = Path(dirpath) / fn
+                        # run_fe228bc0: skip noise (assets-image intermediates, dot-folder
+                        # nested files) at the scan too — _classify would drop them via
+                        # derive_role->Other anyway, but skipping here avoids collecting
+                        # a deck's hundreds of slide images only to discard them.
+                        rel_for_excl = None
+                        try:
+                            _r = fp.resolve()
+                            if _r.is_relative_to(self.workspace_root):
+                                rel_for_excl = str(_r.relative_to(self.workspace_root))
+                        except OSError:
+                            rel_for_excl = None
+                        if rel_for_excl and _is_excluded_path(rel_for_excl):
+                            continue
                         try:
                             if not fp.is_file():
                                 continue

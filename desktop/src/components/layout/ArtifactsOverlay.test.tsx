@@ -334,6 +334,19 @@ describe('Deliverables tile — AC1/AC2/AC3 render', () => {
     // type badge (HTML for a .html)
     expect(screen.getByTestId('artifacts-card-badge')).toHaveTextContent(/DECK/i); // name has -deck
   });
+
+  it('AC5: gallery is a 4-column grid with a flatter (16:7) thumbnail tile', async () => {
+    const fetchProducts = vi.fn().mockResolvedValue([
+      prod('Knowledge/Library/a-deck.html', 'Deliverables'),
+    ]);
+    renderWithClient(<ArtifactsContent close={() => {}} fetchProducts={fetchProducts} />);
+    await waitFor(() => expect(screen.getByTestId('artifacts-card')).toBeInTheDocument());
+    // 4-col grid (the card's grid container)
+    const card = screen.getByTestId('artifacts-card');
+    expect(card.parentElement?.className).toMatch(/grid-cols-4/);
+    // flatter thumbnail aspect (16:7, not the old 16:10)
+    expect(screen.getByTestId('artifacts-card-thumb').className).toMatch(/aspect-\[16\/7\]/);
+  });
 });
 
 describe('Gate-2 adversarial fixes', () => {

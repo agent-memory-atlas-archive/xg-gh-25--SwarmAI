@@ -102,7 +102,9 @@ class TestAC2DeriveRole:
         "rel_path,repo,expected_role",
         [
             ("Projects/AIDLC/assets/deck.html", None, "Deliverables"),
-            ("Attachments/2026-09-30/x.png", None, "Deliverables"),
+            # Attachments is INPUT (chat attachments), not a product OUTPUT — excluded
+            # entirely (run_fe228bc0). derive_role returns Other so _classify drops it.
+            ("Attachments/2026-09-30/x.png", None, "Other"),
             ("Knowledge/Designs/2026-09-30-x.md", None, "Deliverables"),
             ("Projects/SwarmAI/2-understanding/TECH.md", None, "Knowledge"),
             ("Knowledge/Library/2026-09-11-x.md", None, "Knowledge"),
@@ -248,26 +250,31 @@ class TestAC3GitignoredProducts:
         )
 
     def test_real_product_inside_assets_still_registers(self, ws):
-        """The fix must not break the legit case: a deck/image under assets/ or
-        Attachments/ still surfaces as Deliverables."""
+        """The fix must not break the legit case: a deck MAIN product (.html/.pdf)
+        under assets/ still surfaces. But (run_fe228bc0) a loose IMAGE under assets/
+        is a deck intermediate PART (dropped), and an Attachments/ image is INPUT
+        (dropped) — neither is a Deliverable."""
         from core.product_registry import ProductRegistry
 
         deck = ws / "Projects" / "AIDLC" / "assets" / "deck.html"
         deck.parent.mkdir(parents=True)
         deck.write_text("<html>")
-        img = ws / "Attachments" / "2026" / "x.png"
-        img.parent.mkdir(parents=True)
-        img.write_text("png")
+        att = ws / "Attachments" / "2026" / "x.png"  # INPUT — must NOT register
+        att.parent.mkdir(parents=True)
+        att.write_text("png")
+        asset_img = ws / "Projects" / "AIDLC" / "assets" / "slide-2x.png"  # part — NOT
+        asset_img.write_text("png")
         pdf = ws / "Projects" / "X" / "assets" / "report.pdf"
         pdf.parent.mkdir(parents=True)
         pdf.write_text("%PDF")
-        ProductRegistry(ws).register_batch([str(deck), str(img), str(pdf)])
+        ProductRegistry(ws).register_batch([str(deck), str(att), str(asset_img), str(pdf)])
         store = ws / ".artifacts" / "products.json"
         products = json.loads(store.read_text())["products"]
         roles = {e["path"].rsplit("/", 1)[-1]: e["role"] for e in products}
         assert roles.get("deck.html") == "Deliverables"
-        assert roles.get("x.png") == "Deliverables"
-        assert roles.get("report.pdf") == "Deliverables", "known product extensions must surface"
+        assert roles.get("report.pdf") == "Deliverables", "deck MAIN products must surface"
+        assert "x.png" not in roles, "an Attachments/ image is INPUT — must not register"
+        assert "slide-2x.png" not in roles, "a loose image under assets/ is a deck PART — must not register"
 
     def test_other_role_files_are_not_products(self, ws):
         """The store holds PRODUCTS only — a tracked non-product file (role Other)
@@ -864,3 +871,48 @@ class TestRun3Gate2VersionedBackfill:
         assert ProductRegistry(git_ws).has_backfilled() is True, "post-re-backfill must be marked done"
         data = _json.loads(store.read_text())
         assert data["backfill_version"] == _BACKFILL_VERSION
+
+
+# -- run_fe228bc0: noise-cleanup exclusions (dot-folder / assets-image / Attachments) --
+
+
+class TestNoiseCleanupExclusions:
+    """The registry surfaces PRODUCTS only. Three exclusion classes must drop at the
+    shared classification seam (derive_role -> Other, and _classify -> None):
+    (1) any dot-folder segment (.claude/.git/any .xxx), (2) an image nested under an
+    assets/ dir (deck intermediate part), (3) the entire Attachments/ tree (input).
+    A deck MAIN product (.html/.pdf/.pptx/.md) under assets/ is KEPT.
+    """
+
+    @pytest.mark.parametrize(
+        "rel_path",
+        [
+            ".claude/skills/s_pollinate/brand/assets/logo/qr-github.png",
+            "Projects/AIDLC/.git/assets/x.png",
+            "Knowledge/.hidden/report.html",
+            "Projects/AIDLC/assets/2026-07-28-slides/slide-rocky-2x.png",
+            "Projects/AIDLC/assets/slide2.svg",
+            "Knowledge/Notes/assets/cntech-landscape.jpg",
+            "Attachments/2026-09-30/screenshot.png",
+            "Attachments/2026-06-29/x.pdf",
+            "attachments/2026-09-30/lowercase.png",  # case-insensitive (Gate-2 LOW)
+        ],
+    )
+    def test_excluded_paths_derive_to_other(self, rel_path):
+        from core.product_registry import derive_role
+
+        assert derive_role(rel_path, None) == "Other", f"{rel_path} should be excluded"
+
+    @pytest.mark.parametrize(
+        "rel_path,expected",
+        [
+            ("Projects/AIDLC/assets/2026-08-30-ai-native-deck.html", "Deliverables"),
+            ("Projects/AIDLC/assets/deck.pdf", "Deliverables"),
+            ("Projects/AIDLC/assets/slides.pptx", "Deliverables"),
+            ("Knowledge/Designs/2026-09-30-x.md", "Deliverables"),
+        ],
+    )
+    def test_deck_main_products_kept(self, rel_path, expected):
+        from core.product_registry import derive_role
+
+        assert derive_role(rel_path, None) == expected, f"{rel_path} should be kept"
