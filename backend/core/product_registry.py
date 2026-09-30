@@ -87,8 +87,11 @@ _STORE_VERSION = 1
 # would NEVER reach the rows a prior backfill wrote with the OLD logic. Bumping this
 # constant invalidates a store whose stored backfill_version is older → has_backfilled()
 # returns False once → the endpoint re-runs backfill with the new logic, correcting the
-# stale data. Bump this whenever backfill/scan/classification OUTPUT changes.
-_BACKFILL_VERSION = 3  # run_fe228bc0: bumped so the noise-exclusion reclassifies the existing ~637 rows on deploy
+# stale data. Bump this whenever backfill/scan/classification OUTPUT changes. The
+# re-backfill ADDS/refreshes via register_batch AND runs _purge_excluded, which drops
+# stored rows a NEW exclusion rule now rejects — so a version bump both re-adds with the
+# new logic AND removes now-excluded noise (register_batch alone never removes).
+_BACKFILL_VERSION = 3  # run_fe228bc0: bumped so the re-backfill PURGES the existing noise rows (assets images / .claude / Attachments) on deploy
 
 # Run 2 AC4: bounded store. Registering past this cap evicts the OLDEST entries by
 # last_touched inside the same flock-guarded _upsert (never a parallel writer, P8).
@@ -265,7 +268,8 @@ def _under_product_dir(rel_path: str) -> bool:
     """True iff rel_path is a real PRODUCT under an allowlisted dir.
 
     Three gates, ALL must hold: (1) a whitelisted product SEGMENT (``assets`` /
-    ``Attachments``) appears in the path; (2) NO dependency/vendor segment appears
+    ``Library`` / ``Pollinate`` / ``deliverables`` — NOT ``Attachments``, removed
+    run_fe228bc0 as it is INPUT not a product) appears in the path; (2) NO dependency/vendor segment appears
     (``node_modules/.../assets/...`` is 3rd-party — Gate-2 Claim 3); (3) the basename
     has a known PRODUCT EXTENSION (media/document — the Red-Team positive-allowlist
     fix). A secret/config/no-extension file under assets/ fails gate 3 → NOT a
@@ -737,6 +741,16 @@ class ProductRegistry:
             self.register_batch(abs_paths, times=times)
         # AC4: also fs-scan the gitignored product dirs git-log can NEVER list.
         self.scan_product_dirs()
+        # run_fe228bc0 (Gate-2 HIGH): register_batch/_upsert only ADD or refresh rows —
+        # neither removes a row that a NEW exclusion rule now drops. So a version-bump
+        # re-backfill would leave the ~324 pre-existing noise rows (assets images,
+        # .claude/**, Attachments/**) in the store forever, and the read path returns
+        # them verbatim. Reconcile: drop any STORED row that _is_excluded_path or
+        # _is_garbage now rejects. Purely SUBTRACTIVE (only removes non-products),
+        # flock-guarded via _mutate, idempotent. This is what makes the _BACKFILL_VERSION
+        # bump actually clean existing data (the "migration re-points but never cleans"
+        # class — MEMORY: a migration that re-points at a new rule MUST populate/clean it).
+        self._purge_excluded()
         # Mark backfill DONE (git-log succeeded) even when zero products were found,
         # so has_backfilled() is True and the endpoint won't re-run the git-log on the
         # next open of a product-less workspace. Stamp the CURRENT _BACKFILL_VERSION so a
@@ -745,6 +759,35 @@ class ProductRegistry:
             data["backfilled_at"] = datetime.now(timezone.utc).isoformat()
             data["backfill_version"] = _BACKFILL_VERSION
         self._mutate(_mark)
+
+    def _purge_excluded(self) -> int:
+        """Drop stored rows that a current exclusion rule now rejects (run_fe228bc0).
+
+        Reconciliation for a version-bump re-backfill: register_batch/_upsert never
+        REMOVE, so a newly-excluded path (assets image, dot-folder, Attachments,
+        garbage byproduct) already in the store would persist forever. This re-applies
+        _is_excluded_path + _is_garbage to EXISTING rows and removes the rejects.
+
+        SUBTRACTIVE + SAFE: only removes rows the classifier no longer considers
+        products; never adds, never rewrites a kept row. flock-guarded via _mutate.
+        Returns the number of rows removed (for logging/tests).
+        """
+        removed = {"n": 0}
+
+        def _reconcile(data: dict) -> None:
+            products = data.get("products", [])
+            kept = [
+                e for e in products
+                if not (_is_excluded_path(e.get("path", "")) or _is_garbage(e.get("path", "")))
+            ]
+            removed["n"] = len(products) - len(kept)
+            if removed["n"]:
+                data["products"] = kept
+
+        self._mutate(_reconcile)
+        if removed["n"]:
+            logger.info("ProductRegistry._purge_excluded: removed %d now-excluded rows", removed["n"])
+        return removed["n"]
 
     def scan_product_dirs(self) -> None:
         """AC4: fs-walk known PRODUCT dirs for files git-log never lists (gitignored

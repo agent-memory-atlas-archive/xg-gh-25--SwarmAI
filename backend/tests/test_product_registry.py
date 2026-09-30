@@ -916,3 +916,48 @@ class TestNoiseCleanupExclusions:
         from core.product_registry import derive_role
 
         assert derive_role(rel_path, None) == expected, f"{rel_path} should be kept"
+
+
+class TestPurgeExcludedOnRebackfill:
+    """run_fe228bc0 Gate-2 HIGH: register_batch never REMOVES, so a version-bump
+    re-backfill must PURGE stored rows that a new exclusion rule now rejects — else
+    the pre-existing noise (assets images / .claude / Attachments) survives forever
+    and the read path returns it verbatim. _purge_excluded reconciles the store.
+    """
+
+    def _seed_store(self, ws, rows):
+        import json as _json
+        store = ws / ".artifacts"
+        store.mkdir(parents=True, exist_ok=True)
+        (store / "products.json").write_text(_json.dumps({
+            "version": 1,
+            "products": [
+                {"path": p, "role": "Deliverables", "kind": "content",
+                 "gitignored": False, "first_produced": "2026-01-01T00:00:00+00:00",
+                 "last_touched": "2026-01-01T00:00:00+00:00"} for p in rows
+            ],
+        }))
+
+    def test_purge_removes_now_excluded_rows_keeps_real(self, ws):
+        import json as _json
+        from core.product_registry import ProductRegistry
+
+        self._seed_store(ws, [
+            "Attachments/2026-09-30/x.png",              # excluded (input)
+            "Projects/AIDLC/assets/slide-2x.png",        # excluded (assets image part)
+            ".claude/skills/s/brand/logo.png",           # excluded (dot-folder)
+            "Knowledge/Library/real-deck.html",          # KEPT (real deliverable)
+            "Projects/AIDLC/assets/deck.pdf",            # KEPT (deck main product)
+        ])
+        removed = ProductRegistry(ws).            _purge_excluded()  # noqa: E501
+        assert removed == 3, f"must purge exactly the 3 noise rows, removed {removed}"
+        data = _json.loads((ws / ".artifacts" / "products.json").read_text())
+        paths = {e["path"] for e in data["products"]}
+        assert paths == {"Knowledge/Library/real-deck.html", "Projects/AIDLC/assets/deck.pdf"}
+
+    def test_purge_is_idempotent_noop_on_clean_store(self, ws):
+        from core.product_registry import ProductRegistry
+
+        self._seed_store(ws, ["Knowledge/Library/real-deck.html"])
+        assert ProductRegistry(ws)._purge_excluded() == 0
+        assert ProductRegistry(ws)._purge_excluded() == 0
