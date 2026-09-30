@@ -80,6 +80,12 @@ export interface ReferencedFile {
    *  Show-Changes disabled) instead of being removed — "the user should see what I
    *  deleted" (XG). Undefined/false = a live written row. */
   deleted?: boolean;
+  /** Artifact-Lifecycle P0 (②): the backing file drifted from the state this row
+   *  recorded (baseRef/firstSeen). Computed lazily/debounced via GET /artifacts/drift,
+   *  NEVER on the render hot path. 'dirty' = changed since first seen; 'missing' = the
+   *  file is gone (surfaced, not silent). Undefined = not-yet-checked / clean.
+   *  Additive-optional: the write/delete reducers do NOT set it (only the drift check does). */
+  liveDirty?: 'dirty' | 'missing';
 }
 
 /** Detail shape of the unified `swarm:file-changed` event (from the SSE bridge). */

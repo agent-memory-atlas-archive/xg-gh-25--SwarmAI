@@ -285,6 +285,155 @@ async def get_recent_artifacts(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Artifact drift — live_dirty signal (Artifact-Lifecycle P0, ②)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Reuse the SINGLE fail-safe git runner (returns None on any error) — do NOT add a
+# second git wrapper (canvas_surface owns it; a second one drifts, run_4de279ca).
+# Imported into THIS module namespace so the drift handler calls ``_git(...)`` and
+# a test can monkeypatch ``routers.artifacts._git`` to force the fail-safe branch.
+from core.canvas_surface import _git  # noqa: E402
+
+
+class DriftResponse(BaseModel):
+    """Whether a Canvas/Artifacts row's backing file changed since it was last seen."""
+
+    dirty: bool
+    reason: str  # 'git-changed' | 'mtime-newer' | 'missing' | 'clean'
+    current_ref: Optional[str] = None
+
+
+# Drift probes run git subprocesses. The frontend fans out one probe PER Canvas row,
+# so a 50-row session would otherwise dispatch 50 concurrent probes onto the SHARED
+# default anyio thread pool (~40 tokens) that /health + streaming also use — the
+# RP53/RP35 event-loop-starvation failure this codebase has hit before. A DEDICATED
+# small limiter caps drift's slice of the pool so it can NEVER starve the shared one:
+# excess probes queue on the limiter (a bounded wait), health/streaming stay free.
+# (Frontend ALSO chunks its fan-out — defense in depth; this is the backend backstop.)
+_DRIFT_LIMITER = anyio.CapacityLimiter(4)
+
+
+@router.get("/artifacts/drift", response_model=DriftResponse)
+async def get_artifact_drift(
+    path: str = Query(..., description="Workspace-relative or absolute file path"),
+    since_ref: Optional[str] = Query(
+        None, description="git sha the row recorded (link rows carry baseRef)"
+    ),
+    since_ms: Optional[int] = Query(
+        None, description="epoch-ms the row was first seen (firstSeen; for untracked files)"
+    ),
+) -> DriftResponse:
+    """Report whether ``path`` drifted from the state a Canvas/Artifacts row recorded.
+
+    A row is a live pointer (``ReferencedFile``): it stores ``baseRef`` (a git sha)
+    and ``firstSeen`` (epoch-ms). This endpoint compares the file's CURRENT state to
+    that baseline so the UI can show a "changed since you saw it" / "file gone" badge.
+
+    Resolution:
+      - file absent            → ``missing`` (dirty=True — surfaced, not silent)
+      - tracked (git-owned)    → last-commit sha != ``since_ref`` → ``git-changed``
+      - untracked, has since_ms→ fs mtime(ms) > ``since_ms``      → ``mtime-newer``
+      - otherwise / git error  → ``clean`` (dirty=False)
+
+    FAIL-SAFE: any git error, unresolvable path, or uncomputable comparison degrades
+    to ``clean`` — NEVER a false ``dirty``/``missing`` (a badge that cries wolf is
+    worse than no badge). The badge never blocks opening the row (frontend contract).
+    """
+    workspace_path = await _get_workspace_path()
+    ws_root = Path(workspace_path)
+
+    # Resolve the target: accept absolute or workspace-relative.
+    try:
+        p = Path(path)
+        abs_p = p if p.is_absolute() else (ws_root / p)
+        abs_p = abs_p.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return DriftResponse(dirty=False, reason="clean")  # unresolvable → fail-safe
+
+    # SECURITY (RP52/RP44 — path confinement): `path` is caller-supplied, so an
+    # attacker could probe `/etc/passwd` or `~/.ssh/id_rsa` and learn a file's
+    # existence + mtime via the untracked branch below. Canvas/Artifacts rows are
+    # ONLY ever owned files, so confine to a known tree using the SAME canonical
+    # resolver everything else uses (classify_source → _owning_tree). A path not
+    # owned by SwarmWS / a bound worktree is refused → clean (never disclosing an
+    # arbitrary file's state). Reuses the single source of truth — no 2nd allowlist.
+    try:
+        from core.artifact_source import classify_source
+
+        kind, _why = classify_source(str(abs_p), swarmws_root=str(ws_root))
+    except Exception:  # noqa: BLE001 — fail-safe: cannot classify → do not probe
+        kind = "copy"
+    if kind != "link":
+        return DriftResponse(dirty=False, reason="clean")
+
+    # File gone → missing (surfaced, not silent — mirrors KiroCrew source_missing).
+    if not abs_p.exists():
+        return DriftResponse(dirty=True, reason="missing")
+
+    # Directory / non-regular file → nothing to diff → clean.
+    if not abs_p.is_file():
+        return DriftResponse(dirty=False, reason="clean")
+
+    file_dir = abs_p.parent
+
+    def _probe() -> DriftResponse:
+        # Is the file tracked by git? rev-parse from its own dir (fail-safe on None).
+        rp = _git(file_dir, "rev-parse", "--is-inside-work-tree")
+        in_git = (
+            rp is not None
+            and rp.returncode == 0
+            and rp.stdout.decode("utf-8", "replace").strip() == "true"
+        )
+        if in_git:
+            log = _git(file_dir, "log", "-1", "--format=%H", "--", str(abs_p))
+            if log is None or log.returncode != 0:
+                return DriftResponse(dirty=False, reason="clean")  # git error → fail-safe
+            current = log.stdout.decode("utf-8", "replace").strip()
+            if not current:
+                # Tracked-repo but file has no commit (staged/new) → fall through to
+                # the mtime comparison below rather than guessing dirty.
+                return _mtime_probe()
+            if since_ref:
+                # `since_ref` is a git REVSPEC, not a raw sha. A Canvas row's baseRef is
+                # `<sha>^` (the diff-baseline PARENT of the commit that surfaced the row —
+                # ui_actions.py:340 / canvas_surface.py:183), so a raw string `!=` against
+                # `current` (a bare 40-hex sha) is ALWAYS unequal → a permanent false
+                # "git-changed" on every source-final row (the cries-wolf failure this
+                # endpoint's own docstring warns against). Resolve BOTH sides through
+                # rev-parse and compare canonical shas. `<sha>^` resolves to the parent;
+                # the file "changed since the row appeared" iff its current last-commit
+                # is NOT that same parent — i.e. resolved(since_ref) != current.
+                rev = _git(file_dir, "rev-parse", "--verify", "--quiet", f"{since_ref}^{{commit}}")
+                if rev is None or rev.returncode != 0:
+                    # since_ref unresolvable in this repo → cannot compute → fail-safe clean.
+                    return DriftResponse(dirty=False, reason="clean", current_ref=current)
+                resolved = rev.stdout.decode("utf-8", "replace").strip()
+                if resolved and resolved != current:
+                    return DriftResponse(dirty=True, reason="git-changed", current_ref=current)
+            return DriftResponse(dirty=False, reason="clean", current_ref=current or None)
+        return _mtime_probe()
+
+    def _mtime_probe() -> DriftResponse:
+        # Untracked / non-git: compare fs mtime (ms) to the row's firstSeen (ms).
+        if since_ms is None:
+            return DriftResponse(dirty=False, reason="clean")  # no baseline → fail-safe
+        try:
+            mtime_ms = int(abs_p.stat().st_mtime * 1000)
+        except OSError:
+            return DriftResponse(dirty=False, reason="clean")
+        if mtime_ms > since_ms:
+            return DriftResponse(dirty=True, reason="mtime-newer")
+        return DriftResponse(dirty=False, reason="clean")
+
+    try:
+        # Dedicated limiter (not the shared pool) — see _DRIFT_LIMITER rationale.
+        return await anyio.to_thread.run_sync(_probe, limiter=_DRIFT_LIMITER)
+    except Exception:  # noqa: BLE001 — fail-safe: never surface a false dirty on error
+        logger.exception("drift probe failed for %s — degrading to clean", path)
+        return DriftResponse(dirty=False, reason="clean")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Pipeline Artifact Endpoints (ArtifactRegistry)
 # ─────────────────────────────────────────────────────────────────────────────
 
