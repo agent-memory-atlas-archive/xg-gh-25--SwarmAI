@@ -24,6 +24,10 @@ from pathlib import Path
 from typing import Optional
 
 from core import executors
+from core.context_directory_loader import (
+    EFFECTIVE_1M_BUDGET as _CDL_EFFECTIVE_1M_BUDGET,
+    EMERGENCY_MARGIN as _CDL_EMERGENCY_MARGIN,
+)  # budget-threshold SoT (run_72ca2a97) — derived, not hand-typed
 from core.initialization_manager import initialization_manager
 from core.project_registry import DDD_CANONICAL_DOCS  # Run 0: single source of truth
 from core.ddd_paths import ddd_path  # six-section layout resolver (SSOT)
@@ -3068,15 +3072,11 @@ class ContextHealthHook:
     # WARNING/EMERGENCY finding to the deep-check report so the SEPARATE write-side
     # management line (decay/archive/trim — deferred #3) has a signal. WARNING is
     # anchored to the effective assembly budget; EMERGENCY is a clear-over.
-    # Measured with the calibrated estimate_tokens — the same estimator the
-    # assembly uses, so this number matches what actually enters the prompt.
-    # WARNING = BUDGET_1M_MODEL (150K) − EPHEMERAL_HEADROOM (9K) = 141K, the
-    # effective context-file budget for a 1M model (raised 2026-09-30 with the
-    # BUDGET_1M_MODEL 100K→150K bump; the old 91K derived from the old 100K base).
-    # NOTE (follow-up): these mirror compute_token_budget()−EPHEMERAL_HEADROOM by
-    # hand; a future change should derive them so a base bump propagates on its own.
-    _WARNING_THRESHOLD = 141_000
-    _EMERGENCY_THRESHOLD = 180_000
+    # DERIVED from the budget SoT in context_directory_loader (run_72ca2a97) — a
+    # change to BUDGET_1M_MODEL or the ephemeral formula now propagates here
+    # automatically (no hand-typed literal). WARNING = 141K, EMERGENCY = 180K.
+    _WARNING_THRESHOLD = _CDL_EFFECTIVE_1M_BUDGET
+    _EMERGENCY_THRESHOLD = _CDL_EFFECTIVE_1M_BUDGET + _CDL_EMERGENCY_MARGIN
 
     def _check_token_budget(self, context_dir: Path) -> list[str]:
         """Measure total token consumption across all 9 context files.

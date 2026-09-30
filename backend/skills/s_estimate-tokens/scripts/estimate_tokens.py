@@ -19,8 +19,10 @@ Usage:
     estimate_tokens.py [--window N] <file> [<file> ...]
     <command> | estimate_tokens.py [--window N]      # reads stdin
 
---window defaults to 141000 (the effective context-file assembly budget for a 1M
-model: 150K base budget − 9K ephemeral headroom). Override for other budgets.
+--window defaults to the effective context-file assembly budget for a 1M model,
+derived at runtime from context_directory_loader.EFFECTIVE_1M_BUDGET (base budget −
+ephemeral headroom; currently 141K). Run with --help to see the live value.
+Override for other budgets.
 """
 from __future__ import annotations
 
@@ -28,10 +30,51 @@ import argparse
 import sys
 from pathlib import Path
 
-# Effective context-file budget for our default 1M-context models:
-#   compute_token_budget() → 150_000 base, minus EPHEMERAL_HEADROOM (9_000).
-# (Base raised 100K→150K on 2026-09-30; see BUDGET_1M_MODEL docstring.)
-DEFAULT_WINDOW = 141_000
+# Effective context-file budget for our default 1M-context models — DERIVED from
+# the budget SoT (context_directory_loader.EFFECTIVE_1M_BUDGET = BUDGET_1M_MODEL −
+# EPHEMERAL_HEADROOM), so a base-budget change propagates here automatically
+# (run_72ca2a97). Falls back to the current value only if the canonical module is
+# unreachable (e.g. run from a frozen bundle with no source) — a fail-SAFE default,
+# not a 2nd source of truth: when the module IS reachable, this always tracks it.
+_DEFAULT_WINDOW_FALLBACK = 141_000
+
+
+def _load_effective_1m_budget() -> int:
+    """Resolve EFFECTIVE_1M_BUDGET from the canonical loader, reusing the same
+    repo-discovery as the estimator. Returns the fallback if unreachable."""
+    import os
+
+    marker = Path("backend") / "core" / "context_directory_loader.py"
+    candidates = []
+    env_root = os.environ.get("SWARM_REPO_ROOT")
+    if env_root:
+        candidates.append(Path(env_root).resolve())
+    candidates.extend(Path(__file__).resolve().parents)
+    candidates.extend(Path.cwd().resolve().parents)
+    candidates.append(Path.cwd().resolve())
+    home = Path.home()
+    candidates.extend(
+        home / rel
+        for rel in ("Desktop/SwarmAI-Workspace/swarmai", "SwarmAI-Workspace/swarmai", "swarmai")
+    )
+    seen = set()
+    for base in candidates:
+        if base in seen:
+            continue
+        seen.add(base)
+        if (base / marker).is_file():
+            backend = str(base / "backend")
+            if backend not in sys.path:
+                sys.path.insert(0, backend)
+            try:
+                from core.context_directory_loader import EFFECTIVE_1M_BUDGET  # type: ignore
+                return int(EFFECTIVE_1M_BUDGET)
+            except Exception:
+                break
+    return _DEFAULT_WINDOW_FALLBACK
+
+
+DEFAULT_WINDOW = _load_effective_1m_budget()
 
 
 def _load_canonical_estimator():

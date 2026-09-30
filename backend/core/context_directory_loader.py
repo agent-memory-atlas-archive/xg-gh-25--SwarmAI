@@ -97,6 +97,39 @@ on 1M models; all context files inject in full). 150K → ~141K effective
 clears it with real growth headroom, and stays far below the 500K tier
 floor so the budget remains strictly inside the model window."""
 
+# ── Ephemeral headroom + effective-budget SoT (run_72ca2a97) ──────────────────
+# SINGLE SOURCE for the "effective context-file budget" = base − ephemeral overhead.
+# Before this, the post-subtraction result (141_000) was hand-typed as independent
+# literals in context_health_hook, context_brain, and the estimate-tokens skill, and
+# EPHEMERAL_HEADROOM was computed function-locally inside prompt_builder — so a base
+# change had to be hand-synced across every mirror (the drift class run_1b2655df hit).
+# Everything below is DERIVED by arithmetic from module constants, so a change to
+# BUDGET_1M_MODEL or TOKEN_CAP_PER_DAILY_FILE propagates to all consumers automatically.
+TOKEN_CAP_PER_DAILY_FILE = 2000
+"""Per-file token cap for injected DailyActivity files (2 files injected)."""
+
+RESUME_CONTEXT_HEADROOM = 5000
+"""Reserve for the resume-context block appended after the budgeted assembly."""
+
+EPHEMERAL_HEADROOM = 2 * TOKEN_CAP_PER_DAILY_FILE + RESUME_CONTEXT_HEADROOM
+"""Ephemeral overhead subtracted from the base budget to get the effective
+context-file budget. FORMULA-anchored (never a bare literal) so it tracks its
+inputs: 2×DailyActivity cap + resume headroom = 9,000."""
+
+EFFECTIVE_1M_BUDGET = BUDGET_1M_MODEL - EPHEMERAL_HEADROOM
+"""Effective context-file budget for a 1M-context model = 141,000.
+
+Uses the two module constants directly (NOT ``compute_token_budget`` — that is an
+instance method, uncallable at module import). This is exact for the 1M case: the
+``>= 500_000`` branch of ``compute_token_budget`` returns ``BUDGET_1M_MODEL``, so
+``BUDGET_1M_MODEL - EPHEMERAL_HEADROOM == compute_token_budget(1_000_000) - EPHEMERAL_HEADROOM``.
+All budget-observability consumers (context_health_hook, context_brain, the
+estimate-tokens skill) derive their WARNING threshold from this constant."""
+
+EMERGENCY_MARGIN = 39_000
+"""Gap between the WARNING and EMERGENCY context-budget thresholds. Historically
+stable at 39K (both the old 91K→130K and the current 141K→180K gaps = 39K)."""
+
 # Whole-file-private context files — the single source of truth for the
 # private lane (design 2026-07-06 §4). These carry XG's personal / self data
 # and MUST NOT reach ANY non-owner session:

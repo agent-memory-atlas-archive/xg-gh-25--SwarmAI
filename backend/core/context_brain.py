@@ -26,16 +26,22 @@ import logging
 import time
 from pathlib import Path
 
-from core.context_directory_loader import CONTEXT_FILES, ContextDirectoryLoader
+from core.context_directory_loader import (
+    CONTEXT_FILES,
+    EFFECTIVE_1M_BUDGET,
+    EMERGENCY_MARGIN,
+    ContextDirectoryLoader,
+)
 
 logger = logging.getLogger(__name__)
 
-# Budget thresholds — mirror context_health_hook.ContextHealthHook (SoT for the
-# WARN/EMERGENCY lines). Kept in sync with that hook; if it changes, this follows.
-# WARNING = BUDGET_1M_MODEL (150K) − EPHEMERAL_HEADROOM (9K) = 141K effective
-# context-file budget (raised 2026-09-30 with the 100K→150K base bump).
-_WARNING_THRESHOLD = 141_000
-_EMERGENCY_THRESHOLD = 180_000
+# Budget thresholds — DERIVED from the budget SoT in context_directory_loader
+# (run_72ca2a97), the SAME constants context_health_hook uses, so the overlay's
+# token_block and the deep-check report can never disagree. A change to
+# BUDGET_1M_MODEL or the ephemeral formula propagates here automatically.
+# WARNING = 141K effective (150K base − 9K ephemeral); EMERGENCY = WARNING + 39K.
+_WARNING_THRESHOLD = EFFECTIVE_1M_BUDGET
+_EMERGENCY_THRESHOLD = EFFECTIVE_1M_BUDGET + EMERGENCY_MARGIN
 
 # filename → 4-way owner category (rail display only — NO logic consumes it; a file's
 # editability/lock comes from `truncatable`, not owner). This is the coarse display

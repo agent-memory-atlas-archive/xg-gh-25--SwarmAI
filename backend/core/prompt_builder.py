@@ -38,6 +38,10 @@ from pathlib import Path
 from typing import Any, Optional, TYPE_CHECKING
 
 from core import executors
+from core.context_directory_loader import (
+    EPHEMERAL_HEADROOM,
+    TOKEN_CAP_PER_DAILY_FILE,
+)
 from core.ddd_paths import ddd_path
 from model_registry import context_window_for, is_large_context_model
 
@@ -120,7 +124,9 @@ def strip_sensitive_mcps(mcp_servers: dict) -> dict:
 
 # ── DailyActivity token cap constants ──────────────────────────────
 # Applied ephemerally at prompt-assembly time; disk files are never modified.
-TOKEN_CAP_PER_DAILY_FILE = 2000
+# TOKEN_CAP_PER_DAILY_FILE is imported from context_directory_loader (the budget
+# SoT) — re-exported here so existing `from core.prompt_builder import
+# TOKEN_CAP_PER_DAILY_FILE` importers keep working (run_72ca2a97).
 TRUNCATION_MARKER = "[Truncated: kept newest ~2000 tokens]"
 
 
@@ -904,15 +910,12 @@ class PromptBuilder:
         _t_total_start = time.perf_counter()
         try:
             context_dir = Path(working_directory) / ".context"
-            # Reserve headroom for ephemeral injections (DailyActivity, Bootstrap,
-            # resume context) that are appended after the token-budgeted assembly.
-            # Resume context can now be up to 150K tokens on 1M models, but
-            # it's appended to system_prompt which the 1M model accommodates
-            # directly.  The headroom here only ensures context files don't
-            # over-allocate within their own budget tier.  Keep it moderate —
-            # aggressive headroom starves context files unnecessarily.
-            RESUME_CONTEXT_HEADROOM = 5000  # moderate headroom, resume budget enforced in build_resume_context
-            EPHEMERAL_HEADROOM = 2 * TOKEN_CAP_PER_DAILY_FILE + RESUME_CONTEXT_HEADROOM
+            # EPHEMERAL_HEADROOM (imported from context_directory_loader, the budget
+            # SoT) reserves room for ephemeral injections (DailyActivity, Bootstrap,
+            # resume context) appended after the token-budgeted assembly. It only
+            # ensures context files don't over-allocate within their own budget tier;
+            # resume context itself is appended to system_prompt (accommodated
+            # directly by the 1M model) and enforced in build_resume_context.
             base_budget = agent_config.get("context_token_budget", DEFAULT_TOKEN_BUDGET)
             loader = ContextDirectoryLoader(
                 context_dir=context_dir,

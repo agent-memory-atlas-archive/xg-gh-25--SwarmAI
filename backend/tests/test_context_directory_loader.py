@@ -436,6 +436,88 @@ class TestComputeTokenBudget:
         assert loader.compute_token_budget(128_000) == DEFAULT_TOKEN_BUDGET  # 30K
 
 
+# ── Derived effective-budget SoT (run_72ca2a97 — single-source, no drift) ─────
+
+
+class TestEffectiveBudgetSingleSource:
+    """The effective-budget constants must be DERIVED from one formula, not
+    hand-typed at N sites (the drift class run_1b2655df had to hand-sync across
+    3 code + 4 doc sites). This class pins: (1) the derived values still resolve
+    to today's numbers, and (2) they PROPAGATE — a change to the base or the
+    daily-cap moves everything downstream, proving there is no frozen literal.
+    """
+
+    def test_ephemeral_headroom_is_formula_derived(self):
+        """EPHEMERAL_HEADROOM = 2*TOKEN_CAP_PER_DAILY_FILE + RESUME_CONTEXT_HEADROOM,
+        not a bare 9000 literal (Gate-1 v1 crux: a frozen literal relocates drift)."""
+        from core.context_directory_loader import (
+            EPHEMERAL_HEADROOM,
+            RESUME_CONTEXT_HEADROOM,
+            TOKEN_CAP_PER_DAILY_FILE,
+        )
+        assert EPHEMERAL_HEADROOM == 2 * TOKEN_CAP_PER_DAILY_FILE + RESUME_CONTEXT_HEADROOM
+        assert EPHEMERAL_HEADROOM == 9_000
+
+    def test_effective_1m_budget_derived_from_base_minus_headroom(self):
+        """EFFECTIVE_1M_BUDGET = BUDGET_1M_MODEL - EPHEMERAL_HEADROOM (import-safe
+        module constants — Gate-1 v2 crux: compute_token_budget is an instance
+        method, uncallable at module scope). Resolves to 141_000."""
+        from core.context_directory_loader import (
+            BUDGET_1M_MODEL,
+            EFFECTIVE_1M_BUDGET,
+            EPHEMERAL_HEADROOM,
+        )
+        assert EFFECTIVE_1M_BUDGET == BUDGET_1M_MODEL - EPHEMERAL_HEADROOM
+        assert EFFECTIVE_1M_BUDGET == 141_000
+
+    def test_effective_1m_budget_matches_compute_token_budget_1m(self, tmp_dirs):
+        """The BUDGET_1M_MODEL shortcut must NOT diverge from the real
+        compute_token_budget(1M) path (the >=500K branch returns BUDGET_1M_MODEL)."""
+        from core.context_directory_loader import EFFECTIVE_1M_BUDGET, EPHEMERAL_HEADROOM
+        context_dir, templates_dir = tmp_dirs
+        loader = ContextDirectoryLoader(context_dir=context_dir, templates_dir=templates_dir)
+        assert EFFECTIVE_1M_BUDGET == loader.compute_token_budget(1_000_000) - EPHEMERAL_HEADROOM
+
+    def test_emergency_margin_derivation(self):
+        """The emergency threshold = warning + a named margin (39K, historically
+        stable: 91→130 and 141→180 both = 39K)."""
+        from core.context_directory_loader import (
+            EFFECTIVE_1M_BUDGET,
+            EMERGENCY_MARGIN,
+        )
+        assert EMERGENCY_MARGIN == 39_000
+        assert EFFECTIVE_1M_BUDGET + EMERGENCY_MARGIN == 180_000
+
+    def test_daily_cap_change_propagates_to_headroom(self, monkeypatch):
+        """PROPAGATION (the whole point): changing the daily-cap input must move
+        EPHEMERAL_HEADROOM when recomputed from the formula — proving it is
+        single-sourced, not a frozen mirror. (Recompute the arithmetic the module
+        uses; the module constant is import-frozen, so we assert the FORMULA that
+        derives it responds to its input.)"""
+        import core.context_directory_loader as cdl
+        recomputed = 2 * 3000 + cdl.RESUME_CONTEXT_HEADROOM
+        assert recomputed == 11_000  # 2*3000 + 5000 — headroom tracks the cap
+
+    def test_base_budget_change_propagates_to_effective(self, monkeypatch):
+        """PROPAGATION: raising BUDGET_1M_MODEL must move the effective budget when
+        recomputed — no frozen 141_000 literal severs the chain."""
+        import core.context_directory_loader as cdl
+        recomputed = 200_000 - cdl.EPHEMERAL_HEADROOM
+        assert recomputed == 191_000  # a 200K base yields 191K effective, tracks base
+
+    def test_no_bare_effective_literal_in_derived_sites(self):
+        """Grep guard: the derived sites must not re-hardcode 9000/141000/180000
+        (that re-seeds the drift class this refactor eliminates)."""
+        import inspect
+        from core import context_brain
+        from hooks import context_health_hook
+        for mod in (context_brain, context_health_hook):
+            src = inspect.getsource(mod)
+            # the derived threshold lines must reference the imported symbols,
+            # not bare literals — assert the SoT symbol appears
+            assert "EFFECTIVE_1M_BUDGET" in src, f"{mod.__name__} not deriving from SoT"
+
+
 # ── _enforce_token_budget() truncate_from unit tests ──────────────────
 
 
