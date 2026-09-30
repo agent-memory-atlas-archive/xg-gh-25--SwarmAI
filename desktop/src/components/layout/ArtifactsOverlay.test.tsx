@@ -21,6 +21,7 @@ import {
   ArtifactsContent,
   groupByRole,
   parentRunLabel,
+  relativeTime,
   OPEN_FILE_EVENT,
 } from './ArtifactsOverlay';
 
@@ -162,5 +163,71 @@ describe('ArtifactsContent', () => {
     fireEvent.change(screen.getByTestId('artifacts-search'), { target: { value: 'zzzznomatch' } });
     await waitFor(() => expect(screen.getByTestId('artifacts-empty')).toBeInTheDocument());
     expect(screen.getByText(/No products match your search/i)).toBeInTheDocument();
+  });
+});
+
+// ── run_7220ff2a: mockup alignment — role-filter chips + relative timestamps ──
+describe('relativeTime (pure)', () => {
+  const NOW = new Date('2026-09-30T12:00:00Z').getTime();
+  it('buckets now / minutes / hours / days, else a date', () => {
+    expect(relativeTime(new Date(NOW - 20 * 1000).toISOString(), NOW)).toBe('now');
+    expect(relativeTime(new Date(NOW - 5 * 60000).toISOString(), NOW)).toBe('5m');
+    expect(relativeTime(new Date(NOW - 3 * 3600000).toISOString(), NOW)).toBe('3h');
+    expect(relativeTime(new Date(NOW - 2 * 86400000).toISOString(), NOW)).toBe('2d');
+    // >7d → a YYYY-MM-DD date stamp (not "60d")
+    expect(relativeTime(new Date(NOW - 60 * 86400000).toISOString(), NOW)).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  });
+  it('unparseable → empty string (never crashes a row)', () => {
+    expect(relativeTime('not-a-date', NOW)).toBe('');
+  });
+});
+
+describe('ArtifactsContent — role chips + timestamps', () => {
+  let fetchProducts: ReturnType<typeof vi.fn>;
+  let closeSpy: ReturnType<typeof vi.fn>;
+  beforeEach(() => {
+    fetchProducts = vi.fn().mockResolvedValue(FIXTURE);
+    closeSpy = vi.fn();
+  });
+
+  it('AC1: renders a role-filter chip row (4 canonical roles)', async () => {
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
+    await waitFor(() => expect(screen.getByTestId('artifacts-rolefilter')).toBeInTheDocument());
+    for (const role of ['Deliverables', 'Knowledge', 'Pipeline', 'Activity']) {
+      expect(screen.getByTestId(`artifacts-chip-${role}`)).toBeInTheDocument();
+    }
+  });
+
+  it('AC1: clicking a chip filters to that role; clicking it again clears', async () => {
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
+    await waitFor(() => expect(screen.getByText('deck.html')).toBeInTheDocument());
+    // Filter to Knowledge → Deliverables cards gone, Knowledge shown
+    fireEvent.click(screen.getByTestId('artifacts-chip-Knowledge'));
+    await waitFor(() => expect(screen.queryByText('deck.html')).toBeNull());
+    expect(screen.getByText('TECH.md')).toBeInTheDocument();
+    // Click active chip again → all roles back
+    fireEvent.click(screen.getByTestId('artifacts-chip-Knowledge'));
+    await waitFor(() => expect(screen.getByText('deck.html')).toBeInTheDocument());
+  });
+
+  it('AC2: a deliverable card renders a relative timestamp', async () => {
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
+    await waitFor(() => expect(screen.getByText('deck.html')).toBeInTheDocument());
+    // The card for deck.html must contain a time element (data-testid).
+    const times = screen.getAllByTestId('artifacts-card-time');
+    expect(times.length).toBeGreaterThan(0);
+    // Each has non-empty text (a relative time or date).
+    expect(times[0].textContent && times[0].textContent.length).toBeGreaterThan(0);
+  });
+
+  it('AC1: filtering to a collapsed-by-default role (Pipeline) auto-expands it (no dead end)', async () => {
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
+    await waitFor(() => expect(screen.getByText('deck.html')).toBeInTheDocument());
+    // Pipeline is collapsed by default → its run rows are NOT visible initially.
+    expect(screen.queryByText('run_2274b401')).toBeNull();
+    // Click the Pipeline chip → filter to Pipeline AND force-expand it → rows visible.
+    fireEvent.click(screen.getByTestId('artifacts-chip-Pipeline'));
+    await waitFor(() => expect(screen.getByText('run_2274b401')).toBeInTheDocument());
+    expect(screen.getByText('run_91cddb8f')).toBeInTheDocument();
   });
 });

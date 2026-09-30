@@ -36,6 +36,12 @@ export const OPEN_FILE_EVENT = 'swarm:open-file';
 /** Debounce for the filename filter (mirrors HistoryOverlay's search debounce feel). */
 const SEARCH_DEBOUNCE_MS = 200;
 
+/** loading-B poll: while the store is still empty (day-one backfill running in the
+ *  background), re-fetch every POLL_MS so the products appear on their own — but stop
+ *  after POLL_MAX_MS so a genuinely product-less workspace does not poll forever. */
+const BACKFILL_POLL_MS = 2500;
+const BACKFILL_POLL_MAX_MS = 45_000;
+
 /** The backend ignores workspace_id (resolves the single workspace from DB config);
  *  a non-empty placeholder satisfies the required query param. */
 const WS_PLACEHOLDER = 'default';
@@ -60,6 +66,39 @@ const ROLE_LABEL: Record<ProductRole, string> = {
 };
 /** Sections collapsed by default — the demoted "system files" the redesign hides. */
 const COLLAPSED_BY_DEFAULT: ReadonlySet<ProductRole> = new Set<ProductRole>(['Pipeline', 'Activity']);
+
+/** Per-role dot color for the filter chips (mockup .rolefilter .dot). Uses theme
+ *  vars with sensible fallbacks so it tracks light/dark. */
+const ROLE_DOT: Record<ProductRole, string> = {
+  Deliverables: 'var(--color-primary)',
+  Knowledge: 'var(--color-git-added, #4a9)',
+  Pipeline: 'var(--color-git-modified, #d59a26)',
+  Activity: 'var(--color-text-faint, #889)',
+  Other: 'var(--color-text-faint, #889)',
+};
+
+/**
+ * Relative "time ago" for a card/row (mockup .ms/.lt: now/Nm/Nh/Nd, else a date).
+ * Pure — `now` injectable for tests. An unparseable ISO → "" (the row still renders).
+ * <1min→"now"; <60min→"Nm"; <24h→"Nh"; <7d→"Nd"; else a local YYYY-MM-DD stamp.
+ */
+export function relativeTime(iso: string, now: number = Date.now()): string {
+  const ts = Date.parse(iso);
+  if (Number.isNaN(ts)) return '';
+  const diff = now - ts;
+  if (diff < 0) return 'now';
+  const min = Math.floor(diff / 60000);
+  if (min < 1) return 'now';
+  if (min < 60) return `${min}m`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h`;
+  const day = Math.floor(hr / 24);
+  if (day < 7) return `${day}d`;
+  const d = new Date(ts);
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${d.getFullYear()}-${mm}-${dd}`;
+}
 
 /**
  * Bucket products by role into the fixed display order, newest (lastTouched) first
@@ -132,10 +171,25 @@ export function ArtifactsContent({ close, fetchProducts }: ArtifactsContentProps
     queryKey: ['workspace-products'],
     queryFn: () => fetcher(WS_PLACEHOLDER),
     staleTime: 30_000,
+    // loading-B day-one: the endpoint returns immediately + backfills in the BACKGROUND,
+    // so a fresh workspace's first read is []. Without this, the overlay would show the
+    // empty state until a manual reopen (Gate-2 meta-review HIGH). Poll while the store
+    // is still empty so the backfilled products appear on their own — BOUNDED: stop once
+    // any product arrives, and cap the poll window (POLL_MAX_MS) so a genuinely
+    // product-less workspace does not poll forever.
+    refetchInterval: (query) => {
+      const rows = query.state.data as Product[] | undefined;
+      if (rows && rows.length > 0) return false; // filled → stop polling
+      const firstFetch = query.state.dataUpdatedAt || Date.now();
+      if (Date.now() - firstFetch > BACKFILL_POLL_MAX_MS) return false; // give up (empty ws)
+      return BACKFILL_POLL_MS;
+    },
   });
 
   const [searchRaw, setSearchRaw] = useState('');
   const [search, setSearch] = useState('');
+  // Active role filter (null = show all). Clicking the active chip clears it.
+  const [activeRole, setActiveRole] = useState<ProductRole | null>(null);
   // Per-role collapse state; seeded from COLLAPSED_BY_DEFAULT, user-toggleable.
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
@@ -147,14 +201,23 @@ export function ArtifactsContent({ close, fetchProducts }: ArtifactsContentProps
 
   const groups = useMemo(() => {
     const all = data ?? [];
-    const filtered = search
-      ? all.filter((p) => baseName(p.path).toLowerCase().includes(search))
-      : all;
+    const filtered = all.filter((p) => {
+      if (activeRole && p.role !== activeRole) return false;
+      if (search && !baseName(p.path).toLowerCase().includes(search)) return false;
+      return true;
+    });
     return groupByRole(filtered);
-  }, [data, search]);
+  }, [data, search, activeRole]);
 
-  const isCollapsed = (role: ProductRole): boolean =>
-    collapsed[role] ?? COLLAPSED_BY_DEFAULT.has(role);
+  const isCollapsed = (role: ProductRole): boolean => {
+    // An explicit user toggle always wins.
+    if (role in collapsed) return collapsed[role];
+    // Filtering TO a role means the user asked to see it → force-expand, even if it is
+    // collapsed-by-default (Pipeline/Activity). Otherwise clicking the Pipeline chip
+    // would show only a collapsed header + count — a dead end (Gate-2 API-Contract).
+    if (activeRole === role) return false;
+    return COLLAPSED_BY_DEFAULT.has(role);
+  };
 
   const toggle = (role: ProductRole) =>
     setCollapsed((c) => ({ ...c, [role]: !isCollapsed(role) }));
@@ -168,7 +231,7 @@ export function ArtifactsContent({ close, fetchProducts }: ArtifactsContentProps
 
   return (
     <div className="flex flex-col h-full min-h-0" data-testid="artifacts-overlay">
-      {/* Search */}
+      {/* Search + role-filter chips */}
       <div className="px-3 pt-3 pb-2 shrink-0">
         <input
           type="text"
@@ -178,6 +241,33 @@ export function ArtifactsContent({ close, fetchProducts }: ArtifactsContentProps
           data-testid="artifacts-search"
           className="w-full px-3 py-2 rounded-lg bg-[var(--color-input-bg,var(--color-bg-secondary))] border border-[var(--color-border)] text-[12.5px] text-[var(--color-text)] placeholder:text-[var(--color-text-faint)] outline-none focus:border-[var(--color-primary)]"
         />
+        {/* Role filter chips (mockup .rolefilter): click to filter to one role,
+            click the active chip again to clear. Colored dot per role. */}
+        <div className="flex gap-1.5 mt-2 flex-wrap" data-testid="artifacts-rolefilter">
+          {ROLE_ORDER.map((role) => {
+            const on = activeRole === role;
+            return (
+              <button
+                key={role}
+                onClick={() => setActiveRole(on ? null : role)}
+                data-testid={`artifacts-chip-${role}`}
+                aria-pressed={on}
+                className={`flex items-center gap-1.5 text-[10.5px] px-2.5 py-1 rounded-full border transition-colors ${
+                  on
+                    ? 'border-[var(--color-primary)] text-[var(--color-primary)] bg-[color-mix(in_srgb,var(--color-primary)_12%,transparent)]'
+                    : 'border-[var(--color-border)] text-[var(--color-text-muted)] hover:text-[var(--color-text)]'
+                }`}
+              >
+                <span
+                  aria-hidden="true"
+                  className="w-1.5 h-1.5 rounded-full shrink-0"
+                  style={{ backgroundColor: ROLE_DOT[role] }}
+                />
+                {ROLE_LABEL[role]}
+              </button>
+            );
+          })}
+        </div>
       </div>
 
       {/* Body */}
@@ -277,11 +367,13 @@ function DeliverablesGallery({
                   </span>
                 )}
               </span>
-              {parentDir(p.path) && (
-                <span className="text-[9px] text-[var(--color-text-faint)] opacity-[0.72] truncate leading-tight">
-                  {parentDir(p.path)}
+              {/* meta line: parent dir (left) + relative time (right) — mockup .ms */}
+              <span className="flex items-center justify-between gap-2 text-[9px] text-[var(--color-text-faint)] leading-tight">
+                <span className="opacity-[0.72] truncate">{parentDir(p.path)}</span>
+                <span className="shrink-0" data-testid="artifacts-card-time">
+                  {relativeTime(p.lastTouched)}
                 </span>
-              )}
+              </span>
             </span>
           </button>
         ))}
@@ -357,6 +449,13 @@ function RoleSection({
                       local
                     </span>
                   )}
+                </span>
+                {/* relative time, right-aligned — mockup .lt */}
+                <span
+                  className="shrink-0 text-[9.5px] text-[var(--color-text-faint)] leading-none"
+                  data-testid="artifacts-row-time"
+                >
+                  {relativeTime(p.lastTouched)}
                 </span>
               </button>
             );

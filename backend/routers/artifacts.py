@@ -21,6 +21,7 @@ Public endpoints:
 - ``POST /artifacts/pipeline/supersede``  — Mark artifact as superseded
 """
 
+import asyncio
 import logging
 import re
 import subprocess
@@ -453,6 +454,51 @@ class ProductResponse(BaseModel):
     lastTouched: str
 
 
+# ── loading-B: day-one backfill runs in the BACKGROUND, never on the read path ──
+# The read (`get_products`) returns stored products IMMEDIATELY so the overlay's
+# first paint never blocks on the 30-day git-log. On first-ever open we SCHEDULE the
+# backfill as a fire-and-forget task. Two guards, both required:
+#   • `_backfill_tasks` — a module-level STRONG-REF set holding the Task object.
+#     `asyncio.create_task` only weak-refs its task, so without this the task can be
+#     GC'd mid-run before the backfill finishes (CPython footgun — Gate-1). A
+#     done-callback discards it (on success OR failure) so the set never grows.
+#   • `_backfill_inflight` — workspace paths with a backfill currently scheduled, so N
+#     concurrent first-reads (before has_backfilled() flips at the END of backfill) do
+#     NOT each spawn a task. check-and-add is atomic on the single event loop (no await
+#     between). Cleared in the same done-callback (even on crash) so a failed backfill
+#     never wedges the key forever.
+_backfill_tasks: set = set()
+_backfill_inflight: set = set()
+
+
+def _schedule_backfill(workspace_path: str) -> None:
+    """Fire-and-forget the day-one backfill for `workspace_path` (at most one in
+    flight per workspace). No-op if one is already scheduled. Safe to call on every
+    read — the has_backfilled() gate upstream + this in-flight gate bound it."""
+    from core.product_registry import ProductRegistry
+
+    if workspace_path in _backfill_inflight:
+        return
+    _backfill_inflight.add(workspace_path)  # atomic w.r.t. the loop (no await before)
+
+    async def _run() -> None:
+        try:
+            await anyio.to_thread.run_sync(
+                lambda: ProductRegistry(workspace_path).backfill_from_gitlog(days=30)
+            )
+        except Exception:  # noqa: BLE001 — a bg backfill failure must never crash the loop
+            logger.exception("products: background backfill failed for %s", workspace_path)
+
+    task = asyncio.create_task(_run())
+    _backfill_tasks.add(task)  # STRONG ref — else the loop may GC the task mid-run
+
+    def _done(t: asyncio.Task) -> None:
+        _backfill_tasks.discard(t)
+        _backfill_inflight.discard(workspace_path)  # clear on success OR failure
+
+    task.add_done_callback(_done)
+
+
 @router.get("/artifacts/products", response_model=list[ProductResponse])
 async def get_products(
     workspace_id: str = Query(..., description="Workspace identifier (resolved via DB)"),
@@ -475,22 +521,24 @@ async def get_products(
         logger.exception("products: workspace resolution failed")
         return []
 
-    def _load() -> list:
+    def _load() -> tuple[list, bool]:
+        # loading-B: the READ never backfills — it returns stored products immediately
+        # so the overlay's first paint is instant (never blocks on the 30-day git-log).
+        # Returns (products, needs_backfill) so the async caller can SCHEDULE a
+        # background backfill without blocking this read.
         reg = ProductRegistry(workspace_path)
-        # AC7: day-one backfill — gated on has_backfilled(), NOT on an empty product
-        # list. A product-less workspace (recent git-log has only source/process files)
-        # would otherwise re-run the 30s git-log on EVERY overlay open, occupying a
-        # shared thread-pool worker each time (Gate-2 meta-review MED / RP53-adjacent).
-        # The marker makes backfill fire at most once per workspace.
-        if not reg.has_backfilled():
-            reg.backfill_from_gitlog(days=30)
-        return reg.list_products()
+        return reg.list_products(), (not reg.has_backfilled())
 
     try:
-        products = await anyio.to_thread.run_sync(_load)
+        products, needs_backfill = await anyio.to_thread.run_sync(_load)
     except Exception:  # noqa: BLE001 — fail-safe: never surface a 500 to the overlay
         logger.exception("products: registry read failed")
         return []
+
+    # Day-one backfill (AC3): schedule OFF the read path so the response is immediate.
+    # has_backfilled()==False → fire-and-forget one background backfill (in-flight-guarded).
+    if needs_backfill:
+        _schedule_backfill(workspace_path)
 
     return [
         ProductResponse(
