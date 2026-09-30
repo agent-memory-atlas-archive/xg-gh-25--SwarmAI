@@ -160,6 +160,47 @@ function baseName(path: string): string {
 }
 
 /**
+ * AC4: a human-friendly card title derived from the filename — strip a leading
+ * YYYY-MM-DD(-) date, strip ONLY the last extension (dots mid-name survive),
+ * de-slug [-_] to spaces, collapse + title-case. Falls back to the raw basename if
+ * the result is empty (an all-date name like `2026-09-30.md` — Gate-1 F2), so a card
+ * never renders a blank title.
+ */
+export function friendlyTitle(name: string): string {
+  const base = baseName(name);
+  if (!base) return '';
+  const noDate = base.replace(/^\d{4}-\d{2}-\d{2}-?/, '');
+  const noExt = noDate.replace(/\.[^.]+$/, ''); // strip ONLY the last extension
+  // de-slug, drop any leftover leading/trailing dot or space (e.g. `report..md`→`Report`)
+  const words = noExt.replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').replace(/^[.\s]+|[.\s]+$/g, '').trim();
+  if (!words) return base; // degenerate (all-date) → basename, never empty
+  return words.replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+/** A coarse product KIND for the thumbnail faux-preview + type badge (AC2). */
+export type ThumbKind = 'deck' | 'report' | 'image' | 'pdf' | 'html' | 'doc';
+/**
+ * Classify a product path into a thumbnail kind + badge label. ORDERED — deck wins
+ * over pdf/html for a Pollinate/deck path (Pollinate = a content-package deck, a
+ * deliberate call, Gate-1 #3). Defaults to `doc` (never undefined).
+ */
+export function thumbKind(path: string): { kind: ThumbKind; badge: string } {
+  const p = path.replace(/\\/g, '/').toLowerCase();
+  const ext = (p.match(/\.([a-z0-9]+)$/)?.[1]) ?? '';
+  if (['pptx', 'ppt', 'key'].includes(ext) || /\/(deck|pollinate)\b/.test(p) || p.includes('-deck'))
+    return { kind: 'deck', badge: 'DECK' };
+  if (['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'avif'].includes(ext))
+    return { kind: 'image', badge: 'IMG' };
+  if (ext === 'pdf') return { kind: 'pdf', badge: 'PDF' };
+  if (['html', 'htm'].includes(ext)) return { kind: 'html', badge: 'HTML' };
+  // Word-boundary match (Gate-2 MED): a bare includes('report') mis-badges `preport.md`
+  // / `reporter-bio.md`. Match the Reports/ dir OR `report` as a whole hyphen/underscore
+  // -delimited token, never an arbitrary substring.
+  if (/\/reports\//.test(p) || /\breport\b/.test(p.replace(/[-_]/g, ' '))) return { kind: 'report', badge: 'REPORT' };
+  return { kind: 'doc', badge: 'DOC' };
+}
+
+/**
  * Label a Pipeline REPORT.md row by its parent run dir, not the bare "REPORT.md" —
  * the same-name problem the redesign calls out (3 runs all show "REPORT.md"). Pure.
  * `.../.artifacts/runs/run_2274b401/REPORT.md` → "run_2274b401". Falls back to the
@@ -364,31 +405,35 @@ function DeliverablesGallery({
       <div className="text-[10px] uppercase tracking-wide text-[var(--color-text-muted)] font-semibold px-0.5 pb-2">
         {group.label}
       </div>
-      <div className="grid grid-cols-2 gap-2.5">
-        {group.products.map((p) => (
-          <button
-            key={p.path}
-            onClick={() => onOpen(p)}
-            title={p.path}
-            data-testid="artifacts-card"
-            className="group flex flex-col gap-2 p-3 rounded-xl bg-[var(--color-bg-secondary,var(--color-hover))] hover:bg-[var(--color-hover)] transition-colors text-left min-h-[76px]"
-          >
-            <span
-              className="material-symbols-outlined shrink-0 text-[26px] leading-none"
-              style={{ color: fileIconColor(baseName(p.path)) }}
-              aria-hidden="true"
-              data-testid={`artifacts-card-icon-${p.path}`}
+      {/* AC3: 3-column thumbnail-tile gallery (mockup .gallery repeat(3,1fr) gap 14px) */}
+      <div className="grid grid-cols-3 gap-3.5">
+        {group.products.map((p) => {
+          const { kind, badge } = thumbKind(p.path);
+          const title = friendlyTitle(p.path);
+          return (
+            <button
+              key={p.path}
+              onClick={() => onOpen(p)}
+              title={p.path}
+              data-testid="artifacts-card"
+              className="group flex flex-col rounded-[10px] overflow-hidden border border-transparent bg-[var(--color-bg-secondary,var(--color-hover))] hover:border-[var(--color-primary)]/50 hover:bg-[var(--color-hover)] transition-colors text-left"
             >
-              {fileIcon(baseName(p.path))}
-            </span>
-            <span className="flex flex-col min-w-0 gap-0.5">
-              <span className="flex items-center gap-1 min-w-0">
-                <span className="text-[12.5px] text-[var(--color-text)] truncate leading-tight font-medium">
-                  {baseName(p.path)}
+              {/* AC1/AC2: 16:10 thumbnail zone with a type-differentiated faux-preview + badge */}
+              <span
+                data-testid="artifacts-card-thumb"
+                className="relative block aspect-[16/10] w-full overflow-hidden"
+                style={{ background: 'linear-gradient(135deg,#232838,#1a1e28)' }}
+              >
+                <ThumbPreview kind={kind} name={baseName(p.path)} />
+                <span
+                  data-testid="artifacts-card-badge"
+                  className="absolute top-1.5 left-1.5 text-[8.5px] font-bold tracking-wide px-1.5 py-0.5 rounded bg-black/45 text-[var(--color-primary)] leading-none z-10"
+                >
+                  {badge}
                 </span>
                 {p.gitignored && (
                   <span
-                    className="shrink-0 text-[8.5px] px-1 py-px rounded bg-[var(--color-git-modified,#d59a26)]/20 text-[var(--color-git-modified,#d59a26)] font-medium leading-none"
+                    className="absolute top-1.5 right-1.5 text-[8px] px-1 py-px rounded bg-[var(--color-git-modified,#d59a26)]/25 text-[var(--color-git-modified,#d59a26)] font-medium leading-none z-10"
                     title="Not in git (local-only product) — surfaced anyway"
                     data-testid="artifacts-gitignored-badge"
                   >
@@ -396,22 +441,83 @@ function DeliverablesGallery({
                   </span>
                 )}
               </span>
-              {/* meta line: elided dir (left) + absolute time (right, relative on hover) — mockup .ms */}
-              <span className="flex items-center justify-between gap-2 text-[9px] text-[var(--color-text-faint)] leading-tight">
-                <span className="opacity-[0.72] truncate" title={p.path}>{elideDir(p.path)}</span>
-                <span
-                  className="shrink-0"
-                  data-testid="artifacts-card-time"
-                  title={relativeTime(p.lastTouched)}
-                >
-                  {absoluteTime(p.lastTouched)}
+              {/* AC4: meta zone — friendly title + (dir·kind left, absolute time right) */}
+              <span className="flex flex-col gap-0.5 px-2.5 py-2">
+                <span className="text-[12px] font-medium text-[var(--color-text)] truncate leading-tight">
+                  {title}
+                </span>
+                <span className="flex items-center justify-between gap-2 text-[9.5px] text-[var(--color-text-faint)] leading-tight">
+                  <span className="opacity-[0.72] truncate" title={p.path}>
+                    {elideDir(p.path)} · {kind}
+                  </span>
+                  <span
+                    className="shrink-0"
+                    data-testid="artifacts-card-time"
+                    title={relativeTime(p.lastTouched)}
+                  >
+                    {absoluteTime(p.lastTouched)}
+                  </span>
                 </span>
               </span>
-            </span>
-          </button>
-        ))}
+            </button>
+          );
+        })}
       </div>
     </section>
+  );
+}
+
+/** CSS-only faux thumbnail preview by kind (AC2, Approach A — no real asset/screenshot). */
+function ThumbPreview({ kind, name }: { kind: ThumbKind; name: string }) {
+  if (kind === 'image') {
+    return (
+      <span
+        className="absolute inset-0 block"
+        style={{ background: 'conic-gradient(from 210deg,#2b3f6b,#6b3f5f,#3f6b52,#2b3f6b)' }}
+        aria-hidden="true"
+      />
+    );
+  }
+  if (kind === 'report') {
+    return (
+      <span className="absolute inset-3 rounded-[5px] bg-[#11151d] p-2.5 flex flex-col gap-1.5" aria-hidden="true">
+        <span className="h-[7px] w-1/2 rounded-[2px] bg-[#5b8def]/80" />
+        <span className="grid grid-cols-2 gap-[5px] mt-0.5">
+          <span className="h-5 rounded-[3px] bg-[#1c2637]" />
+          <span className="h-5 rounded-[3px] bg-[#1c2637]" />
+          <span className="h-5 rounded-[3px] bg-[#1c2637]" />
+          <span className="h-5 rounded-[3px] bg-[#1c2637]" />
+        </span>
+      </span>
+    );
+  }
+  if (kind === 'deck') {
+    // faux slide: title bar + text lines + a row of chips (mockup .slide)
+    return (
+      <span className="absolute inset-3 rounded-[5px] bg-[#11151d] px-2.5 py-2.5 flex flex-col gap-[5px]" aria-hidden="true">
+        <span className="h-2 w-[62%] rounded-[2px] bg-[var(--color-primary)]/85" />
+        <span className="h-[5px] w-[88%] rounded-[2px] bg-[#33445f]" />
+        <span className="h-[5px] w-[70%] rounded-[2px] bg-[#33445f]" />
+        <span className="h-[5px] w-[80%] rounded-[2px] bg-[#33445f]" />
+        <span className="flex gap-1 mt-auto">
+          <span className="h-3.5 flex-1 rounded-[3px] bg-[#232c3d]" />
+          <span className="h-3.5 flex-1 rounded-[3px] bg-[#232c3d]" />
+          <span className="h-3.5 flex-1 rounded-[3px] bg-[#232c3d]" />
+        </span>
+      </span>
+    );
+  }
+  // pdf / html / doc — a centered type-tinted icon block (color block per mockup)
+  const tint = kind === 'pdf' ? '#e5484d' : kind === 'html' ? '#e0982a' : '#5b8def';
+  return (
+    <span className="absolute inset-0 flex items-center justify-center" aria-hidden="true">
+      <span
+        className="material-symbols-outlined text-[30px] leading-none opacity-90"
+        style={{ color: tint }}
+      >
+        {fileIcon(name)}
+      </span>
+    </span>
   );
 }
 

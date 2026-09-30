@@ -24,6 +24,8 @@ import {
   relativeTime,
   absoluteTime,
   elideDir,
+  friendlyTitle,
+  thumbKind,
   OPEN_FILE_EVENT,
 } from './ArtifactsOverlay';
 
@@ -101,8 +103,8 @@ describe('ArtifactsContent', () => {
     await waitFor(() => expect(screen.getAllByTestId('artifacts-card').length).toBeGreaterThan(0));
     // Deliverables dominant (cards)
     expect(screen.getByTestId('artifacts-group-Deliverables')).toBeInTheDocument();
-    expect(screen.getByText('deck.html')).toBeInTheDocument();
-    expect(screen.getByText('weekly.html')).toBeInTheDocument();
+    expect(screen.getByText('Deck')).toBeInTheDocument();
+    expect(screen.getByText('Weekly')).toBeInTheDocument();
     // Demoted sections present
     expect(screen.getByTestId('artifacts-group-Knowledge')).toBeInTheDocument();
     expect(screen.getByTestId('artifacts-group-Pipeline')).toBeInTheDocument();
@@ -113,7 +115,7 @@ describe('ArtifactsContent', () => {
 
   it('AC2: a gitignored deck surfaces with a `local` badge (the blind-spot fix)', async () => {
     renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getByText('deck.html')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('Deck')).toBeInTheDocument());
     expect(screen.getByTestId('artifacts-gitignored-badge')).toBeInTheDocument();
   });
 
@@ -135,8 +137,8 @@ describe('ArtifactsContent', () => {
     document.addEventListener(OPEN_FILE_EVENT, onOpen as EventListener);
     try {
       renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
-      await waitFor(() => expect(screen.getByText('deck.html')).toBeInTheDocument());
-      fireEvent.click(screen.getByText('deck.html'));
+      await waitFor(() => expect(screen.getByText('Deck')).toBeInTheDocument());
+      fireEvent.click(screen.getByText('Deck'));
       expect(onOpen).toHaveBeenCalledTimes(1);
       const ev = onOpen.mock.calls[0][0] as CustomEvent;
       expect(ev.detail).toEqual({ path: 'Projects/AIDLC/assets/deck.html' });
@@ -148,10 +150,10 @@ describe('ArtifactsContent', () => {
 
   it('AC6: search filters by filename (debounced)', async () => {
     renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getByText('deck.html')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('Deck')).toBeInTheDocument());
     fireEvent.change(screen.getByTestId('artifacts-search'), { target: { value: 'weekly' } });
-    await waitFor(() => expect(screen.queryByText('deck.html')).toBeNull());
-    expect(screen.getByText('weekly.html')).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText('Deck')).toBeNull());
+    expect(screen.getByText('Weekly')).toBeInTheDocument();
   });
 
   it('AC6: empty data renders the friendly empty state (no crash)', async () => {
@@ -163,7 +165,7 @@ describe('ArtifactsContent', () => {
 
   it('AC6: search with no match renders the no-match empty state', async () => {
     renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getByText('deck.html')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('Deck')).toBeInTheDocument());
     fireEvent.change(screen.getByTestId('artifacts-search'), { target: { value: 'zzzznomatch' } });
     await waitFor(() => expect(screen.getByTestId('artifacts-empty')).toBeInTheDocument());
     expect(screen.getByText(/No products match your search/i)).toBeInTheDocument();
@@ -204,19 +206,19 @@ describe('ArtifactsContent — role chips + timestamps', () => {
 
   it('AC1: clicking a chip filters to that role; clicking it again clears', async () => {
     renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getByText('deck.html')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('Deck')).toBeInTheDocument());
     // Filter to Knowledge → Deliverables cards gone, Knowledge shown
     fireEvent.click(screen.getByTestId('artifacts-chip-Knowledge'));
-    await waitFor(() => expect(screen.queryByText('deck.html')).toBeNull());
+    await waitFor(() => expect(screen.queryByText('Deck')).toBeNull());
     expect(screen.getByText('TECH.md')).toBeInTheDocument();
     // Click active chip again → all roles back
     fireEvent.click(screen.getByTestId('artifacts-chip-Knowledge'));
-    await waitFor(() => expect(screen.getByText('deck.html')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('Deck')).toBeInTheDocument());
   });
 
   it('AC2: a deliverable card renders a relative timestamp', async () => {
     renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getByText('deck.html')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('Deck')).toBeInTheDocument());
     // The card for deck.html must contain a time element (data-testid).
     const times = screen.getAllByTestId('artifacts-card-time');
     expect(times.length).toBeGreaterThan(0);
@@ -226,7 +228,7 @@ describe('ArtifactsContent — role chips + timestamps', () => {
 
   it('AC1: filtering to a collapsed-by-default role (Pipeline) auto-expands it (no dead end)', async () => {
     renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getByText('deck.html')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('Deck')).toBeInTheDocument());
     // Pipeline is collapsed by default → its run rows are NOT visible initially.
     expect(screen.queryByText('Artifacts data root-fix')).toBeNull();
     // Click the Pipeline chip → filter to Pipeline AND force-expand it → rows visible.
@@ -280,5 +282,68 @@ describe('Pipeline rows use server displayLabel — AC8', () => {
       expect(screen.getByText('Fix the artifacts overlay timestamps')).toBeInTheDocument(),
     );
     expect(screen.queryByText('run_abc12345')).not.toBeInTheDocument();
+  });
+});
+
+describe('friendlyTitle (pure) — AC4', () => {
+  it('strips a leading YYYY-MM-DD date + extension, de-slugs, title-cases', () => {
+    expect(friendlyTitle('2026-08-30-ai-native-ee-oe-deck.html')).toBe('Ai Native Ee Oe Deck');
+  });
+  it('no date prefix: just de-slug + title-case', () => {
+    expect(friendlyTitle('SecDLC-flywheel.png')).toBe('SecDLC Flywheel'); // preserves acronym caps
+  });
+  it('strips ONLY the last extension (dots in the middle survive)', () => {
+    expect(friendlyTitle('v1.2-deck.html')).toBe('V1.2 Deck');
+  });
+  it('all-date name → falls back to the basename, never empty (Gate-1 F2)', () => {
+    expect(friendlyTitle('2026-09-30.md')).toBe('2026-09-30.md');
+  });
+  it('degenerate empty → basename fallback', () => {
+    expect(friendlyTitle('')).toBe('');
+  });
+});
+
+describe('thumbKind (pure) — AC2', () => {
+  it('classifies deck / image / pdf / html / report / doc', () => {
+    expect(thumbKind('Projects/AIDLC/assets/x.pptx').kind).toBe('deck');
+    expect(thumbKind('Knowledge/Pollinate/y/index.html').kind).toBe('deck'); // Pollinate = content package deck (deliberate)
+    expect(thumbKind('Knowledge/Designs/pic.png').kind).toBe('image');
+    expect(thumbKind('Knowledge/Library/report.pdf').kind).toBe('pdf');
+    expect(thumbKind('Knowledge/Library/page.html').kind).toBe('html');
+    expect(thumbKind('Knowledge/Reports/weekly.md').kind).toBe('report');
+    expect(thumbKind('Knowledge/Notes/whatever.md').kind).toBe('doc'); // default
+  });
+  it('every kind carries a non-empty badge label', () => {
+    for (const p of ['a.pptx', 'b.png', 'c.pdf', 'd.html', 'Reports/e.md', 'f.txt']) {
+      expect(thumbKind(p).badge.length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('Deliverables tile — AC1/AC2/AC3 render', () => {
+  it('renders a thumbnail zone + type badge + friendly title (not the raw filename)', async () => {
+    const fetchProducts = vi.fn().mockResolvedValue([
+      prod('Knowledge/Library/2026-08-30-ai-native-ee-oe-deck.html', 'Deliverables'),
+    ]);
+    renderWithClient(<ArtifactsContent close={() => {}} fetchProducts={fetchProducts} />);
+    await waitFor(() => expect(screen.getByTestId('artifacts-card')).toBeInTheDocument());
+    expect(screen.getByTestId('artifacts-card-thumb')).toBeInTheDocument();
+    // friendly title shown, raw filename NOT the visible label
+    expect(screen.getByText('Ai Native Ee Oe Deck')).toBeInTheDocument();
+    expect(screen.queryByText('2026-08-30-ai-native-ee-oe-deck.html')).toBeNull();
+    // type badge (HTML for a .html)
+    expect(screen.getByTestId('artifacts-card-badge')).toHaveTextContent(/DECK/i); // name has -deck
+  });
+});
+
+describe('Gate-2 adversarial fixes', () => {
+  it('thumbKind: report matches only a whole token, not a substring (preport.md → doc)', () => {
+    expect(thumbKind('Knowledge/Notes/preport.md').kind).toBe('doc');
+    expect(thumbKind('Knowledge/Notes/reporter-bio.md').kind).toBe('doc');
+    expect(thumbKind('Knowledge/Reports/x.md').kind).toBe('report'); // Reports/ dir
+    expect(thumbKind('Knowledge/Notes/weekly-report.md').kind).toBe('report'); // token
+  });
+  it('friendlyTitle: no trailing dot from a double-extension (report..md → Report)', () => {
+    expect(friendlyTitle('report..md')).toBe('Report');
   });
 });
