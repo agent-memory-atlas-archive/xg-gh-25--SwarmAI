@@ -8,8 +8,9 @@ This skill uses **human-in-the-loop** for the one long *local* step (backend
 build+deploy, which verifies the new binary boots before we ship). Everything
 else is Agent-driven. **The shipped multi-platform artifacts are built by CI, not
 locally** — pushing the `v*` tag triggers `.github/workflows/release.yml`, which
-builds macOS/Windows/Hive on GitHub runners and creates a **draft** GitHub Release.
-The only manual publish step is flipping that draft to published.
+builds macOS + Windows on GitHub runners and creates a **draft** GitHub Release
+(Hive is local-only, not a CI job — see the release.yml `publish:` NOTE). The only manual publish step
+is flipping that draft to published.
 
 ```
 Agent: PREFLIGHT → BUMP → USER: prod.sh build (local backend deploy+verify) →
@@ -264,8 +265,8 @@ There is no separate local-DMG verification stage anymore. The artifacts that
 ship are the CI-built ones attached to the draft Release; they are verified in
 **Stage 7b** by inspecting `gh release view v${VERSION} --json assets` (all
 platforms present, fresh, from the current HEAD) — NOT by a local `find *.dmg`.
-A local `find` would only see the throwaway Stage-5 build and misses Windows/Hive
-entirely. See Stage 7b.
+A local `find` would only see the throwaway Stage-5 build and misses the Windows
+CI artifacts entirely. See Stage 7b. (Hive is not a CI asset — local-only.)
 
 ---
 
@@ -278,9 +279,9 @@ fix for the v1.24.0 miss (published on HEAD `2d4a2ff2`, CI then went red on 3 st
 artifacts — IMPROVEMENT.md 2026-07-04).
 
 **How release actually happens (CI-driven — verified against `.github/workflows/release.yml`):**
-pushing the `v*` tag (7a) TRIGGERS `release.yml`, which builds macOS/Windows/Hive on
-GitHub runners and creates a **`draft: true`** GitHub Release with all-platform assets +
-auto-generated notes. So by the time you reach 7c the Release object ALREADY EXISTS as a
+pushing the `v*` tag (7a) TRIGGERS `release.yml`, which builds **macOS + Windows** on
+GitHub runners (Hive is local-only, not a CI job) and creates a
+**`draft: true`** GitHub Release with those assets + `latest.json` + auto-generated notes. So by the time you reach 7c the Release object ALREADY EXISTS as a
 draft — 7c is a **flip to published**, NOT a `gh release create`. The draft is
 star/download-invisible until flipped, so it is safe for the draft to exist pre-CI-green;
 what 7b gates is the **flip**.
@@ -339,17 +340,23 @@ cd $SWARMAI_ROOT && VERSION=$(cat VERSION)
 gh release view "v${VERSION}" --json isDraft,targetCommitish,assets \
   --jq '{isDraft, target:.targetCommitish, assets:[.assets[].name]}'
 ```
-**Pass (required):** `isDraft=true`, and assets include a `.dmg` + `hive-*.tar.gz` +
-`checksums.txt`, freshly built for this HEAD. These are the load-bearing platforms —
-`release.yml`'s publish job requires `build-macos OR build-hive` to succeed (release.yml
-`if:` L219), so their absence means the CI build genuinely hasn't finished/failed.
-**Warn (not fail):** missing `-setup.exe` / `.msi` (Windows). Windows is **best-effort** —
-the publish job ships macOS+Hive even when `build-windows` fails (that's by design in
-release.yml). So absent Windows assets → WARN + note it in the release, do NOT block the
-flip. If you want Windows, re-run the failed `build-windows` job, don't hold the release.
-**Fail:** missing `.dmg` AND `hive-*.tar.gz`, or all assets older than the current
-release.yml run → the CI build hasn't finished (or fully failed); re-check the workflow
-before flipping.
+**Pass (required):** `isDraft=true`, and assets include the macOS `.dmg` + the updater
+bundle (`SwarmAI.app.tar.gz` + `.sig`) + `latest.json`, freshly built for this HEAD.
+**macOS is THE load-bearing platform** — `release.yml`'s publish job runs
+`if: always() && needs.build-macos.result == 'success'` (release.yml, the `publish:`
+guard), so a missing `.dmg` means the CI build genuinely hasn't finished/failed.
+**Warn (not fail):** missing `-setup.exe` / `.msi` / `.nsis.zip` (Windows). Windows is
+**best-effort** — the publish job ships macOS even when `build-windows` fails (by design:
+the `publish` guard gates only on `build-macos`). Absent Windows assets → WARN + note it in
+the release, do NOT block the flip. Re-run the failed `build-windows` job if you want them.
+**NOT a CI asset (do NOT expect, do NOT block on):** `hive-*.tar.gz` and `checksums.txt`.
+The `build-hive` CI job was **REMOVED** (see the release.yml `publish:` NOTE) —
+Hive packaging is now **LOCAL-ONLY** (`bash hive/release.sh <version>` on a machine with a
+populated `~/.swarm-ai/SwarmWS` daemon workspace; that script is the ONLY thing that emits
+`checksums.txt`). So a CI draft never carries a Hive tar or checksums — their absence is the
+current design, NOT a build failure. If a Hive release is needed, build + ship it separately.
+**Fail:** missing `.dmg`, or all assets older than the current release.yml run → the CI
+build hasn't finished (or fully failed); re-check the workflow before flipping.
 
 > **✅ Updater artifacts ARE now published — but the first post-fix release needs a one-time signature verification (fixed 2026-07-28).**
 > `release.yml` now uploads the updater bundles + their `.sig` and generates
@@ -359,8 +366,8 @@ before flipping.
 > `*.nsis.zip` + `.sig` (best-effort), and **`latest.json`**. The generator points each
 > platform url at the updater BUNDLE (not the DMG/exe), reads `signature` from the `.sig`
 > contents, keys platforms `darwin-aarch64` / `windows-x86_64`, fails loud if macOS built
-> but its bundle/sig is missing, and gracefully omits a platform that didn't build (a
-> hive-only release still ships).
+> but its bundle/sig is missing, and gracefully omits a platform that didn't build (e.g.
+> a macOS-only release still ships when Windows fails).
 > **⚠️ ONE-TIME CHECK on the first release after this fix (assumption A — key pairing):**
 > auto-update only works if the CI secret `TAURI_SIGNING_PRIVATE_KEY` is the private key
 > for the pubkey embedded in `tauri.conf.json` (`7B9CEDB5D3C58A4D`). That pairing is
@@ -462,7 +469,7 @@ Stage 7 PUBLISH: PASS
   CI gate: GREEN (HEAD <sha>, run <id>)
   Draft flipped → Published + Latest ✓
   Release: https://github.com/xg-gh-25/SwarmAI/releases/tag/vX.Y.Z
-  Assets: macOS DMG · Windows exe+msi · Hive tar.gz · checksums (all CI-built)
+  Assets: macOS DMG + updater bundle(.sig) · Windows exe+msi · latest.json (all CI-built; Hive is local-only)
 ```
 
 ---
@@ -473,7 +480,7 @@ Stage 7 PUBLISH: PASS
 RELEASE COMPLETE ✅ vX.Y.Z
   Commits: N (since vPREV)
   Backend: verified (prod.sh build passed — local deploy)
-  Artifacts: CI-built (macOS DMG · Windows exe+msi · Hive tar.gz)
+  Artifacts: CI-built (macOS DMG + updater bundle · Windows exe+msi · latest.json; Hive local-only)
   Smoke: healthy, correct version
   Published: GitHub Release (draft flipped → published + latest)
 ```
