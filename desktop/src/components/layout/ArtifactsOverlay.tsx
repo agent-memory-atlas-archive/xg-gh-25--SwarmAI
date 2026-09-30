@@ -101,6 +101,35 @@ export function relativeTime(iso: string, now: number = Date.now()): string {
 }
 
 /**
+ * AC6: absolute local timestamp `YYYY-MM-DD HH:MM` — the primary display (XG asked
+ * for a real timestamp, not "2h"). relativeTime is demoted to the hover title.
+ * Unparseable → '' (a row must never crash on a bad date).
+ */
+export function absoluteTime(iso: string): string {
+  const ts = Date.parse(iso);
+  if (Number.isNaN(ts)) return '';
+  const d = new Date(ts);
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mi = String(d.getMinutes()).padStart(2, '0');
+  return `${d.getFullYear()}-${mm}-${dd} ${hh}:${mi}`;
+}
+
+/**
+ * AC7: directory display — the LAST TWO dir segments, eliding any deeper prefix
+ * with a leading `…/`. `Projects/SwarmAI/.artifacts/runs/run_x/REPORT.md` →
+ * `…/runs/run_x`; a two-level path shows both with no ellipsis; a bare filename → ''.
+ */
+export function elideDir(path: string): string {
+  const parts = path.replace(/\\/g, '/').split('/').filter(Boolean);
+  const dirs = parts.slice(0, -1); // drop the filename
+  if (dirs.length === 0) return '';
+  if (dirs.length <= 2) return dirs.join('/');
+  return `…/${dirs.slice(-2).join('/')}`;
+}
+
+/**
  * Bucket products by role into the fixed display order, newest (lastTouched) first
  * within each group. Returns only non-empty groups. An unexpected role (`Other`, or a
  * future value) folds into Knowledge so it is never dropped (exhaustiveness). Pure.
@@ -128,11 +157,6 @@ export function groupByRole(products: Product[]): RoleGroup[] {
 function baseName(path: string): string {
   const i = path.lastIndexOf('/');
   return i >= 0 ? path.slice(i + 1) : path;
-}
-/** Parent directory ("" for a bare filename). */
-function parentDir(path: string): string {
-  const i = path.lastIndexOf('/');
-  return i > 0 ? path.slice(0, i) : '';
 }
 
 /**
@@ -203,7 +227,12 @@ export function ArtifactsContent({ close, fetchProducts }: ArtifactsContentProps
     const all = data ?? [];
     const filtered = all.filter((p) => {
       if (activeRole && p.role !== activeRole) return false;
-      if (search && !baseName(p.path).toLowerCase().includes(search)) return false;
+      if (search) {
+        // Match the VISIBLE text (filename OR the displayLabel a Pipeline row shows)
+        // so a search over the label the user actually sees never misses a row.
+        const hay = `${baseName(p.path)} ${p.displayLabel ?? ''}`.toLowerCase();
+        if (!hay.includes(search)) return false;
+      }
       return true;
     });
     return groupByRole(filtered);
@@ -367,11 +396,15 @@ function DeliverablesGallery({
                   </span>
                 )}
               </span>
-              {/* meta line: parent dir (left) + relative time (right) — mockup .ms */}
+              {/* meta line: elided dir (left) + absolute time (right, relative on hover) — mockup .ms */}
               <span className="flex items-center justify-between gap-2 text-[9px] text-[var(--color-text-faint)] leading-tight">
-                <span className="opacity-[0.72] truncate">{parentDir(p.path)}</span>
-                <span className="shrink-0" data-testid="artifacts-card-time">
-                  {relativeTime(p.lastTouched)}
+                <span className="opacity-[0.72] truncate" title={p.path}>{elideDir(p.path)}</span>
+                <span
+                  className="shrink-0"
+                  data-testid="artifacts-card-time"
+                  title={relativeTime(p.lastTouched)}
+                >
+                  {absoluteTime(p.lastTouched)}
                 </span>
               </span>
             </span>
@@ -420,7 +453,10 @@ function RoleSection({
       {!collapsed && (
         <div className="flex flex-col">
           {group.products.map((p) => {
-            const label = isPipeline ? parentRunLabel(p.path) : baseName(p.path);
+            // AC8: the server-resolved displayLabel (Pipeline = task name, not run-id;
+            // everything else = basename). Falls back to the client label if a row
+            // predates the field (defensive; the backend always emits it now).
+            const label = p.displayLabel || (isPipeline ? parentRunLabel(p.path) : baseName(p.path));
             return (
               <button
                 key={p.path}
@@ -450,12 +486,13 @@ function RoleSection({
                     </span>
                   )}
                 </span>
-                {/* relative time, right-aligned — mockup .lt */}
+                {/* absolute time, right-aligned (relative on hover) — mockup .lt */}
                 <span
                   className="shrink-0 text-[9.5px] text-[var(--color-text-faint)] leading-none"
                   data-testid="artifacts-row-time"
+                  title={relativeTime(p.lastTouched)}
                 >
-                  {relativeTime(p.lastTouched)}
+                  {absoluteTime(p.lastTouched)}
                 </span>
               </button>
             );

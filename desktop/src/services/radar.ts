@@ -52,6 +52,12 @@ export interface Product {
   gitignored: boolean;
   firstProduced: string;
   lastTouched: string;
+  /** Run-3 AC8: human label — task name for Pipeline rows, basename otherwise.
+   *  OPTIONAL by type (Gate-2 meta Finding 3): the current backend always emits it,
+   *  but the overlay handles its absence defensively (`p.displayLabel || fallback`),
+   *  so an old-backend / rolled-back response degrades gracefully. The type matches
+   *  that runtime contract rather than lying about a hard requirement. */
+  displayLabel?: string;
 }
 
 export const radarService = {

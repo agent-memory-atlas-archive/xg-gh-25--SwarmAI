@@ -182,9 +182,14 @@ async def test_read_never_calls_backfill_inline(app_with_ws, monkeypatch):
     deck.write_text("<html>")
     reg = ProductRegistry(ws)
     reg.register_batch([str(deck)])
-    reg._mutate(lambda data: data.__setitem__("backfilled_at", "2026-01-01T00:00:00+00:00"))
-
+    # Mark backfilled AT THE CURRENT VERSION (Gate-2 Finding 1: has_backfilled() now
+    # version-gates; a marker lacking the current backfill_version would re-qualify).
     import core.product_registry as pr
+    reg._mutate(lambda data: (
+        data.__setitem__("backfilled_at", "2026-01-01T00:00:00+00:00"),
+        data.__setitem__("backfill_version", pr._BACKFILL_VERSION),
+    ))
+
     inline_calls = {"n": 0}
     real = pr.ProductRegistry.backfill_from_gitlog
     def spy(self, days=30):
@@ -281,3 +286,50 @@ class TestLayer4CrossBoundaryContract:
             f"backend/frontend Product contract DIVERGED: backend emits {backend_fields}, "
             f"frontend `Product` declares {frontend_fields}. Update radar.ts OR ProductResponse."
         )
+
+
+# ── Run-3 AC8: pipeline rows carry a human displayLabel (task name, not run-id) ──
+
+
+async def test_pipeline_row_display_label_is_task_name(app_with_ws):
+    """A Pipeline REPORT.md row's displayLabel = the run.json requirement (task
+    name), NOT the raw run-id. A user opening Artifacts sees what the run DID."""
+    app, ws = app_with_ws
+    import json as _json
+    from core.product_registry import ProductRegistry
+
+    run_dir = ws / "Projects" / "SwarmAI" / ".artifacts" / "runs" / "run_abc12345"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(_json.dumps({
+        "pipeline_id": "run_abc12345",
+        "requirement": "Fix the artifacts overlay timestamps and sorting",
+    }))
+    report = run_dir / "REPORT.md"
+    report.write_text("# report")
+    ProductRegistry(ws).register_batch([str(report)])
+
+    data = await _get_products(app)
+    pipeline_rows = [r for r in data if r["role"] == "Pipeline"]
+    assert pipeline_rows, "the REPORT.md must project as a Pipeline row"
+    row = pipeline_rows[0]
+    assert "displayLabel" in row, "pipeline row must carry a displayLabel field"
+    assert "artifacts overlay" in row["displayLabel"].lower(), (
+        f"displayLabel must be the task name, got {row['displayLabel']!r}"
+    )
+    assert "run_abc12345" not in row["displayLabel"], "must NOT be the raw run-id"
+
+
+async def test_non_pipeline_row_display_label_is_basename(app_with_ws):
+    """A non-pipeline row's displayLabel = its basename (no run.json lookup)."""
+    app, ws = app_with_ws
+    from core.product_registry import ProductRegistry
+
+    deck = ws / "Knowledge" / "Library" / "my-deck.html"
+    deck.parent.mkdir(parents=True)
+    deck.write_text("<html>")
+    ProductRegistry(ws).register_batch([str(deck)])
+
+    data = await _get_products(app)
+    deliv = [r for r in data if r["role"] == "Deliverables"]
+    assert deliv, "the deck must project as Deliverables"
+    assert deliv[0]["displayLabel"] == "my-deck.html"

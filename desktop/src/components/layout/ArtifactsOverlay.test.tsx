@@ -22,10 +22,13 @@ import {
   groupByRole,
   parentRunLabel,
   relativeTime,
+  absoluteTime,
+  elideDir,
   OPEN_FILE_EVENT,
 } from './ArtifactsOverlay';
 
 function prod(path: string, role: Product['role'], extra: Partial<Product> = {}): Product {
+  const base = path.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? path;
   return {
     path,
     role,
@@ -33,6 +36,7 @@ function prod(path: string, role: Product['role'], extra: Partial<Product> = {})
     gitignored: false,
     firstProduced: '2026-09-30T00:00:00+00:00',
     lastTouched: '2026-09-30T00:00:00+00:00',
+    displayLabel: base,
     ...extra,
   };
 }
@@ -41,8 +45,8 @@ const FIXTURE: Product[] = [
   prod('Projects/AIDLC/assets/deck.html', 'Deliverables', { gitignored: true, lastTouched: '2026-09-30T10:00:00+00:00' }),
   prod('Knowledge/Reports/weekly.html', 'Deliverables', { lastTouched: '2026-09-30T09:00:00+00:00' }),
   prod('Projects/SwarmAI/2-understanding/TECH.md', 'Knowledge', { kind: 'knowledge' }),
-  prod('Projects/SwarmAI/.artifacts/runs/run_2274b401/REPORT.md', 'Pipeline', { kind: 'knowledge' }),
-  prod('Projects/SwarmAI/.artifacts/runs/run_91cddb8f/REPORT.md', 'Pipeline', { kind: 'knowledge' }),
+  prod('Projects/SwarmAI/.artifacts/runs/run_2274b401/REPORT.md', 'Pipeline', { kind: 'knowledge', displayLabel: 'Artifacts data root-fix' }),
+  prod('Projects/SwarmAI/.artifacts/runs/run_91cddb8f/REPORT.md', 'Pipeline', { kind: 'knowledge', displayLabel: 'Shared product registry backend' }),
   prod('Knowledge/DailyActivity/2026-09-30.md', 'Activity'),
 ];
 
@@ -117,13 +121,13 @@ describe('ArtifactsContent', () => {
     renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
     await waitFor(() => expect(screen.getByTestId('artifacts-group-Pipeline')).toBeInTheDocument());
     // Pipeline collapsed → its REPORT rows are NOT rendered until toggled
-    expect(screen.queryByText('run_2274b401')).toBeNull();
+    expect(screen.queryByText('Artifacts data root-fix')).toBeNull();
     // Knowledge expanded → its row IS rendered
     expect(screen.getByText('TECH.md')).toBeInTheDocument();
     // Expand Pipeline → REPORT rows appear, labeled by run dir (same-name fix)
     fireEvent.click(screen.getByTestId('artifacts-section-toggle-Pipeline'));
-    await waitFor(() => expect(screen.getByText('run_2274b401')).toBeInTheDocument());
-    expect(screen.getByText('run_91cddb8f')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('Artifacts data root-fix')).toBeInTheDocument());
+    expect(screen.getByText('Shared product registry backend')).toBeInTheDocument();
   });
 
   it('AC2: clicking a deliverable card dispatches swarm:open-file with the path AND calls close()', async () => {
@@ -224,10 +228,57 @@ describe('ArtifactsContent — role chips + timestamps', () => {
     renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
     await waitFor(() => expect(screen.getByText('deck.html')).toBeInTheDocument());
     // Pipeline is collapsed by default → its run rows are NOT visible initially.
-    expect(screen.queryByText('run_2274b401')).toBeNull();
+    expect(screen.queryByText('Artifacts data root-fix')).toBeNull();
     // Click the Pipeline chip → filter to Pipeline AND force-expand it → rows visible.
     fireEvent.click(screen.getByTestId('artifacts-chip-Pipeline'));
-    await waitFor(() => expect(screen.getByText('run_2274b401')).toBeInTheDocument());
-    expect(screen.getByText('run_91cddb8f')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText('Artifacts data root-fix')).toBeInTheDocument());
+    expect(screen.getByText('Shared product registry backend')).toBeInTheDocument();
+  });
+});
+
+describe('absoluteTime (pure) — AC6', () => {
+  it('renders YYYY-MM-DD HH:MM in local time', () => {
+    // A fixed instant; assert the shape, not a tz-specific value.
+    const out = absoluteTime('2026-06-04T01:13:16+00:00');
+    expect(out).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+  });
+  it('unparseable → empty string (never crashes a row)', () => {
+    expect(absoluteTime('not-a-date')).toBe('');
+    expect(absoluteTime('')).toBe('');
+  });
+});
+
+describe('elideDir (pure) — AC7', () => {
+  it('shows the last two dirs, eliding deeper prefixes with …/', () => {
+    expect(elideDir('Projects/SwarmAI/.artifacts/runs/run_x/REPORT.md'))
+      .toBe('…/runs/run_x');
+  });
+  it('two-level path shows both, no ellipsis', () => {
+    expect(elideDir('Knowledge/Library/deck.html')).toBe('Knowledge/Library');
+  });
+  it('one-level path shows the single dir', () => {
+    expect(elideDir('Knowledge/deck.html')).toBe('Knowledge');
+  });
+  it('bare filename → empty', () => {
+    expect(elideDir('deck.html')).toBe('');
+  });
+});
+
+describe('Pipeline rows use server displayLabel — AC8', () => {
+  it('renders the task-name displayLabel, not the raw run-id', async () => {
+    const fetchProducts = vi.fn().mockResolvedValue([
+      prod('Projects/SwarmAI/.artifacts/runs/run_abc12345/REPORT.md', 'Pipeline', {
+        kind: 'knowledge',
+        displayLabel: 'Fix the artifacts overlay timestamps',
+      }),
+    ]);
+    renderWithClient(<ArtifactsContent close={() => {}} fetchProducts={fetchProducts} />);
+    await waitFor(() => expect(screen.getByTestId('artifacts-group-Pipeline')).toBeInTheDocument());
+    // Pipeline is collapsed by default — expand it.
+    fireEvent.click(screen.getByTestId('artifacts-section-toggle-Pipeline'));
+    await waitFor(() =>
+      expect(screen.getByText('Fix the artifacts overlay timestamps')).toBeInTheDocument(),
+    );
+    expect(screen.queryByText('run_abc12345')).not.toBeInTheDocument();
   });
 });

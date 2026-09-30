@@ -81,6 +81,15 @@ class Role(str, Enum):
 
 _STORE_VERSION = 1
 
+# Backfill schema version (Gate-2 meta-review Finding 1). The `backfilled_at` marker
+# alone froze existing stores: once set, has_backfilled() short-circuits forever, so a
+# code change to the backfill LOGIC (e.g. Run-3's real timestamps + fs-scan + displayLabel)
+# would NEVER reach the rows a prior backfill wrote with the OLD logic. Bumping this
+# constant invalidates a store whose stored backfill_version is older → has_backfilled()
+# returns False once → the endpoint re-runs backfill with the new logic, correcting the
+# stale data. Bump this whenever backfill/scan/classification OUTPUT changes.
+_BACKFILL_VERSION = 2
+
 # Run 2 AC4: bounded store. Registering past this cap evicts the OLDEST entries by
 # last_touched inside the same flock-guarded _upsert (never a parallel writer, P8).
 # Generous but finite — the overlay is a recent-products view, not an archive.
@@ -96,6 +105,9 @@ MAX_PRODUCTS = 2000
 _PRODUCT_DIR_SEGMENTS: tuple[str, ...] = (
     "assets",        # Projects/*/assets/** — decks, generated media
     "Attachments",   # Attachments/** — user-attached / produced images
+    "Library",       # Knowledge/Library/** — published decks/reports (Run-3 AC3)
+    "Pollinate",     # Knowledge/Pollinate/** — Pollinate content packages (Run-3 AC3)
+    "deliverables",  # Projects/*/deliverables/** — project deliverables (Run-3 AC3)
 )
 
 # Dependency / vendor trees whose nested ``assets/`` dirs are NOT user products
@@ -125,6 +137,81 @@ _PRODUCT_EXTENSIONS: frozenset[str] = frozenset({
 # the collision is a secret risk, so it is EXCLUDED from products (a Keynote deck
 # is exported to .pptx/.pdf for surfacing). Remove it from the set explicitly.
 _PRODUCT_EXTENSIONS = _PRODUCT_EXTENSIONS - {".key"}
+
+# Run-3 AC4: the FS-SCAN extension gate is STRICTER than _PRODUCT_EXTENSIONS.
+# scan_product_dirs() walks gitignored dirs (Projects/*/assets), bypassing the
+# git-log tracked-only guarantee — so a gitignored data-export could carry a
+# product extension. .csv/.xlsx are dropped here (Gate-1 F3: a gitignored
+# `secrets_export.csv` under assets/ must never surface).
+#
+# ⚠️ SECURITY (Gate-2 HIGH, defense-in-depth): the extension gate ALONE is NOT a
+# sufficient secret guard — a document-formatted secret (an exported
+# `aws_credentials.pdf`, a `session_tokens.html`) carries a legit product extension.
+# AC4's PURPOSE is to surface a gitignored DECK (Projects/AIDLC/assets/*.pdf), so we
+# cannot drop .pdf/.html. GUARD-1 (role==Other) does NOT catch these — a product-
+# extension file under assets/ classifies as Deliverables, bypassing GUARD-1/GUARD-2.
+# So the fs-scan path adds a SECOND layer: _is_secretish_name() (a filename denylist)
+# runs before registration. It is a denylist (Red-Team notes denylists leak), but here
+# it is defense-IN-DEPTH layered ON the positive extension allowlist — not the sole
+# guard — and the blast radius is bounded (products.json stores PATHS not content, and
+# SwarmWS has zero git remote per C050/STEERING#5, so a surfaced path is local-only).
+_SCAN_EXTENSIONS: frozenset[str] = _PRODUCT_EXTENSIONS - {".csv", ".xlsx"}
+
+# Secret-name markers for the FS-SCAN path only (defense-in-depth on the gitignored
+# walk). A basename matching any of these is not surfaced even with a product
+# extension. Substring match on the lowercased basename.
+_SECRET_NAME_MARKERS: tuple[str, ...] = (
+    "secret", "credential", "cred_", "_creds", "password", "passwd", "token",
+    "apikey", "api_key", "api-key", "private", "privkey", "id_rsa", "id_ed25519",
+    ".pem", ".p12", ".pfx", "keystore", "aws_", "_aws", ".env",
+)
+
+
+def _is_secretish_name(basename: str) -> bool:
+    """True iff a basename looks secret-bearing (FS-scan defense-in-depth, Gate-2 HIGH).
+
+    A denylist — deliberately, and deliberately LAYERED on the positive extension
+    allowlist (never the sole guard). Bounds the fs-scan's exposure of gitignored
+    document-secrets that carry a legit product extension (a `.pdf`/`.html` that
+    GUARD-1 cannot catch because it classifies as Deliverables under a product dir).
+    """
+    low = basename.lower()
+    return any(m in low for m in _SECRET_NAME_MARKERS)
+
+# Run-3 AC2: backup/temp/corrupt markers. A file carrying one of these in ANY path
+# component OR its basename is never a product (it is an editor/tool byproduct).
+# COMPONENT-aware, not endswith — `deck.bak.html` (a double-extension where .bak is
+# mid-name) is garbage even though its final suffix is .html (Gate-1 F2).
+_GARBAGE_MARKERS: tuple[str, ...] = (
+    ".bak", ".broken", ".tmp", ".temp", ".corrupt", ".orig", ".swp", ".old",
+)
+
+
+def _is_garbage(rel_path: str) -> bool:
+    """True iff rel_path is a backup/temp/corrupt byproduct — never a product.
+
+    COMPONENT-aware (Gate-1 F2): checks every path component AND the dot-split
+    tokens of the basename, so `deck.bak.html` (mid-name .bak), `x.html.bak-1788`
+    (trailing epoch-bak), `notes.md.tmp`, `data.corrupt-20260930`, and `draft.html~`
+    (trailing tilde) are ALL caught — not just a naive final-suffix match.
+    """
+    norm = rel_path.replace("\\", "/")
+    # Trailing-tilde editor backup (draft.html~).
+    if norm.endswith("~"):
+        return True
+    for comp in norm.split("/"):
+        if not comp:
+            continue
+        # Each dot-delimited token of the component (basename included): a marker
+        # appearing as ANY token — start, middle, or with a trailing -<suffix> —
+        # means garbage. Lowercase for case-insensitive match.
+        lowered = comp.lower()
+        for marker in _GARBAGE_MARKERS:
+            m = marker  # e.g. ".bak"
+            # ".bak" as a standalone dotted token, OR ".bak-<anything>" (epoch/host).
+            if (m + ".") in lowered or (m + "-") in lowered or lowered.endswith(m):
+                return True
+    return False
 
 
 def _under_product_dir(rel_path: str) -> bool:
@@ -245,13 +332,23 @@ class ProductRegistry:
         return [Product(**e) for e in self._read().get("products", [])]
 
     def has_backfilled(self) -> bool:
-        """True once backfill_from_gitlog has run (regardless of whether it produced
-        rows). The endpoint gates day-one backfill on THIS, not on an empty product
-        list — otherwise a workspace whose recent git-log has no products (a code-only
-        or brand-new tree) would re-run the 30s git-log on EVERY overlay open, occupying
+        """True once backfill_from_gitlog has run WITH THE CURRENT backfill version.
+
+        The endpoint gates day-one backfill on THIS, not on an empty product list —
+        otherwise a workspace whose recent git-log has no products (a code-only or
+        brand-new tree) would re-run the 30s git-log on EVERY overlay open, occupying
         a shared thread-pool worker each time (Gate-2 meta-review MED / RP53-adjacent).
-        The marker makes backfill fire at most once."""
-        return bool(self._read().get("backfilled_at"))
+
+        VERSION GATE (Gate-2 meta-review Finding 1): returns False if the store was
+        backfilled by an OLDER _BACKFILL_VERSION, so a change to the backfill LOGIC
+        re-runs ONCE to correct rows the previous logic wrote (e.g. the 175 rows a v1
+        backfill stamped with the fetch-instant instead of real git-commit dates).
+        A store with no marker (never backfilled) also returns False. Fires at most
+        once per version bump."""
+        data = self._read()
+        if not data.get("backfilled_at"):
+            return False
+        return data.get("backfill_version", 1) >= _BACKFILL_VERSION
 
     # ── atomic write (temp + replace) ─────────────────────────────────────────
 
@@ -315,6 +412,7 @@ class ProductRegistry:
         rel_path: str,
         repo: Optional[str],
         ignored: Optional[bool],
+        ts: Optional[str] = None,
     ) -> Optional[Product]:
         """Classify an already-resolved path into a Product, or None if not a product.
 
@@ -323,7 +421,20 @@ class ProductRegistry:
         decided HERE. ``ignored`` is the PRE-COMPUTED tri-state git verdict (True /
         False / None-unknown) from the batched check-ignore — the per-path subprocess
         is gone (AC5). Returns None for non-product content (AC3 secret guard).
+
+        ``ts`` (Run-3 AC1) is the REAL file time (git commit date / mtime) to stamp
+        both first_produced and last_touched. When None (the LIVE watcher path), we
+        stamp now() — a file the watcher just saw WAS just touched. Backfill/fs-scan
+        pass a real historical ts so a 2026-06 deck shows 2026-06, not the backfill
+        instant. MUST set BOTH date fields from ts (Gate-1 F1: a post-hoc overwrite
+        in register_batch would miss first_produced).
         """
+        # AC2 (Gate-1 F2): garbage byproducts are never products — MUST run BEFORE
+        # derive_role, because a Library/x-deck.bak.html passes the ext gate and
+        # derive_role would (mis)classify it as a Deliverable. First line, no bypass.
+        if _is_garbage(rel_path):
+            return None
+
         role = derive_role(rel_path, repo)
 
         # GUARD 1 — the store holds PRODUCTS only. `Other` is the classification
@@ -349,14 +460,15 @@ class ProductRegistry:
         gitignored = ignored is True
 
         kind = _classify_kind(rel_path, repo)
-        now = datetime.now(timezone.utc).isoformat()
+        # AC1: real file time when provided (backfill/fs-scan), else now() (live).
+        stamp = ts or datetime.now(timezone.utc).isoformat()
         return Product(
             path=rel_path,
             role=role,
             kind=kind,
             gitignored=gitignored,
-            first_produced=now,
-            last_touched=now,
+            first_produced=stamp,
+            last_touched=stamp,
         )
 
     def _batch_gitignored(
@@ -424,7 +536,9 @@ class ProductRegistry:
         """Register ONE product path (no-op if not a product)."""
         self.register_batch([abs_path])
 
-    def register_batch(self, paths: list[str]) -> None:
+    def register_batch(
+        self, paths: list[str], times: Optional[dict[str, str]] = None
+    ) -> None:
         """Register a batch of RAW paths. Classifies each independently of any
         surface verdict (the Gate-1 fix), then upserts under one flock.
 
@@ -432,34 +546,46 @@ class ProductRegistry:
         --stdin per tree (not one subprocess per path), then classify. Keyed by
         relative path: re-registering refreshes ``last_touched`` (+role/kind/
         gitignored) but never duplicates. AC4: eviction inside the same flock.
+
+        ``times`` (Run-3 AC1): optional {abs_path: iso_time} of REAL file times
+        (git commit date / mtime). When present, the matching product is stamped
+        with that time instead of now(). Absent → now() (the live-watcher path).
         """
+        times = times or {}
         # 1. Resolve every raw path to (tree_root, rel_path, repo); drop externals.
-        resolved = []  # (tree_root, rel_path, repo)
+        #    Keep the raw abs_path so we can look up its real time in `times`.
+        resolved = []  # (tree_root, rel_path, repo, ts)
         for a in paths:
             r = self._resolve(a)
             if r is not None:
-                resolved.append(r)
+                resolved.append((*r, times.get(a)))
         if not resolved:
             return
 
         # 2. Group rel_paths per owning tree → ONE batched check-ignore per tree (AC5).
         by_tree: dict[Path, list[str]] = {}
-        for tree_root, rel_path, _repo in resolved:
+        for tree_root, rel_path, _repo, _ts in resolved:
             by_tree.setdefault(tree_root, []).append(rel_path)
         ignore_maps: dict[Path, dict[str, Optional[bool]]] = {
             tree_root: self._batch_gitignored(tree_root, rels)
             for tree_root, rels in by_tree.items()
         }
 
-        # 3. Classify each with its pre-computed gitignore verdict.
+        # 3. Classify each with its pre-computed gitignore verdict + real time.
         classified = []
-        for tree_root, rel_path, repo in resolved:
+        for tree_root, rel_path, repo, ts in resolved:
             ignored = ignore_maps.get(tree_root, {}).get(rel_path)
-            prod = self._classify(tree_root, rel_path, repo, ignored)
+            prod = self._classify(tree_root, rel_path, repo, ignored, ts)
             if prod is not None:
                 classified.append(prod)
         if not classified:
             return
+
+        # Rel-paths that got a REAL historical time (backfill/fs-scan), so _upsert can
+        # CORRECT a stale first_produced (Gate-2 meta-review Finding 1: a re-backfill
+        # must overwrite the v1 fetch-instant stamp with the real git-commit date, not
+        # preserve the wrong value). A live re-touch (no ts) still preserves first_produced.
+        real_ts_rels = {rel for _t, rel, _r, ts in resolved if ts}
 
         def _upsert(data: dict) -> None:
             products = data.setdefault("products", [])
@@ -467,11 +593,15 @@ class ProductRegistry:
             for prod in classified:
                 existing = by_path.get(prod.path)
                 if existing is not None:
-                    # Refresh mutable fields; PRESERVE first_produced.
+                    # Refresh mutable fields.
                     existing["role"] = prod.role.value
                     existing["kind"] = prod.kind
                     existing["gitignored"] = prod.gitignored
                     existing["last_touched"] = prod.last_touched
+                    # Correct first_produced ONLY when a real historical time was supplied
+                    # (backfill/scan); a live re-touch preserves the earliest-seen value.
+                    if prod.path in real_ts_rels:
+                        existing["first_produced"] = prod.first_produced
                 else:
                     row = asdict(prod)
                     row["role"] = prod.role.value  # store the enum VALUE, not the member
@@ -504,10 +634,17 @@ class ProductRegistry:
         marker — that stays retryable.
         """
         try:
+            # AC1: --pretty=format:%x00%cI emits a header line "<NUL><iso>" before each
+            # commit's file list. git log is reverse-chronological, so the FIRST time a
+            # path appears (under the newest header) is its latest commit time. ONE pass,
+            # no per-file subprocess (RP53). The NUL (0x00) sentinel is a byte that CANNOT
+            # appear in a POSIX path, so a header can never be confused with a filename —
+            # a file literally named "COMMIT foo.pdf" would have poisoned a "COMMIT "-prefix
+            # parse (Gate-2 Correctness F1). Verified live.
             r = subprocess.run(
                 [
                     "git", "log", f"--since={days}.days", "--diff-filter=ACMR",
-                    "--name-only", "--pretty=format:",
+                    "--name-only", "--pretty=format:%x00%cI",
                 ],
                 cwd=str(self.workspace_root),
                 capture_output=True,
@@ -520,15 +657,105 @@ class ProductRegistry:
         if r.returncode != 0:
             return
 
-        rels = {line.strip() for line in r.stdout.splitlines() if line.strip()}
-        abs_paths = [
-            str(self.workspace_root / rel)
-            for rel in rels
-            if (self.workspace_root / rel).is_file()
-        ]
+        # Parse interleaved "<NUL><iso>" headers + file lists. First-seen per path
+        # (newest commit) wins its timestamp. A line starting with NUL is a header;
+        # anything else is a path (a path can never contain NUL).
+        rel_times: dict[str, str] = {}
+        cur_iso = ""
+        for line in r.stdout.splitlines():
+            if line.startswith("\x00"):
+                cur_iso = line[1:].strip()
+                continue
+            rel = line.strip()
+            if rel and rel not in rel_times:
+                rel_times[rel] = cur_iso
+
+        abs_paths: list[str] = []
+        times: dict[str, str] = {}
+        for rel, iso in rel_times.items():
+            p = self.workspace_root / rel
+            if p.is_file():
+                a = str(p)
+                abs_paths.append(a)
+                if iso:
+                    times[a] = iso
         if abs_paths:
-            self.register_batch(abs_paths)
+            self.register_batch(abs_paths, times=times)
+        # AC4: also fs-scan the gitignored product dirs git-log can NEVER list.
+        self.scan_product_dirs()
         # Mark backfill DONE (git-log succeeded) even when zero products were found,
         # so has_backfilled() is True and the endpoint won't re-run the git-log on the
-        # next open of a product-less workspace.
-        self._mutate(lambda data: data.__setitem__("backfilled_at", datetime.now(timezone.utc).isoformat()))
+        # next open of a product-less workspace. Stamp the CURRENT _BACKFILL_VERSION so a
+        # future logic change (version bump) re-runs once to correct old data (Finding 1).
+        def _mark(data: dict) -> None:
+            data["backfilled_at"] = datetime.now(timezone.utc).isoformat()
+            data["backfill_version"] = _BACKFILL_VERSION
+        self._mutate(_mark)
+
+    def scan_product_dirs(self) -> None:
+        """AC4: fs-walk known PRODUCT dirs for files git-log never lists (gitignored
+        AIDLC decks under Projects/*/assets). TWO secret layers on this gitignored
+        walk (Gate-2 HIGH): (1) the STRICTER ``_SCAN_EXTENSIONS`` positive allowlist
+        (no .csv/.xlsx); (2) ``_is_secretish_name`` filename denylist — because a
+        document-formatted secret (aws_credentials.pdf) carries a legit product
+        extension AND classifies as Deliverables under a product dir, so GUARD-1
+        (role==Other) does NOT catch it. Time = os.path.getmtime (the file's real
+        age). Files still flow through register_batch → _classify → _batch_gitignored
+        so each carries its correct ``gitignored`` flag.
+
+        Bounded: skips _DEPENDENCY_SEGMENTS (vendored assets/). Fail-safe: an OSError
+        on any dir is logged + skipped, never raised (a background/backfill caller
+        must never crash on a permission or race).
+
+        PRECEDENCE (real interaction fix): a TRACKED file already registered by
+        git-log backfill carries its authoritative COMMIT date. The fs-scan must NOT
+        re-register it with the (fresher) mtime — that would overwrite the commit
+        date with ~now. So we skip any path already in the store; the fs-scan only
+        ADDS files git-log never listed (the gitignored decks it exists to surface).
+        """
+        already: set[str] = {p.path for p in self.list_products()}
+        # The product-dir roots to walk. Each glob yields real dirs on disk; a
+        # missing dir simply yields nothing.
+        scan_globs = [
+            "Projects/*/assets",
+            "Projects/*/deliverables",
+            "Knowledge/Pollinate",
+            "Knowledge/Library",
+        ]
+        abs_paths: list[str] = []
+        times: dict[str, str] = {}
+        for pattern in scan_globs:
+            for root_dir in self.workspace_root.glob(pattern):
+                if not root_dir.is_dir():
+                    continue
+                for dirpath, dirnames, filenames in os.walk(root_dir):
+                    # Prune vendored/dependency subtrees + VCS/pipeline byproduct dirs
+                    # in-place (Gate-2 meta-review Finding 2: a nested .git or an
+                    # .artifacts/runs/** tree can be pathologically large — walking it
+                    # fully would stat thousands of byproduct files on a pool worker).
+                    _prune = {s.lower() for s in _DEPENDENCY_SEGMENTS} | {".git", ".artifacts"}
+                    dirnames[:] = [d for d in dirnames if d.lower() not in _prune]
+                    for fn in filenames:
+                        if Path(fn).suffix.lower() not in _SCAN_EXTENSIONS:
+                            continue
+                        # Layer 2 (Gate-2 HIGH): a secret-named product-extension file
+                        # under a gitignored product dir is NOT surfaced.
+                        if _is_secretish_name(fn):
+                            continue
+                        fp = Path(dirpath) / fn
+                        try:
+                            if not fp.is_file():
+                                continue
+                            rel_check = str(fp.resolve().relative_to(self.workspace_root)) \
+                                if fp.resolve().is_relative_to(self.workspace_root) else None
+                            if rel_check and rel_check in already:
+                                continue  # git-log commit date wins over mtime
+                            a = str(fp)
+                            abs_paths.append(a)
+                            times[a] = datetime.fromtimestamp(
+                                os.path.getmtime(fp), tz=timezone.utc
+                            ).isoformat()
+                        except OSError as exc:
+                            logger.warning("scan_product_dirs: stat failed %s: %s", fp, exc)
+        if abs_paths:
+            self.register_batch(abs_paths, times=times)

@@ -600,3 +600,267 @@ class TestRun2CapEviction:
 
         assert hasattr(pr, "MAX_PRODUCTS"), "a MAX_PRODUCTS cap constant must exist"
         assert 100 <= pr.MAX_PRODUCTS <= 10000, "cap should be a generous but finite bound"
+
+
+# ── Run-3: data-layer root-fix (AC1 real time / AC2 garbage / AC3 Library / AC4 fs-scan) ──
+
+
+class TestRun3GarbageFilter:
+    """AC2: backup/temp files never register as products (component-aware)."""
+
+    @pytest.mark.parametrize(
+        "rel",
+        [
+            "Knowledge/Library/deck.html.bak-1788437117",  # trailing epoch-bak
+            "Knowledge/Library/deck.bak.html",             # double-ext: .bak mid-name
+            "Knowledge/Library/deck.html.broken-hostclose",
+            "Knowledge/Library/notes.md.tmp",
+            "Knowledge/Library/data.corrupt-20260930",
+            "Knowledge/Library/draft.html~",               # trailing ~
+        ],
+    )
+    def test_garbage_suffix_never_registers(self, ws, rel):
+        from core.product_registry import ProductRegistry
+
+        p = ws / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x")
+        ProductRegistry(ws).register_batch([str(p)])
+        products = ProductRegistry(ws).list_products()
+        bases = {e.path for e in products}
+        assert rel not in bases, f"garbage file must NOT register: {rel}"
+
+    def test_real_deck_next_to_garbage_still_registers(self, ws):
+        from core.product_registry import ProductRegistry
+
+        d = ws / "Knowledge" / "Library"
+        d.mkdir(parents=True)
+        good = d / "2026-08-30-ai-native-deck.html"
+        bad = d / "2026-08-30-ai-native-deck.html.bak-1788437117"
+        good.write_text("x")
+        bad.write_text("x")
+        ProductRegistry(ws).register_batch([str(good), str(bad)])
+        bases = {e.path for e in ProductRegistry(ws).list_products()}
+        assert "Knowledge/Library/2026-08-30-ai-native-deck.html" in bases
+        assert "Knowledge/Library/2026-08-30-ai-native-deck.html.bak-1788437117" not in bases
+
+
+class TestRun3LibraryDeliverable:
+    """AC3: Library/Pollinate decks classify as Deliverables, not Knowledge."""
+
+    @pytest.mark.parametrize(
+        "rel",
+        [
+            "Knowledge/Library/2026-08-30-ai-native-ee-oe-deck.html",
+            "Knowledge/Library/2026-08-30-ai-native-ee-oe-deck-en.pdf",
+            "Knowledge/Pollinate/2026-07-13-ai-native-transformation-deck/index.html",
+        ],
+    )
+    def test_library_pollinate_deck_is_deliverable(self, ws, rel):
+        from core.product_registry import ProductRegistry, Role
+
+        p = ws / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x")
+        ProductRegistry(ws).register_batch([str(p)])
+        products = ProductRegistry(ws).list_products()
+        match = [e for e in products if e.path == rel]
+        assert match, f"deck must register: {rel}"
+        assert match[0].role == Role.DELIVERABLES.value, f"{rel} must be Deliverables"
+
+
+class TestRun3RealTimestamp:
+    """AC1: backfill sets time from git commit date (fallback mtime), not now()."""
+
+    def test_backfill_uses_git_commit_date_not_now(self, git_ws):
+        import subprocess
+        from datetime import datetime, timezone
+        from core.product_registry import ProductRegistry
+
+        # Commit a deliverable at a KNOWN back-date via GIT_*_DATE env.
+        deck = git_ws / "Knowledge" / "Library" / "old-deck.html"
+        deck.parent.mkdir(parents=True, exist_ok=True)
+        deck.write_text("x")
+        old_date = "2026-06-04T01:13:16"
+        env = {
+            "GIT_AUTHOR_DATE": f"{old_date} +0000",
+            "GIT_COMMITTER_DATE": f"{old_date} +0000",
+        }
+        import os
+        full_env = {**os.environ, **env}
+        subprocess.run(["git", "add", "-A"], cwd=git_ws, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "old deck"],
+            cwd=git_ws, check=True, env=full_env,
+        )
+        ProductRegistry(git_ws).backfill_from_gitlog(days=3650)
+        products = ProductRegistry(git_ws).list_products()
+        match = [e for e in products if e.path == "Knowledge/Library/old-deck.html"]
+        assert match, "backfilled deck must be present"
+        # Its last_touched must reflect the 2026-06 commit date, NOT the backfill instant.
+        assert match[0].last_touched.startswith("2026-06-04"), (
+            f"timestamp must be the commit date, got {match[0].last_touched}"
+        )
+        assert match[0].first_produced.startswith("2026-06-04"), (
+            f"first_produced must be the commit date, got {match[0].first_produced}"
+        )
+
+
+class TestRun3FsScanGitignoredDecks:
+    """AC4: fs-scan surfaces gitignored product-dir decks, extension-gated (no secrets)."""
+
+    def test_gitignored_deck_scanned_and_surfaced(self, git_ws):
+        from core.product_registry import ProductRegistry
+
+        # A gitignored AIDLC deck (Projects/* is gitignored) — git-log never lists it.
+        deck = git_ws / "Projects" / "AIDLC" / "assets" / "AIDLC-Deck-EN.pdf"
+        deck.parent.mkdir(parents=True, exist_ok=True)
+        deck.write_text("%PDF-x")
+        ProductRegistry(git_ws).scan_product_dirs()
+        bases = {e.path for e in ProductRegistry(git_ws).list_products()}
+        assert "Projects/AIDLC/assets/AIDLC-Deck-EN.pdf" in bases, (
+            "gitignored deck under a product dir must be fs-scanned in"
+        )
+
+    def test_secret_in_product_dir_not_scanned(self, git_ws):
+        from core.product_registry import ProductRegistry
+
+        # A secret with a NON-product extension under a scanned dir must never surface.
+        env = git_ws / "Projects" / "AIDLC" / "assets" / "secret.env"
+        key = git_ws / "Projects" / "AIDLC" / "assets" / "id_rsa"
+        csv = git_ws / "Projects" / "AIDLC" / "assets" / "secrets_export.csv"
+        env.parent.mkdir(parents=True, exist_ok=True)
+        for f in (env, key, csv):
+            f.write_text("SECRET")
+        ProductRegistry(git_ws).scan_product_dirs()
+        bases = {e.path for e in ProductRegistry(git_ws).list_products()}
+        assert not any("secret" in b or "id_rsa" in b for b in bases), (
+            f"no secret may be fs-scanned into products; got {bases}"
+        )
+
+    def test_scanned_files_carry_correct_gitignored_flag(self, git_ws):
+        from core.product_registry import ProductRegistry
+
+        deck = git_ws / "Projects" / "AIDLC" / "assets" / "deck.pdf"
+        deck.parent.mkdir(parents=True, exist_ok=True)
+        deck.write_text("%PDF-x")
+        ProductRegistry(git_ws).scan_product_dirs()
+        match = [e for e in ProductRegistry(git_ws).list_products()
+                 if e.path == "Projects/AIDLC/assets/deck.pdf"]
+        assert match, "deck must be scanned in"
+        assert match[0].gitignored is True, "scanned gitignored deck must carry gitignored=True"
+
+
+class TestRun3Gate2SecurityHardening:
+    """Gate-2 HIGH: document-formatted secrets under scanned gitignored dirs."""
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "aws_credentials_export.pdf",
+            "session_tokens.html",
+            "internal-secret-deck.html",
+            "id_rsa.pdf",
+            "my_password_list.docx",
+            "cluster.pem.pdf",
+            "prod.env.html",
+        ],
+    )
+    def test_secret_named_product_extension_not_scanned(self, git_ws, name):
+        from core.product_registry import ProductRegistry
+
+        f = git_ws / "Projects" / "AIDLC" / "assets" / name
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("SECRET")
+        ProductRegistry(git_ws).scan_product_dirs()
+        bases = {e.path.rsplit("/", 1)[-1] for e in ProductRegistry(git_ws).list_products()}
+        assert name not in bases, f"secret-named product-ext file must NOT be scanned in: {name}"
+
+    def test_legit_deck_still_scanned_alongside_secret(self, git_ws):
+        from core.product_registry import ProductRegistry
+
+        d = git_ws / "Projects" / "AIDLC" / "assets"
+        d.mkdir(parents=True)
+        (d / "AIDLC-Deck-EN.pdf").write_text("%PDF")
+        (d / "aws_credentials.pdf").write_text("SECRET")
+        ProductRegistry(git_ws).scan_product_dirs()
+        bases = {e.path.rsplit("/", 1)[-1] for e in ProductRegistry(git_ws).list_products()}
+        assert "AIDLC-Deck-EN.pdf" in bases, "the legit deck must still surface"
+        assert "aws_credentials.pdf" not in bases, "the secret must not"
+
+
+class TestRun3Gate2CommitFilenameParse:
+    """Gate-2 Correctness F1: a file named 'COMMIT ...' must not poison the git parse."""
+
+    def test_commit_prefixed_filename_does_not_poison_timestamps(self, git_ws):
+        import subprocess, os
+        from core.product_registry import ProductRegistry
+
+        # Two decks committed together; one basename literally starts with "COMMIT ".
+        d = git_ws / "Knowledge" / "Library"
+        d.mkdir(parents=True)
+        good = d / "real-deck.html"
+        trap = d / "COMMIT summary.html"
+        good.write_text("x")
+        trap.write_text("x")
+        old = "2026-06-04T01:13:16"
+        env = {**os.environ,
+               "GIT_AUTHOR_DATE": f"{old} +0000", "GIT_COMMITTER_DATE": f"{old} +0000"}
+        subprocess.run(["git", "add", "-A"], cwd=git_ws, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "decks"], cwd=git_ws, check=True, env=env)
+        ProductRegistry(git_ws).backfill_from_gitlog(days=3650)
+        prods = {e.path: e for e in ProductRegistry(git_ws).list_products()}
+        # The real deck must carry the REAL commit date, not a poisoned filename-string.
+        real = prods.get("Knowledge/Library/real-deck.html")
+        assert real, "real deck must be backfilled"
+        assert real.last_touched.startswith("2026-06-04"), (
+            f"a COMMIT-prefixed sibling filename must not poison the timestamp; "
+            f"got {real['last_touched']}"
+        )
+
+
+class TestRun3Gate2VersionedBackfill:
+    """Gate-2 meta Finding 1: a version bump re-runs backfill to correct stale data."""
+
+    def test_stale_v1_store_re_backfills_and_corrects_timestamp(self, git_ws):
+        import subprocess, os, json as _json
+        from core.product_registry import ProductRegistry, _BACKFILL_VERSION
+
+        # Commit a deck at a known OLD date.
+        deck = git_ws / "Knowledge" / "Library" / "old-deck.html"
+        deck.parent.mkdir(parents=True, exist_ok=True)
+        deck.write_text("x")
+        old = "2026-06-04T01:13:16"
+        env = {**os.environ, "GIT_AUTHOR_DATE": f"{old} +0000", "GIT_COMMITTER_DATE": f"{old} +0000"}
+        subprocess.run(["git", "add", "-A"], cwd=git_ws, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "deck"], cwd=git_ws, check=True, env=env)
+
+        reg = ProductRegistry(git_ws)
+        # Simulate a v1 store: a row stamped with a WRONG (fetch-instant) time + an
+        # old backfill marker with NO version (the pre-Run-3 shape).
+        store = git_ws / ".artifacts" / "products.json"
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(_json.dumps({
+            "version": 1,
+            "backfilled_at": "2026-09-30T08:19:58+00:00",  # v1 marker, no backfill_version
+            "products": [{
+                "path": "Knowledge/Library/old-deck.html", "role": "Deliverables",
+                "kind": "content", "gitignored": False,
+                "first_produced": "2026-09-30T08:19:58+00:00",  # WRONG (fetch instant)
+                "last_touched": "2026-09-30T08:19:58+00:00",
+            }],
+        }))
+        # has_backfilled must be FALSE for a v1 store under the new version.
+        assert reg.has_backfilled() is False, "a v1-backfilled store must re-qualify for backfill"
+        # Re-run backfill → the stale timestamp must be CORRECTED to the real commit date.
+        reg.backfill_from_gitlog(days=3650)
+        row = [e for e in ProductRegistry(git_ws).list_products()
+               if e.path == "Knowledge/Library/old-deck.html"][0]
+        assert row.last_touched.startswith("2026-06-04"), (
+            f"re-backfill must correct last_touched to the real commit date, got {row.last_touched}")
+        assert row.first_produced.startswith("2026-06-04"), (
+            f"re-backfill must correct first_produced too, got {row.first_produced}")
+        # And the marker must now carry the current version → no perpetual re-run.
+        assert ProductRegistry(git_ws).has_backfilled() is True, "post-re-backfill must be marked done"
+        data = _json.loads(store.read_text())
+        assert data["backfill_version"] == _BACKFILL_VERSION
