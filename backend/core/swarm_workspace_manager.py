@@ -184,6 +184,75 @@ DEFAULT_PROJECT_NAME = "SwarmAI"
 # Bump when the six-section structure changes in a way propagated DDDs must track.
 DDD_SPEC_VERSION = "1.0"
 
+
+def ensure_project_metadata(project_dir: Path, name: str) -> bool:
+    """Guarantee ``project_dir/.project.json`` exists (register the project).
+
+    THE single registration primitive: a ``Projects/<name>/`` directory is only a
+    real DDD — and only VISIBLE to Brain Hub (``list_brains`` → ``_list_project_dirs``
+    lists only dirs carrying ``.project.json``) — once this metadata file is written.
+    Any code path that MINTS a project directory (e.g. the pipeline CLI's run/report/
+    analytics/release-gate commands, which ``mkdir(parents=True)`` a ``Projects/<name>/``
+    subtree) must call this so it can never create a metadata-less "pseudo-DDD".
+
+    ONLY-IF-ABSENT + NON-DESTRUCTIVE: if ``.project.json`` already exists, this is a
+    no-op returning ``False`` — it NEVER overwrites existing metadata / update_history.
+    Returns ``True`` iff it wrote a fresh file. The schema mirrors the backfill written
+    by ``migrate_project_to_six_section._ensure_metadata`` (stable non-uuid id
+    ``<name>-ddd`` — safe per ``_rebuild_uuid_index``, which maps string→path with no
+    uuid parsing). This is the ONE source of that schema; callers must not inline a copy.
+
+    NOTE the uuid-index: this module-level helper deliberately does NOT touch a manager
+    instance's ``_uuid_index`` (it has none). That index is rebuilt lazily on a
+    lookup-miss via ``_rebuild_uuid_index`` (a full Projects/ scan), so a freshly
+    registered project resolves by name immediately (Brain Hub) and by id after the
+    next rebuild. Callers holding a manager instance (e.g. ``migrate``) still update
+    their own ``_uuid_index`` after delegating here.
+    """
+    meta_file = project_dir / ".project.json"
+    if meta_file.exists():
+        return False
+    now = datetime.now(timezone.utc).isoformat()
+    metadata = {
+        "id": f"{name.lower()}-ddd",
+        "name": name,
+        "description": "",
+        "created_at": now,
+        "updated_at": now,
+        "status": "active",
+        "tags": [],
+        "priority": None,
+        "schema_version": CURRENT_SCHEMA_VERSION,
+        "ddd_spec_version": DDD_SPEC_VERSION,
+        "version": 1,
+        "update_history": [{
+            "version": 1, "timestamp": now,
+            "action": "created", "changes": {},
+            "source": "auto-register",
+        }],
+    }
+    project_dir.mkdir(parents=True, exist_ok=True)
+    # Atomic create (adversarial-review MED): exclusive-create a temp then os.replace,
+    # so concurrent minters of the same project can't tear/double-write .project.json
+    # (check-then-act race), and a crash mid-write never leaves a truncated file that
+    # would break _read_project_metadata's json.loads. The temp name is pid-scoped to
+    # avoid two writers colliding on the SAME temp path.
+    payload = json.dumps(metadata, indent=2)
+    tmp = project_dir / f".project.json.tmp-{os.getpid()}"
+    try:
+        with open(tmp, "x", encoding="utf-8") as fh:  # x: exclusive — never clobber
+            fh.write(payload)
+        os.replace(tmp, meta_file)  # atomic on POSIX; last-writer-wins is fine (same content)
+    except FileExistsError:
+        # Another minter already produced .project.json (or our temp) between the
+        # exists() check and here — that's the idempotent win, not an error.
+        tmp.unlink(missing_ok=True)
+        return False
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+    return True
+
 # The canonical short NAMES of the six DDD sections (DDD-agent-brain spec §3.6),
 # in section order ①→⑥. This is the reusable SSOT of the section VOCABULARY for
 # programmatic consumers (e.g. a doc-drift check that asks "does this doc mention
@@ -1500,33 +1569,15 @@ class SwarmWorkspaceManager:
             raise ValueError(f"Project directory not found: {project_dir}")
 
         def _ensure_metadata() -> bool:
-            meta_file = project_dir / ".project.json"
-            if meta_file.exists():
-                return False
-            now = datetime.now(timezone.utc).isoformat()
-            metadata = {
-                # Deliberate stable id (NOT uuid4) — safe per _rebuild_uuid_index
-                # (string→path map, no uuid parsing) and mirrors "swarmai-default".
-                "id": f"{project_name.lower()}-ddd",
-                "name": project_name,
-                "description": "",
-                "created_at": now,
-                "updated_at": now,
-                "status": "active",
-                "tags": [],
-                "priority": None,
-                "schema_version": CURRENT_SCHEMA_VERSION,
-                "ddd_spec_version": DDD_SPEC_VERSION,
-                "version": 1,
-                "update_history": [{
-                    "version": 1, "timestamp": now,
-                    "action": "created", "changes": {},
-                    "source": "migration",
-                }],
-            }
-            self._write_project_metadata(project_dir, metadata)
-            self._uuid_index[metadata["id"]] = project_dir
-            return True
+            # Delegate to the ONE registration primitive (single source of the schema —
+            # no inline copy). It writes .project.json only-if-absent with the stable
+            # <name>-ddd id. Then keep THIS manager's uuid-index warm (the module-level
+            # helper can't touch instance state), so a lookup-by-id resolves without a
+            # rebuild scan.
+            wrote = ensure_project_metadata(project_dir, project_name)
+            if wrote:
+                self._uuid_index[f"{project_name.lower()}-ddd"] = project_dir
+            return wrote
 
         def _prune_legacy_scaffold() -> list[str]:
             """Remove ONLY prior-version over-build artifacts that are still the

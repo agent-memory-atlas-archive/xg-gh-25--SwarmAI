@@ -1039,6 +1039,39 @@ def _run_dir(project: str, run_id: str) -> Path:
     return _pipeline_runs_dir(project) / run_id
 
 
+def _ensure_project_dir(project: str) -> Path:
+    """Return ``Projects/<project>/``, guaranteeing it exists AND is REGISTERED.
+
+    THE single choke point for minting a project directory from the pipeline CLI.
+    Every command that would ``mkdir(parents=True)`` a ``Projects/<name>/`` subtree
+    (run-create, release-gate, run-report, run-analytics) must obtain the project dir
+    THROUGH here first — so a ``Projects/<name>/`` can NEVER be created without its
+    ``.project.json`` (which is what makes it visible to Brain Hub). This closes the
+    "pseudo-DDD" class at the birth point rather than in one command (see run_be30a0c6).
+
+    Idempotent + non-destructive: ``ensure_project_metadata`` is only-if-absent, so an
+    already-registered project keeps its metadata/history untouched. Returns the dir.
+    """
+    from core.swarm_workspace_manager import ensure_project_metadata
+    # Containment guard (adversarial-review HIGH): `project` is a CLI arg that upstream
+    # tooling may fill from requirement/LLM text — an unvalidated segment like
+    # "../../.ssh" would let mkdir(parents=True) escape the workspace. Reject any
+    # separator/parent/absolute segment, and assert the resolved path stays under
+    # Projects/ before creating anything.
+    projects_root = _get_workspace() / "Projects"
+    if (not project or project in (".", "..") or "/" in project or "\\" in project
+            or "\x00" in project or Path(project).is_absolute()):
+        raise ValueError(f"unsafe project name (path traversal): {project!r}")
+    pdir = projects_root / project
+    try:
+        pdir.resolve().relative_to(projects_root.resolve())
+    except ValueError:
+        raise ValueError(f"project dir escapes Projects/: {project!r}")
+    pdir.mkdir(parents=True, exist_ok=True)
+    ensure_project_metadata(pdir, project)
+    return pdir
+
+
 def _resolve_run_file(project: str, run_id: str) -> Path:
     """Find the run.json file, checking new path (runs/<id>/run.json) then legacy (pipeline-run-<id>.json)."""
     # New path: .artifacts/runs/<run_id>/run.json
@@ -1699,6 +1732,9 @@ def cmd_run_create(args, reg: ArtifactRegistry) -> None:
         "completed_at": None,
     }
 
+    # Register the project AT its birth point — mkdir(parents=True) below would mint
+    # Projects/<name>/ with no .project.json (a Brain-Hub-invisible pseudo-DDD) otherwise.
+    _ensure_project_dir(args.project)
     rd = _run_dir(args.project, run_id)
     rd.mkdir(parents=True, exist_ok=True)
     run_file = rd / "run.json"
@@ -3424,6 +3460,9 @@ def cmd_release_gate(args, reg: "ArtifactRegistry") -> None:
 
     if concl == "success":
         # Atomic write (temp + replace) — mirror the file-write discipline used elsewhere.
+        # Register the project first — this .artifacts/ mkdir would otherwise mint an
+        # unregistered Projects/<name>/ (pseudo-DDD) if release-gate ran before run-create.
+        _ensure_project_dir(args.project)
         marker.parent.mkdir(parents=True, exist_ok=True)
         payload = {"head_sha": head, "repo_root": repo_root,
                    "run_id": ci.get("databaseId"),
@@ -4030,6 +4069,11 @@ def cmd_run_report(args, reg: ArtifactRegistry) -> str:
     adversarial review, completion audit, files changed, and lessons.
     """
     from datetime import datetime, timezone
+
+    # Register at the command entry (adversarial-review MED): this must NOT be buried in
+    # the best-effort metrics try/except below — if metrics extraction throws first, the
+    # project would go unregistered. Guarantee registration before any Projects/ write.
+    _ensure_project_dir(args.project)
 
     run_file = _resolve_run_file(args.project, args.run_id)
     run_state = json.loads(run_file.read_text(encoding="utf-8"))
@@ -4806,6 +4850,9 @@ def _try_generate_metrics(
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             pass
 
+        # Register at THIS mint point — self-contained, not relying on the caller having
+        # done it first (the mkdir(parents=True) below is what actually mints Projects/<name>/).
+        _ensure_project_dir(project)
         metrics_file.parent.mkdir(parents=True, exist_ok=True)
         metrics_file.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     except Exception:
@@ -5294,7 +5341,10 @@ def cmd_run_metrics(args, reg: ArtifactRegistry) -> None:
 
     metrics = _extract_run_metrics(args.project, args.run_id, run_state)
 
-    # Write METRICS.json
+    # Write METRICS.json. NOTE: this writes into an ALREADY-RESOLVED run dir
+    # (_resolve_run_file requires the run to exist), so it does NOT mint a Projects/<name>/
+    # subtree and needs no _ensure_project_dir. If this ever grows a mkdir(parents=True),
+    # it MUST route through _ensure_project_dir (else it becomes a pseudo-DDD birth point).
     metrics_file = run_file.parent / "METRICS.json"
     metrics_file.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
@@ -5332,6 +5382,8 @@ def cmd_run_analytics(args, reg: ArtifactRegistry) -> None:
         all_metrics.append(m)
         # Persist for next time
         try:
+            # Register the project first — never mint an unregistered Projects/<name>/.
+            _ensure_project_dir(args.project)
             metrics_file.parent.mkdir(parents=True, exist_ok=True)
             metrics_file.write_text(json.dumps(m, indent=2), encoding="utf-8")
         except OSError:

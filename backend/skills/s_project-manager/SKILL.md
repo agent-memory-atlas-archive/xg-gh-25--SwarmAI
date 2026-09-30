@@ -254,13 +254,37 @@ test -d "{codebase_path}/.git" && git -C "{codebase_path}" log --oneline -10 2>/
 | git log -10 | Recent activity | PROJECT.md Current Focus |
 | Session conversation | Decisions, goals, blockers | All 4 docs |
 
-#### Step 4: Create project directory and write POPULATED DDD files
+#### Step 4: Create + REGISTER the project (never a raw mkdir), then write POPULATED DDD files
+
+⚠️ **Register through `create_project` — do NOT `mkdir` a bare project dir.** A raw
+`mkdir Projects/<name>/` produces a "pseudo-DDD": a directory with NO `.project.json`, which
+Brain Hub (`list_brains` → `_list_project_dirs`, lists only dirs carrying `.project.json`)
+**cannot see**. This is exactly how Agent-DLC/SimStock became invisible. `create_project`
+writes `.project.json` (the registry file Brain Hub keys on) AND provisions the six-section
+skeleton — so it is the ONLY sanctioned creation path (matches this skill's P1 phase + the ①
+manifest row above).
+
+Create + register the project via the daemon's projects API (it delegates to
+`swarm_workspace_manager.create_project`, which writes `.project.json` AND provisions the
+six-section skeleton — no path/CWD guessing, no manual `mkdir`):
 
 ```bash
-mkdir -p "Projects/ProjectName/.artifacts"
+# Register + scaffold in one call. Returns 201 with the project metadata, or 409 if the
+# name already exists (then it's already registered — just populate the docs).
+curl -sS -X POST http://127.0.0.1:18321/api/projects \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "ProjectName"}'
 ```
 
-Now write DDD documents **pre-filled with extracted content**. For any field where NO context was found, use the placeholder template. For fields where context WAS found, write the actual extracted content.
+- **Importing an EXISTING code dir that lacks `.project.json`?** Do NOT use the create API
+  (it 409s on the existing dir). Backfill idempotently instead — see the § "importing existing"
+  note above (`migrate_project_to_six_section`, content-preserving).
+- **Never** substitute a raw `mkdir Projects/<name>/` for this call — that reintroduces the
+  pseudo-DDD (a dir with no `.project.json`, invisible to Brain Hub).
+
+Now write DDD documents **pre-filled with extracted content** into `2-understanding/` (the
+six-section layout the create step just scaffolded). For any field where NO context was found,
+use the placeholder template. For fields where context WAS found, write the actual extracted content.
 
 **PRODUCT.md template (fill extracted fields, keep placeholders for unknowns):**
 ```markdown
