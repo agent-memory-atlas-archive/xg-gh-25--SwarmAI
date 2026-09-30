@@ -164,16 +164,24 @@ registerOverlay({
   ),
 });
 
-// ── artifacts (recent-artifacts selector) ───────────────────────────────────────────────
-// History's twin: browses recent FILES (git-derived /artifacts/recent) instead of past
-// conversations. Pure SELECTOR — a row click dispatches swarm:open-file (→ current-tab
-// Canvas) then closes; no preview pane (Canvas is the sole file viewer). width:'m' fits
-// a single-column list + search + type chips (Gate-1 density call).
+// ── artifacts (product gallery) ─────────────────────────────────────────────────────────
+// History's twin: browses the workspace PRODUCT registry (GET /artifacts/products →
+// products.json, Artifacts B′ Run 2) instead of past conversations — a ROLE-grouped gallery
+// (Deliverables card grid primary; Knowledge/Pipeline/Activity collapsible below), so a
+// gitignored deck the old git-log view could not see now surfaces. Pure SELECTOR — a row
+// click dispatches swarm:open-file (→ current-tab Canvas) then closes; no preview pane
+// (Canvas is the sole file viewer). width:'l' (was 'm') — the deliverables card grid needs
+// the horizontal room a single-column list did not.
 registerOverlay({
   id: 'artifacts',
   title: 'Artifacts',
   mode: 'ARTIFACTS',
-  width: 'm',
+  width: 'l',
+  // sourceCardTestId is the NAV CARD that OPENS the overlay (ThreeColumnLayout
+  // `data-testid="artifacts-row"`) — OverlayHost reads its rect for the spout
+  // origin. It is NOT the overlay's own row/card testid. Must stay 'artifacts-row'
+  // (Gate-2 API-Contract HIGH: changing it to 'artifacts-card' matched nothing in
+  // the nav → the open animation lost its spout origin).
   sourceCardTestId: 'artifacts-row',
   render: ({ close }) => <ArtifactsContent close={close} />,
 });

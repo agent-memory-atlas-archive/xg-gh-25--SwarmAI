@@ -195,8 +195,11 @@ class TestAC3GitignoredProducts:
         secret.write_text("SECRET=1")
 
         reg = ProductRegistry(ws)
-        # Force the gitignore check to UNKNOWN (git errored) — must not fail open.
-        monkeypatch.setattr(reg, "_is_gitignored", lambda tree, rel: None)
+        # Force the BATCHED gitignore check to UNKNOWN (git errored) — must not fail
+        # open (Run 2 AC5: per-path _is_gitignored → batched _batch_gitignored).
+        monkeypatch.setattr(
+            reg, "_batch_gitignored", lambda tree, rels: {rp: None for rp in rels}
+        )
         reg.register_batch([str(secret)])
 
         store = ws / ".artifacts" / "products.json"
@@ -427,3 +430,173 @@ class TestLayer4CrossBoundaryE2E:
             "with the hook reverted, the deck must NOT reach the store — "
             "proves the Layer-4 test is non-vacuous (green only because the real hook fires)"
         )
+
+
+# ── Run 2 AC3: Role is a FROZEN enum, not a bare str alias ───────────────────
+
+
+class TestRun2RoleEnum:
+    def test_role_is_frozen_enum_not_bare_str(self):
+        """Role must be a closed set (Enum or Literal), not `Role = str`. An
+        invalid role string must not be a valid Role — the type is the guard."""
+        import core.product_registry as pr
+
+        # Role must NOT be the bare `str` builtin (the pre-Run-2 alias).
+        assert pr.Role is not str, "Role must be a frozen enum/Literal, not `Role = str`"
+
+    def test_derive_role_returns_only_known_roles(self):
+        """Every derive_role output is one of the closed role set — no free-form
+        strings leak out."""
+        from core.product_registry import derive_role
+
+        known = {"Deliverables", "Knowledge", "Pipeline", "Activity", "Other"}
+        samples = [
+            ("Knowledge/Designs/x.html", None),
+            ("Projects/SwarmAI/2-understanding/TECH.md", None),
+            ("Projects/SwarmAI/.artifacts/runs/run_x/REPORT.md", None),
+            ("Knowledge/DailyActivity/2026-09-30.md", None),
+            ("randomconfig.xyz", None),
+        ]
+        for rel, repo in samples:
+            r = derive_role(rel, repo)
+            assert str(r) in known or getattr(r, "value", r) in known, (
+                f"derive_role({rel!r}) returned {r!r} — not in the closed role set"
+            )
+
+
+# ── Run 2 AC5: git check-ignore is BATCHED (one subprocess per owning tree) ──
+
+
+class TestRun2BatchCheckIgnore:
+    def test_batch_runs_one_check_ignore_per_tree(self, git_ws, monkeypatch):
+        """register_batch of N paths in ONE owning tree must run git check-ignore
+        at most ONCE (batched via --stdin), not once per path."""
+        import core.product_registry as pr
+
+        calls = {"check_ignore": 0}
+        real_run = subprocess.run
+
+        def counting_run(cmd, *a, **kw):
+            if isinstance(cmd, (list, tuple)) and "check-ignore" in cmd:
+                calls["check_ignore"] += 1
+            return real_run(cmd, *a, **kw)
+
+        monkeypatch.setattr(pr.subprocess, "run", counting_run)
+
+        # 4 product files (real product extensions) in the ONE git_ws tree.
+        paths = []
+        for i in range(4):
+            p = git_ws / "Knowledge" / "Designs" / f"d{i}.html"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("<html>")
+            paths.append(str(p))
+
+        pr.ProductRegistry(git_ws).register_batch(paths)
+
+        assert calls["check_ignore"] <= 1, (
+            f"check-ignore ran {calls['check_ignore']}× for 4 paths in one tree — "
+            "must be batched (one --stdin subprocess per tree), not per-path"
+        )
+
+    def test_batch_cjk_gitignored_path_matches(self, git_ws):
+        """Gate-2 Correctness HIGH: a CJK-named gitignored deck under assets/ must be
+        recorded gitignored=True. WITHOUT `-c core.quotepath=false`, git C-quotes the
+        non-ASCII path in --verbose output and the raw rel_path key never matches →
+        gitignored=False (wrong). This locks the quotepath fix."""
+        from core.product_registry import ProductRegistry
+
+        deck = git_ws / "Projects" / "AIDLC" / "assets" / "中概互联ETF.html"
+        deck.parent.mkdir(parents=True)
+        deck.write_text("<html>")
+        ProductRegistry(git_ws).register_batch([str(deck)])
+        products = json.loads((git_ws / ".artifacts" / "products.json").read_text())["products"]
+        cjk = [e for e in products if e["path"].endswith("ETF.html")]
+        assert len(cjk) == 1, "the CJK-named gitignored deck must surface"
+        assert cjk[0]["gitignored"] is True, (
+            "a gitignored CJK path must be recorded gitignored=True — the check-ignore "
+            "match must survive non-ASCII (core.quotepath=false)"
+        )
+
+    def test_tracked_product_matching_ignore_pattern_not_dropped(self, git_ws, monkeypatch):
+        """Gate-2 Red-Team: check-ignore must be INDEX-AWARE (no --no-index). A TRACKED
+        Designs product that matches a broad ignore pattern must NOT be marked gitignored
+        and must NOT be dropped by GUARD-2 — a committed file overrides .gitignore. With
+        --no-index it would false-report ignored and drop a real committed product."""
+        import subprocess as _sp
+        # Add a broad ignore rule that WOULD match a tracked Designs product, then TRACK it.
+        gi = git_ws / ".gitignore"
+        gi.write_text(gi.read_text() + "\n*.html\n")
+        spec = git_ws / "Knowledge" / "Designs" / "spec.html"
+        spec.parent.mkdir(parents=True)
+        spec.write_text("<html>")
+        _sp.run(["git", "add", "-f", "Knowledge/Designs/spec.html", ".gitignore"], cwd=git_ws, check=True)
+        _sp.run(["git", "commit", "-qm", "track spec despite *.html"], cwd=git_ws, check=True)
+
+        from core.product_registry import ProductRegistry
+        ProductRegistry(git_ws).register_batch([str(spec)])
+        products = json.loads((git_ws / ".artifacts" / "products.json").read_text())["products"]
+        by_base = {e["path"].rsplit("/", 1)[-1]: e for e in products}
+        assert "spec.html" in by_base, (
+            "a TRACKED Designs product matching an ignore pattern must NOT be dropped — "
+            "check-ignore must be index-aware (no --no-index)"
+        )
+        assert by_base["spec.html"]["gitignored"] is False, (
+            "a committed file overrides .gitignore → gitignored must be False"
+        )
+
+    def test_batch_gitignored_deck_still_surfaces(self, git_ws):
+        """The batch path must preserve AC3: a gitignored deck under assets/ still
+        surfaces (batching must not regress the gitignore→product decision)."""
+        from core.product_registry import ProductRegistry
+
+        deck = git_ws / "Projects" / "AIDLC" / "assets" / "deck.html"
+        deck.parent.mkdir(parents=True)
+        deck.write_text("<html>")
+        tracked = git_ws / "Knowledge" / "Designs" / "spec.html"
+        tracked.parent.mkdir(parents=True)
+        tracked.write_text("<html>")
+
+        ProductRegistry(git_ws).register_batch([str(deck), str(tracked)])
+        products = json.loads((git_ws / ".artifacts" / "products.json").read_text())["products"]
+        by_base = {e["path"].rsplit("/", 1)[-1]: e for e in products}
+        assert "deck.html" in by_base, "gitignored deck must still surface after batching"
+        assert by_base["deck.html"]["gitignored"] is True, "deck must be marked gitignored"
+        assert "spec.html" in by_base, "tracked product must also surface"
+        assert by_base["spec.html"]["gitignored"] is False
+
+
+# ── Run 2 AC4: products.json size cap + oldest-first eviction ────────────────
+
+
+class TestRun2CapEviction:
+    def test_store_capped_and_evicts_oldest(self, ws, monkeypatch):
+        """Registering past MAX_PRODUCTS must cap the store and evict the OLDEST
+        by last_touched, never grow unbounded."""
+        import core.product_registry as pr
+
+        # Shrink the cap for a fast, deterministic test.
+        monkeypatch.setattr(pr, "MAX_PRODUCTS", 5, raising=False)
+
+        reg = pr.ProductRegistry(ws)
+        # Register MAX+3 distinct product files, each a real Deliverable.
+        made = []
+        for i in range(8):
+            p = ws / "Knowledge" / "Designs" / f"deck{i}.html"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("<html>")
+            reg.register_batch([str(p)])  # one at a time → distinct last_touched order
+            made.append(f"deck{i}.html")
+
+        products = json.loads((ws / ".artifacts" / "products.json").read_text())["products"]
+        assert len(products) <= 5, f"store must be capped at MAX_PRODUCTS, got {len(products)}"
+        bases = {e["path"].rsplit("/", 1)[-1] for e in products}
+        # The 3 oldest (deck0/1/2) must have been evicted; the newest survive.
+        assert "deck7.html" in bases, "newest product must survive"
+        assert "deck0.html" not in bases, "oldest product must be evicted"
+
+    def test_cap_default_is_generous(self):
+        """The default cap must exist and be a sane bound (not tiny, not unbounded)."""
+        import core.product_registry as pr
+
+        assert hasattr(pr, "MAX_PRODUCTS"), "a MAX_PRODUCTS cap constant must exist"
+        assert 100 <= pr.MAX_PRODUCTS <= 10000, "cap should be a generous but finite bound"

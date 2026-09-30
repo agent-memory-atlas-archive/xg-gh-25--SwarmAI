@@ -434,6 +434,78 @@ async def get_artifact_drift(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Products — the shared workspace-level PRODUCT registry projection (Artifacts B′ Run 2)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The Artifacts overlay reads THIS (not /artifacts/recent) so a gitignored deck —
+# which the git-log projection structurally cannot see — surfaces. The store is
+# written by the workspace file-watcher (Run 1); this is the read/projection half.
+
+
+class ProductResponse(BaseModel):
+    """One product row projected from products.json (camelCase for the frontend)."""
+
+    path: str
+    role: str            # Deliverables | Knowledge | Pipeline | Activity (never Other — dropped at write)
+    kind: str
+    gitignored: bool
+    firstProduced: str
+    lastTouched: str
+
+
+@router.get("/artifacts/products", response_model=list[ProductResponse])
+async def get_products(
+    workspace_id: str = Query(..., description="Workspace identifier (resolved via DB)"),
+) -> list[ProductResponse]:
+    """Return the workspace product registry, role-typed (Artifacts B′ Run 2, AC1).
+
+    Projects ``ProductRegistry.list_products()`` — the role-classified user products
+    (decks/reports/images/DDD docs) both the overlay and (future) rail read from. On
+    first read of an EMPTY store, backfills from the last 30d of git-log so the overlay
+    is not empty day-one (AC7). FAIL-SAFE: any error → [] (never 500) — an empty
+    Artifacts list is a benign degrade; a 500 breaks the overlay.
+    """
+    from core.product_registry import ProductRegistry
+
+    try:
+        workspace_path = await _get_workspace_path()
+    except HTTPException:
+        raise
+    except Exception:  # noqa: BLE001 — fail-safe: unresolved workspace → empty, not 500
+        logger.exception("products: workspace resolution failed")
+        return []
+
+    def _load() -> list:
+        reg = ProductRegistry(workspace_path)
+        # AC7: day-one backfill — gated on has_backfilled(), NOT on an empty product
+        # list. A product-less workspace (recent git-log has only source/process files)
+        # would otherwise re-run the 30s git-log on EVERY overlay open, occupying a
+        # shared thread-pool worker each time (Gate-2 meta-review MED / RP53-adjacent).
+        # The marker makes backfill fire at most once per workspace.
+        if not reg.has_backfilled():
+            reg.backfill_from_gitlog(days=30)
+        return reg.list_products()
+
+    try:
+        products = await anyio.to_thread.run_sync(_load)
+    except Exception:  # noqa: BLE001 — fail-safe: never surface a 500 to the overlay
+        logger.exception("products: registry read failed")
+        return []
+
+    return [
+        ProductResponse(
+            path=p.path,
+            role=str(p.role),
+            kind=p.kind,
+            gitignored=bool(p.gitignored),
+            firstProduced=p.first_produced,
+            lastTouched=p.last_touched,
+        )
+        for p in products
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Pipeline Artifact Endpoints (ArtifactRegistry)
 # ─────────────────────────────────────────────────────────────────────────────
 

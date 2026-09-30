@@ -1,32 +1,32 @@
 /**
- * ArtifactsOverlay — the left-nav "Artifacts" surface: a recent-artifacts SELECTOR.
+ * ArtifactsOverlay — the left-nav "Artifacts" surface: a ROLE-grouped product gallery.
  *
- * The twin of History: History browses past CONVERSATIONS, Artifacts browses recent
- * FILES (git-derived recent user artifacts from /artifacts/recent). Because a file's
- * sole viewer is the Canvas, this surface is a pure SELECTOR — it has NO right-side
- * preview pane and NO diff button (both deliberately rejected: Canvas is the one place
- * a file is viewed/diffed). Clicking a row dispatches `swarm:open-file` (→ opens in the
- * CURRENT tab's Canvas, exactly like LibraryOverlay/BrainHub) and then closes the overlay.
+ * Artifacts B′ Run 2: the overlay now projects the workspace PRODUCT registry
+ * (`GET /artifacts/products` → products.json), NOT the old git-log `/artifacts/recent`
+ * view. The load-bearing win: a gitignored deck (under a project assets dir) — which the
+ * git-log projection structurally could NOT see — now surfaces. The ROLE is computed once
+ * in the backend (`product_registry.derive_role`); this component renders it, never
+ * re-derives (run_4de279ca — no second classifier in the frontend).
  *
- * Layout (single column): a debounced filename search box + type chips
- * (all/document/code/data/image) + a time-grouped list (today/yesterday/this-week/older).
- * Each row = a material-symbols file icon (fileIcon) + filename + parent dir + a relative
- * "time ago". No A/M git-status badge in v1 — RadarArtifact carries no new/upd field
- * (that lives in a separate useChangeStatus hook, deferred to keep this a thin selector).
+ * Spatial form (design-judgment Surface-2 + Von Restorff): ONE thing dominant — the
+ * **Deliverables** card grid (the products you actually reopen: decks, reports, images).
+ * Knowledge / Pipeline / Activity are DEMOTED to collapsible sections below (Pipeline +
+ * Activity collapsed by default — they are the "everything looks the same" system files
+ * the redesign exists to get out of the way). Whitespace separates role groups, not boxes.
+ * Pipeline REPORT.md rows read the same-name problem: labeled by their parent run dir.
  *
- * Data comes from radarService.fetchRecentArtifacts; the backend resolves the single
- * workspace from DB config and ignores the workspace_id param, so a placeholder id
- * satisfies the required query param. Backend-primary — invents no data (R30).
+ * Still a pure SELECTOR (History's twin): no preview pane, no diff — a row click dispatches
+ * `swarm:open-file` (→ current-tab Canvas) then closes. Canvas is the sole file viewer.
  *
  * @exports ArtifactsContent
- * @exports groupArtifactsByTime — pure time-bucketer (unit-tested)
- * @exports relativeTimeFromNow — pure relative-time formatter (unit-tested)
+ * @exports groupByRole — pure role-bucketer (unit-tested)
+ * @exports parentRunLabel — pure Pipeline-row label (unit-tested)
  * @exports OPEN_FILE_EVENT — the swarm:open-file event name (shared with the row-click contract)
  */
 import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { radarService } from '../../services/radar';
-import type { RadarArtifact } from '../../pages/chat/components/RightSidebar/types';
+import type { Product, ProductRole } from '../../services/radar';
 import { fileIcon, fileIconColor } from '../../utils/fileUtils';
 
 /** The window CustomEvent that opens a file in the current tab's Canvas.
@@ -40,138 +40,74 @@ const SEARCH_DEBOUNCE_MS = 200;
  *  a non-empty placeholder satisfies the required query param. */
 const WS_PLACEHOLDER = 'default';
 
-const MS_PER_DAY = 24 * 60 * 60 * 1000;
-
-// ── Time bucketing ────────────────────────────────────────────────────────────
-export type ArtifactTimeGroup = 'today' | 'yesterday' | 'thisWeek' | 'older';
-
-export interface GroupedArtifacts {
-  group: ArtifactTimeGroup;
+// ── Role grouping ──────────────────────────────────────────────────────────────
+// The 4 RENDERED roles in display order. `Other` is dropped at write time (never
+// reaches the frontend); if one ever arrives it is grouped under Knowledge as a
+// defensive fallback (see groupByRole) — never silently lost.
+export interface RoleGroup {
+  role: ProductRole;
   label: string;
-  artifacts: RadarArtifact[];
+  products: Product[];
 }
 
-const GROUP_LABEL: Record<ArtifactTimeGroup, string> = {
-  today: 'Today',
-  yesterday: 'Yesterday',
-  thisWeek: 'This Week',
-  older: 'Older',
+const ROLE_ORDER: ProductRole[] = ['Deliverables', 'Knowledge', 'Pipeline', 'Activity'];
+const ROLE_LABEL: Record<ProductRole, string> = {
+  Deliverables: 'Deliverables',
+  Knowledge: 'Knowledge',
+  Pipeline: 'Pipeline reports',
+  Activity: 'Activity',
+  Other: 'Other',
 };
+/** Sections collapsed by default — the demoted "system files" the redesign hides. */
+const COLLAPSED_BY_DEFAULT: ReadonlySet<ProductRole> = new Set<ProductRole>(['Pipeline', 'Activity']);
 
 /**
- * Bucket artifacts by their modifiedAt into today / yesterday / this-week / older.
- * Pure (except reading `now` — injectable for tests). Preserves input order within a
- * group (the service already returns newest-first). Returns only non-empty groups,
- * in fixed order. An unparseable/absent modifiedAt falls into `older` (never dropped).
+ * Bucket products by role into the fixed display order, newest (lastTouched) first
+ * within each group. Returns only non-empty groups. An unexpected role (`Other`, or a
+ * future value) folds into Knowledge so it is never dropped (exhaustiveness). Pure.
  */
-export function groupArtifactsByTime(
-  artifacts: RadarArtifact[],
-  now: Date = new Date(),
-): GroupedArtifacts[] {
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const yesterday = new Date(today.getTime() - MS_PER_DAY);
-  const dayOfWeek = now.getDay();
-  const mondayOffset = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
-  const weekStart = new Date(today.getTime() - mondayOffset * MS_PER_DAY);
-
-  const buckets: Record<ArtifactTimeGroup, RadarArtifact[]> = {
-    today: [],
-    yesterday: [],
-    thisWeek: [],
-    older: [],
+export function groupByRole(products: Product[]): RoleGroup[] {
+  const buckets: Record<ProductRole, Product[]> = {
+    Deliverables: [], Knowledge: [], Pipeline: [], Activity: [], Other: [],
   };
-
-  for (const a of artifacts) {
-    const ts = Date.parse(a.modifiedAt);
-    if (Number.isNaN(ts)) {
-      buckets.older.push(a);
-      continue;
-    }
-    const d = new Date(ts);
-    const day = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-    if (day.getTime() === today.getTime()) buckets.today.push(a);
-    else if (day.getTime() === yesterday.getTime()) buckets.yesterday.push(a);
-    else if (day >= weekStart) buckets.thisWeek.push(a);
-    else buckets.older.push(a);
+  for (const p of products) {
+    (buckets[p.role] ?? buckets.Knowledge).push(p);
   }
-
-  const order: ArtifactTimeGroup[] = ['today', 'yesterday', 'thisWeek', 'older'];
-  return order
-    .filter((g) => buckets[g].length > 0)
-    .map((g) => ({ group: g, label: GROUP_LABEL[g], artifacts: buckets[g] }));
-}
-
-/**
- * Relative "time ago" string for the row's right edge — a scannable reference point.
- * <1min → "now"; <1h → "Nm"; <24h → "Nh"; <7d → "Nd"; else a local YYYY-MM-DD stamp.
- * Pure (now injectable). An unparseable timestamp → "" (row still renders).
- */
-export function relativeTimeFromNow(iso: string, now: Date = new Date()): string {
-  const ts = Date.parse(iso);
-  if (Number.isNaN(ts)) return '';
-  const diffMs = now.getTime() - ts;
-  if (diffMs < 0) return 'now';
-  const min = Math.floor(diffMs / 60000);
-  if (min < 1) return 'now';
-  if (min < 60) return `${min}m`;
-  const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr}h`;
-  const day = Math.floor(hr / 24);
-  if (day < 7) return `${day}d`;
-  const d = new Date(ts);
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  return `${d.getFullYear()}-${mm}-${dd}`;
-}
-
-// ── Type chips ──────────────────────────────────────────────────────────────
-type ChipKey = 'all' | 'document' | 'code' | 'data' | 'image';
-
-const CHIPS: { key: ChipKey; label: string }[] = [
-  { key: 'all', label: 'All' },
-  { key: 'document', label: 'Docs' },
-  { key: 'code', label: 'Code' },
-  { key: 'data', label: 'Data' },
-  { key: 'image', label: 'Images' },
-];
-
-/**
- * Map a chip to the RadarArtifact.type values it includes. The backend enum is exactly
- * {code, document, config, image, other} (backend `EXTENSION_TYPE_MAP` + an `other`
- * fallback — verified against artifacts.py). Two deliberate mappings:
- *  - Data folds `config` (json/yaml/toml/…) into the "Data" chip.
- *  - `other` (anything unclassified — e.g. .xlsx/.csv spreadsheets, which the backend
- *    map does NOT cover) is shown under the All chip but HIDDEN under every specific
- *    chip (it belongs to no type category). It is therefore always reachable (All is
- *    the default view) but is not surfaced by a narrowing chip — by design.
- * The switch is exhaustive with an explicit `default: false`, so a future enum value
- * that is not handled hides under specific chips (never crashes) and All still shows it.
- */
-function chipMatches(chip: ChipKey, t: RadarArtifact['type']): boolean {
-  switch (chip) {
-    case 'all':
-      return true;
-    case 'document':
-      return t === 'document';
-    case 'code':
-      return t === 'code';
-    case 'data':
-      return t === 'config';
-    case 'image':
-      return t === 'image';
-    default:
-      return false;
+  // Fold any stray Other/unknown into Knowledge (never lost).
+  if (buckets.Other.length) {
+    buckets.Knowledge.push(...buckets.Other);
+    buckets.Other = [];
   }
+  const byNewest = (a: Product, b: Product) =>
+    (b.lastTouched || '').localeCompare(a.lastTouched || '');
+  return ROLE_ORDER
+    .filter((r) => buckets[r].length > 0)
+    .map((r) => ({ role: r, label: ROLE_LABEL[r], products: [...buckets[r]].sort(byNewest) }));
 }
 
-/** Parent directory of a workspace-relative path ("" for a bare filename). */
+/** basename of a workspace-relative path. */
+function baseName(path: string): string {
+  const i = path.lastIndexOf('/');
+  return i >= 0 ? path.slice(i + 1) : path;
+}
+/** Parent directory ("" for a bare filename). */
 function parentDir(path: string): string {
   const i = path.lastIndexOf('/');
   return i > 0 ? path.slice(0, i) : '';
 }
-function baseName(path: string): string {
-  const i = path.lastIndexOf('/');
-  return i >= 0 ? path.slice(i + 1) : path;
+
+/**
+ * Label a Pipeline REPORT.md row by its parent run dir, not the bare "REPORT.md" —
+ * the same-name problem the redesign calls out (3 runs all show "REPORT.md"). Pure.
+ * `.../.artifacts/runs/run_2274b401/REPORT.md` → "run_2274b401". Falls back to the
+ * basename if the path has no recognizable run segment.
+ */
+export function parentRunLabel(path: string): string {
+  const norm = path.replace(/\\/g, '/');
+  const parts = norm.split('/').filter(Boolean);
+  const runsIdx = parts.lastIndexOf('runs');
+  if (runsIdx >= 0 && runsIdx + 1 < parts.length) return parts[runsIdx + 1];
+  return baseName(path);
 }
 
 /** Open a file in the current tab's Canvas (same contract as LibraryOverlay). */
@@ -182,25 +118,26 @@ export function dispatchOpenFile(path: string): void {
 export interface ArtifactsContentProps {
   /** Host-owned close — called after a row opens a file (return to chat/Canvas). */
   close: () => void;
-  /** Test seam: override the fetch (defaults to radarService.fetchRecentArtifacts). */
-  fetchArtifacts?: (wsId: string, limit?: number) => Promise<RadarArtifact[]>;
+  /** Test seam: override the fetch (defaults to radarService.fetchProducts). */
+  fetchProducts?: (wsId: string) => Promise<Product[]>;
 }
 
 /**
- * The Artifacts selector body (the host wraps it in scrim + panel + header chrome).
+ * The Artifacts product-gallery body (the host wraps it in scrim + panel + header chrome).
  */
-export function ArtifactsContent({ close, fetchArtifacts }: ArtifactsContentProps) {
-  const fetcher = fetchArtifacts ?? radarService.fetchRecentArtifacts;
+export function ArtifactsContent({ close, fetchProducts }: ArtifactsContentProps) {
+  const fetcher = fetchProducts ?? radarService.fetchProducts;
 
   const { data, isLoading, isError } = useQuery({
-    queryKey: ['recent-artifacts'],
-    queryFn: () => fetcher(WS_PLACEHOLDER, 50),
+    queryKey: ['workspace-products'],
+    queryFn: () => fetcher(WS_PLACEHOLDER),
     staleTime: 30_000,
   });
 
   const [searchRaw, setSearchRaw] = useState('');
   const [search, setSearch] = useState('');
-  const [chip, setChip] = useState<ChipKey>('all');
+  // Per-role collapse state; seeded from COLLAPSED_BY_DEFAULT, user-toggleable.
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
   // Debounce the filename filter.
   useEffect(() => {
@@ -210,58 +147,45 @@ export function ArtifactsContent({ close, fetchArtifacts }: ArtifactsContentProp
 
   const groups = useMemo(() => {
     const all = data ?? [];
-    const filtered = all.filter((a) => {
-      if (!chipMatches(chip, a.type)) return false;
-      if (search && !baseName(a.path).toLowerCase().includes(search)) return false;
-      return true;
-    });
-    return groupArtifactsByTime(filtered);
-  }, [data, search, chip]);
+    const filtered = search
+      ? all.filter((p) => baseName(p.path).toLowerCase().includes(search))
+      : all;
+    return groupByRole(filtered);
+  }, [data, search]);
 
-  const openRow = (a: RadarArtifact) => {
-    dispatchOpenFile(a.path);
+  const isCollapsed = (role: ProductRole): boolean =>
+    collapsed[role] ?? COLLAPSED_BY_DEFAULT.has(role);
+
+  const toggle = (role: ProductRole) =>
+    setCollapsed((c) => ({ ...c, [role]: !isCollapsed(role) }));
+
+  const openRow = (p: Product) => {
+    dispatchOpenFile(p.path);
     close();
   };
 
-  const totalShown = groups.reduce((n, g) => n + g.artifacts.length, 0);
+  const totalShown = groups.reduce((n, g) => n + g.products.length, 0);
 
   return (
     <div className="flex flex-col h-full min-h-0" data-testid="artifacts-overlay">
-      {/* Search + chips */}
+      {/* Search */}
       <div className="px-3 pt-3 pb-2 shrink-0">
         <input
           type="text"
           value={searchRaw}
           onChange={(e) => setSearchRaw(e.target.value)}
-          placeholder="Search filename…"
+          placeholder="Search products…"
           data-testid="artifacts-search"
           className="w-full px-3 py-2 rounded-lg bg-[var(--color-input-bg,var(--color-bg-secondary))] border border-[var(--color-border)] text-[12.5px] text-[var(--color-text)] placeholder:text-[var(--color-text-faint)] outline-none focus:border-[var(--color-primary)]"
         />
-        <div className="flex gap-1.5 mt-2 flex-wrap" data-testid="artifacts-chips">
-          {CHIPS.map((c) => (
-            <button
-              key={c.key}
-              onClick={() => setChip(c.key)}
-              data-testid={`artifacts-chip-${c.key}`}
-              aria-pressed={chip === c.key}
-              className={`text-[10.5px] px-2.5 py-1 rounded-full border transition-colors ${
-                chip === c.key
-                  ? 'bg-[var(--color-active,var(--color-hover))] text-[var(--color-text)] border-transparent'
-                  : 'text-[var(--color-text-muted)] border-[var(--color-border)] hover:text-[var(--color-text)]'
-              }`}
-            >
-              {c.label}
-            </button>
-          ))}
-        </div>
       </div>
 
-      {/* List */}
-      <div className="flex-1 min-h-0 overflow-y-auto px-2 pb-3" data-testid="artifacts-list">
+      {/* Body */}
+      <div className="flex-1 min-h-0 overflow-y-auto px-3 pb-4" data-testid="artifacts-list">
         {isLoading ? (
-          <div className="flex flex-col gap-1 px-2 py-3" data-testid="artifacts-loading">
+          <div className="flex flex-col gap-1 px-1 py-3" data-testid="artifacts-loading">
             {[0, 1, 2].map((i) => (
-              <div key={i} className="h-8 rounded-md bg-[var(--color-hover)] animate-pulse" />
+              <div key={i} className="h-9 rounded-md bg-[var(--color-hover)] animate-pulse" />
             ))}
           </div>
         ) : isError ? (
@@ -271,7 +195,7 @@ export function ArtifactsContent({ close, fetchArtifacts }: ArtifactsContentProp
           >
             <span className="text-[22px]" aria-hidden="true">🐝</span>
             <p className="text-[11px] text-[var(--color-text-muted)]">
-              Couldn't load recent artifacts. Try again in a moment.
+              Couldn't load products. Try again in a moment.
             </p>
           </div>
         ) : totalShown === 0 ? (
@@ -282,54 +206,163 @@ export function ArtifactsContent({ close, fetchArtifacts }: ArtifactsContentProp
             <span className="text-[22px]" aria-hidden="true">🐝</span>
             <p className="text-[11px] text-[var(--color-text-muted)] max-w-[240px]">
               {(data ?? []).length === 0
-                ? 'No artifacts in the last 30 days. Files you create or edit will show up here.'
-                : 'No artifacts match your search.'}
+                ? 'No products yet. Decks, reports, and files you create show up here.'
+                : 'No products match your search.'}
             </p>
           </div>
         ) : (
-          groups.map((g) => (
-            <div key={g.group}>
-              <div className="text-[9.5px] uppercase tracking-wide text-[var(--color-text-faint)] font-semibold px-2 pt-3 pb-1">
-                {g.label}
-              </div>
-              {g.artifacts.map((a) => (
-                <button
-                  key={a.path}
-                  onClick={() => openRow(a)}
-                  title={a.path}
-                  data-testid="artifacts-row"
-                  className="group w-full flex items-center gap-2.5 h-11 px-2.5 rounded-lg hover:bg-[var(--color-hover)] transition-colors text-left"
-                >
-                  {/* Per-file-type color via the existing fileIconColor() SSOT (same
-                      helper the Workspace Explorer uses) — same-type→same-color, so
-                      the list reads as "scan by type", not a rainbow. */}
-                  <span
-                    data-testid={`artifacts-row-icon-${a.path}`}
-                    className="material-symbols-outlined shrink-0 text-[16px] leading-none"
-                    style={{ color: fileIconColor(baseName(a.path)) }}
-                    aria-hidden="true"
-                  >
-                    {fileIcon(baseName(a.path))}
-                  </span>
-                  <span className="flex flex-col min-w-0 flex-1 gap-0.5">
-                    <span className="text-[12.5px] text-[var(--color-text)] truncate leading-tight">
-                      {baseName(a.path)}
-                    </span>
-                    {parentDir(a.path) && (
-                      <span className="text-[9px] text-[var(--color-text-faint)] opacity-[0.72] truncate leading-tight">
-                        {parentDir(a.path)}
-                      </span>
-                    )}
-                  </span>
-                  <span className="shrink-0 text-[9.5px] text-[var(--color-text-faint)]">
-                    {relativeTimeFromNow(a.modifiedAt)}
-                  </span>
-                </button>
-              ))}
-            </div>
-          ))
+          <div className="flex flex-col gap-5">
+            {groups.map((g) =>
+              g.role === 'Deliverables' ? (
+                <DeliverablesGallery key={g.role} group={g} onOpen={openRow} />
+              ) : (
+                <RoleSection
+                  key={g.role}
+                  group={g}
+                  collapsed={isCollapsed(g.role)}
+                  onToggle={() => toggle(g.role)}
+                  onOpen={openRow}
+                />
+              ),
+            )}
+          </div>
         )}
       </div>
     </div>
+  );
+}
+
+// ── Deliverables — the PRIMARY, dominant card grid ──────────────────────────────
+function DeliverablesGallery({
+  group,
+  onOpen,
+}: {
+  group: RoleGroup;
+  onOpen: (p: Product) => void;
+}) {
+  return (
+    <section data-testid="artifacts-group-Deliverables">
+      <div className="text-[10px] uppercase tracking-wide text-[var(--color-text-muted)] font-semibold px-0.5 pb-2">
+        {group.label}
+      </div>
+      <div className="grid grid-cols-2 gap-2.5">
+        {group.products.map((p) => (
+          <button
+            key={p.path}
+            onClick={() => onOpen(p)}
+            title={p.path}
+            data-testid="artifacts-card"
+            className="group flex flex-col gap-2 p-3 rounded-xl bg-[var(--color-bg-secondary,var(--color-hover))] hover:bg-[var(--color-hover)] transition-colors text-left min-h-[76px]"
+          >
+            <span
+              className="material-symbols-outlined shrink-0 text-[26px] leading-none"
+              style={{ color: fileIconColor(baseName(p.path)) }}
+              aria-hidden="true"
+              data-testid={`artifacts-card-icon-${p.path}`}
+            >
+              {fileIcon(baseName(p.path))}
+            </span>
+            <span className="flex flex-col min-w-0 gap-0.5">
+              <span className="flex items-center gap-1 min-w-0">
+                <span className="text-[12.5px] text-[var(--color-text)] truncate leading-tight font-medium">
+                  {baseName(p.path)}
+                </span>
+                {p.gitignored && (
+                  <span
+                    className="shrink-0 text-[8.5px] px-1 py-px rounded bg-[var(--color-git-modified,#d59a26)]/20 text-[var(--color-git-modified,#d59a26)] font-medium leading-none"
+                    title="Not in git (local-only product) — surfaced anyway"
+                    data-testid="artifacts-gitignored-badge"
+                  >
+                    local
+                  </span>
+                )}
+              </span>
+              {parentDir(p.path) && (
+                <span className="text-[9px] text-[var(--color-text-faint)] opacity-[0.72] truncate leading-tight">
+                  {parentDir(p.path)}
+                </span>
+              )}
+            </span>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+// ── Knowledge / Pipeline / Activity — DEMOTED collapsible sections ──────────────
+function RoleSection({
+  group,
+  collapsed,
+  onToggle,
+  onOpen,
+}: {
+  group: RoleGroup;
+  collapsed: boolean;
+  onToggle: () => void;
+  onOpen: (p: Product) => void;
+}) {
+  const isPipeline = group.role === 'Pipeline';
+  return (
+    <section data-testid={`artifacts-group-${group.role}`}>
+      <button
+        onClick={onToggle}
+        aria-expanded={!collapsed}
+        data-testid={`artifacts-section-toggle-${group.role}`}
+        className="w-full flex items-center gap-1.5 px-0.5 pb-1.5 text-left"
+      >
+        <span
+          className="material-symbols-outlined text-[15px] leading-none text-[var(--color-text-faint)] transition-transform"
+          style={{ transform: collapsed ? 'rotate(-90deg)' : 'none' }}
+          aria-hidden="true"
+        >
+          expand_more
+        </span>
+        <span className="text-[10px] uppercase tracking-wide text-[var(--color-text-muted)] font-semibold">
+          {group.label}
+        </span>
+        <span className="text-[9.5px] text-[var(--color-text-faint)] font-normal">
+          {group.products.length}
+        </span>
+      </button>
+      {!collapsed && (
+        <div className="flex flex-col">
+          {group.products.map((p) => {
+            const label = isPipeline ? parentRunLabel(p.path) : baseName(p.path);
+            return (
+              <button
+                key={p.path}
+                onClick={() => onOpen(p)}
+                title={p.path}
+                data-testid="artifacts-row"
+                className="group w-full flex items-center gap-2.5 h-9 px-2 rounded-lg hover:bg-[var(--color-hover)] transition-colors text-left"
+              >
+                <span
+                  data-testid={`artifacts-row-icon-${p.path}`}
+                  className="material-symbols-outlined shrink-0 text-[15px] leading-none"
+                  style={{ color: fileIconColor(baseName(p.path)) }}
+                  aria-hidden="true"
+                >
+                  {fileIcon(baseName(p.path))}
+                </span>
+                <span className="flex items-center gap-1.5 min-w-0 flex-1">
+                  <span className="text-[12px] text-[var(--color-text)] truncate leading-tight">
+                    {label}
+                  </span>
+                  {p.gitignored && (
+                    <span
+                      className="shrink-0 text-[8.5px] px-1 py-px rounded bg-[var(--color-git-modified,#d59a26)]/20 text-[var(--color-git-modified,#d59a26)] font-medium leading-none"
+                      title="Not in git (local-only) — surfaced anyway"
+                    >
+                      local
+                    </span>
+                  )}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </section>
   );
 }

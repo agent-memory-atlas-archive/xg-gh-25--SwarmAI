@@ -56,6 +56,7 @@ import subprocess
 import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
@@ -64,10 +65,26 @@ from utils.file_lock import flock_exclusive, flock_unlock
 
 logger = logging.getLogger(__name__)
 
-# Roles (the overlay's grouping axis — §8 of the redesign design doc).
-Role = str  # one of: Deliverables | Knowledge | Pipeline | Activity | Other
+
+# Roles (the overlay's grouping axis — §8 of the redesign design doc). Run 2 AC3:
+# a FROZEN enum, not a bare `Role = str` alias — the role set is closed, so an
+# invalid role can never be stored or projected. str-subclass so existing JSON
+# round-trips unchanged (asdict → the member's str value; a stored "Deliverables"
+# rehydrates identically) and every `role == "Deliverables"` comparison still holds.
+class Role(str, Enum):
+    DELIVERABLES = "Deliverables"
+    KNOWLEDGE = "Knowledge"
+    PIPELINE = "Pipeline"
+    ACTIVITY = "Activity"
+    OTHER = "Other"
+
 
 _STORE_VERSION = 1
+
+# Run 2 AC4: bounded store. Registering past this cap evicts the OLDEST entries by
+# last_touched inside the same flock-guarded _upsert (never a parallel writer, P8).
+# Generous but finite — the overlay is a recent-products view, not an archive.
+MAX_PRODUCTS = 2000
 
 # ── PRODUCT-dir allowlist (AC3) ──────────────────────────────────────────────
 # A NARROW positive list: dirs whose gitignored contents are still user PRODUCTS
@@ -153,33 +170,33 @@ def derive_role(rel_path: str, repo: Optional[str]) -> Role:
     # Pipeline: a run REPORT under .artifacts/runs/ — check BEFORE kind, because the
     # dot-segment (.artifacts) would make _classify_kind return "process".
     if ".artifacts" in parts and "runs" in parts and parts[-1] == "REPORT.md":
-        return "Pipeline"
+        return Role.PIPELINE
 
     # Activity: automated per-day logs.
     if "DailyActivity" in parts or "Signals" in parts or "DailyBriefs" in parts:
-        return "Activity"
+        return Role.ACTIVITY
 
     # Deliverables: an explicit product dir (decks/attachments), OR a design/report
     # authoring dir. These are the things a user makes and reopens.
     if _under_product_dir(rel_path):
-        return "Deliverables"
+        return Role.DELIVERABLES
     if "Designs" in parts or "Reports" in parts:
-        return "Deliverables"
+        return Role.DELIVERABLES
 
     # Otherwise fall back to the delegated content-kind.
     kind = _classify_kind(rel_path, repo)
     if kind == "knowledge":
-        return "Knowledge"
+        return Role.KNOWLEDGE
     if kind in ("content",):
         # Bare content with no product/activity path signal → treat as Knowledge-
         # adjacent only if it is a knowledge dir; else Other.
         if "Knowledge" in parts:
-            return "Knowledge"
-        return "Other"
+            return Role.KNOWLEDGE
+        return Role.OTHER
 
     # source / source-final / process with no product-dir short-circuit → not a
     # user product surface → Other (the catch-all; never dropped).
-    return "Other"
+    return Role.OTHER
 
 
 # ── the store ────────────────────────────────────────────────────────────────
@@ -227,6 +244,15 @@ class ProductRegistry:
     def list_products(self) -> list[Product]:
         return [Product(**e) for e in self._read().get("products", [])]
 
+    def has_backfilled(self) -> bool:
+        """True once backfill_from_gitlog has run (regardless of whether it produced
+        rows). The endpoint gates day-one backfill on THIS, not on an empty product
+        list — otherwise a workspace whose recent git-log has no products (a code-only
+        or brand-new tree) would re-run the 30s git-log on EVERY overlay open, occupying
+        a shared thread-pool worker each time (Gate-2 meta-review MED / RP53-adjacent).
+        The marker makes backfill fire at most once."""
+        return bool(self._read().get("backfilled_at"))
+
     # ── atomic write (temp + replace) ─────────────────────────────────────────
 
     def _atomic_write_json(self, data: dict) -> None:
@@ -267,16 +293,12 @@ class ProductRegistry:
 
     # ── classification (delegated) ────────────────────────────────────────────
 
-    def _classify(self, abs_path: str) -> Optional[Product]:
-        """Classify a RAW path into a Product, or None if it is not a product.
+    def _resolve(self, abs_path: str):
+        """Resolve a raw path to (tree_root, rel_path, repo) or None if external.
 
-        INDEPENDENT of the surface verdict (the Gate-1 fix): a gitignored deck is
-        review_worthy=False/process at needs_human_review, but its PRODUCT status is
-        decided HERE. Returns None for external/disposable paths (AC4) and for
-        non-product content under Projects/* that is not in the product allowlist
-        (AC3 secret guard).
+        Split out of _classify so register_batch can group rel_paths by owning tree
+        and run ONE check-ignore per tree (AC5) before classifying.
         """
-        # Location: must be owned by SwarmWS or a bound tree. External → skip (AC4).
         try:
             abs_resolved = Path(os.path.expanduser(abs_path)).resolve()
         except (OSError, RuntimeError):
@@ -285,8 +307,23 @@ class ProductRegistry:
         if owning is None:
             return None  # external / $HOME / tmp — not our product (AC4)
         tree_root, rel_path, repo = owning
-        rel_path = rel_path.replace("\\", "/")
+        return tree_root, rel_path.replace("\\", "/"), repo
 
+    def _classify(
+        self,
+        tree_root: Path,
+        rel_path: str,
+        repo: Optional[str],
+        ignored: Optional[bool],
+    ) -> Optional[Product]:
+        """Classify an already-resolved path into a Product, or None if not a product.
+
+        INDEPENDENT of the surface verdict (the Gate-1 fix): a gitignored deck is
+        review_worthy=False/process at needs_human_review, but its PRODUCT status is
+        decided HERE. ``ignored`` is the PRE-COMPUTED tri-state git verdict (True /
+        False / None-unknown) from the batched check-ignore — the per-path subprocess
+        is gone (AC5). Returns None for non-product content (AC3 secret guard).
+        """
         role = derive_role(rel_path, repo)
 
         # GUARD 1 — the store holds PRODUCTS only. `Other` is the classification
@@ -296,10 +333,8 @@ class ProductRegistry:
         # Projects/*/.env is kind=process → role Other → dropped here regardless of
         # what git check-ignore reported (RP50 fail-open defense that does not depend
         # on the gitignore subprocess succeeding).
-        if role == "Other":
+        if role == Role.OTHER:
             return None
-
-        ignored = self._is_gitignored(tree_root, rel_path)  # True | False | None(unknown)
 
         # GUARD 2 — a CONFIRMED-gitignored product surfaces ONLY under an explicit
         # PRODUCT dir (AC3: a deck under Projects/*/assets YES; a gitignored draft
@@ -324,28 +359,64 @@ class ProductRegistry:
             last_touched=now,
         )
 
-    def _is_gitignored(self, tree_root: Path, rel_path: str) -> Optional[bool]:
-        """git check-ignore in the owning tree — TRI-STATE (RP55).
+    def _batch_gitignored(
+        self, tree_root: Path, rel_paths: list[str]
+    ) -> dict[str, Optional[bool]]:
+        """ONE ``git check-ignore --stdin`` for ALL rel_paths in a tree (AC5).
 
-        Returns True (ignored), False (not-ignored), or None (git errored / couldn't
-        check). The caller must NOT collapse None into False: a couldn't-check is
-        absence-of-evidence, and for a path that might be a gitignored secret the safe
-        side is fail-CLOSED (don't surface), not fail-open.
+        Replaces the per-path subprocess. Returns a {rel_path: True|False|None} map.
+        --stdin --verbose prints one line PER IGNORED path (``<source>:<line>:<pat>\\t<path>``);
+        a non-ignored path prints nothing. Exit 0 = at least one match, 1 = none, other
+        = git error → EVERY path is UNKNOWN (None), so the caller fails CLOSED (RP55) —
+        a couldn't-check never silently becomes not-ignored.
         """
+        if not rel_paths:
+            return {}
         try:
             r = subprocess.run(
-                ["git", "check-ignore", "-q", "--", rel_path],
+                # -c core.quotepath=false: emit paths as raw UTF-8, NOT git's default
+                # C-style octal-escaped + double-quote-wrapped form for non-ASCII names.
+                # WITHOUT it, a CJK-named product (e.g. `assets/中概互联ETF.md`) comes back
+                # as `"assets/\344\270\255..."` in --verbose output — that token never
+                # matches the raw rel_path key, so `rp in ignored_set` is False → the file
+                # is recorded gitignored=False (wrong) and a gitignored non-product-dir CJK
+                # path could slip GUARD-2. The sibling /artifacts/recent uses the same flag
+                # for exactly this reason (artifacts.py). (Gate-2 Correctness HIGH.)
+                # Index-AWARE by default (do NOT pass the ignore-the-index flag): a
+                # TRACKED file matching a broad ignore pattern (e.g. a committed
+                # Designs/*.html under an `*.html` rule) correctly reports NOT-ignored,
+                # because tracking overrides gitignore. Ignoring the index would falsely
+                # mark that committed product gitignored=True → GUARD-2 would DROP a real
+                # committed product. The gitignored DECK we DO want (AC3) is UNtracked, so
+                # the default still reports it ignored. (Gate-2 Red-Team, verified.)
+                ["git", "-c", "core.quotepath=false", "check-ignore",
+                 "--stdin", "--verbose"],
                 cwd=str(tree_root),
+                input="\n".join(rel_paths) + "\n",
                 capture_output=True,
-                timeout=5,
+                text=True,
+                timeout=10,
             )
         except (OSError, subprocess.SubprocessError):
-            return None  # couldn't check → UNKNOWN (caller fails closed, RP55)
-        if r.returncode == 0:
-            return True   # ignored
-        if r.returncode == 1:
-            return False  # not ignored
-        return None       # 128 etc → git error → UNKNOWN
+            return {rp: None for rp in rel_paths}  # git unavailable → all UNKNOWN
+        # returncode 0 (some ignored) / 1 (none ignored) are both valid, parseable
+        # results. Anything else (128 not-a-repo, etc.) → all UNKNOWN, fail closed.
+        if r.returncode not in (0, 1):
+            return {rp: None for rp in rel_paths}
+        ignored_set: set[str] = set()
+        for line in r.stdout.splitlines():
+            # --verbose format: "<source>:<line>:<pattern>\t<path>". The path is
+            # after the LAST tab; git delimits with the tab, so do NOT .strip() the
+            # tab-present branch (a filename with a legit trailing space would be
+            # corrupted and miss the key match). Only the no-tab fallback strips
+            # the trailing newline splitlines already removed. (Gate-2 F2.)
+            if "\t" in line:
+                path = line.rsplit("\t", 1)[-1]
+            else:
+                path = line.strip()
+            if path:
+                ignored_set.add(path)
+        return {rp: (rp in ignored_set) for rp in rel_paths}
 
     # ── write (public, sync — callable from an off-loop seam, AC6) ─────────────
 
@@ -357,11 +428,36 @@ class ProductRegistry:
         """Register a batch of RAW paths. Classifies each independently of any
         surface verdict (the Gate-1 fix), then upserts under one flock.
 
-        Keyed by relative path: re-registering an existing product refreshes its
-        ``last_touched`` (and role/kind/gitignored, in case they changed) but never
-        duplicates the row.
+        AC5: resolve all paths first, GROUP by owning tree, run ONE check-ignore
+        --stdin per tree (not one subprocess per path), then classify. Keyed by
+        relative path: re-registering refreshes ``last_touched`` (+role/kind/
+        gitignored) but never duplicates. AC4: eviction inside the same flock.
         """
-        classified = [p for p in (self._classify(a) for a in paths) if p is not None]
+        # 1. Resolve every raw path to (tree_root, rel_path, repo); drop externals.
+        resolved = []  # (tree_root, rel_path, repo)
+        for a in paths:
+            r = self._resolve(a)
+            if r is not None:
+                resolved.append(r)
+        if not resolved:
+            return
+
+        # 2. Group rel_paths per owning tree → ONE batched check-ignore per tree (AC5).
+        by_tree: dict[Path, list[str]] = {}
+        for tree_root, rel_path, _repo in resolved:
+            by_tree.setdefault(tree_root, []).append(rel_path)
+        ignore_maps: dict[Path, dict[str, Optional[bool]]] = {
+            tree_root: self._batch_gitignored(tree_root, rels)
+            for tree_root, rels in by_tree.items()
+        }
+
+        # 3. Classify each with its pre-computed gitignore verdict.
+        classified = []
+        for tree_root, rel_path, repo in resolved:
+            ignored = ignore_maps.get(tree_root, {}).get(rel_path)
+            prod = self._classify(tree_root, rel_path, repo, ignored)
+            if prod is not None:
+                classified.append(prod)
         if not classified:
             return
 
@@ -372,14 +468,22 @@ class ProductRegistry:
                 existing = by_path.get(prod.path)
                 if existing is not None:
                     # Refresh mutable fields; PRESERVE first_produced.
-                    existing["role"] = prod.role
+                    existing["role"] = prod.role.value
                     existing["kind"] = prod.kind
                     existing["gitignored"] = prod.gitignored
                     existing["last_touched"] = prod.last_touched
                 else:
                     row = asdict(prod)
+                    row["role"] = prod.role.value  # store the enum VALUE, not the member
                     products.append(row)
                     by_path[prod.path] = row
+            # AC4: bounded store — evict OLDEST by last_touched past the cap. Runs
+            # inside the SAME flock (P8: no parallel writer). A just-refreshed live
+            # product has the newest last_touched, so eviction removes only genuinely
+            # stale rows; a re-touched or backfilled product re-enters on next write.
+            if len(products) > MAX_PRODUCTS:
+                products.sort(key=lambda e: e.get("last_touched", ""))
+                del products[: len(products) - MAX_PRODUCTS]
 
         self._mutate(_upsert)
 
@@ -393,6 +497,11 @@ class ProductRegistry:
         twice adds no duplicate (AC5). Only tracked files appear in git-log, so a
         gitignored deck is NOT backfilled here — it registers live via the watcher
         hook (AC3). Fail-safe: any git error → no-op (never raises).
+
+        On a SUCCESSFUL git-log run (even if it produced zero products) sets a
+        ``backfilled_at`` marker so the endpoint never re-runs the 30s git-log on a
+        product-less workspace (Gate-2 meta-review MED). A git ERROR does NOT set the
+        marker — that stays retryable.
         """
         try:
             r = subprocess.run(
@@ -419,3 +528,7 @@ class ProductRegistry:
         ]
         if abs_paths:
             self.register_batch(abs_paths)
+        # Mark backfill DONE (git-log succeeded) even when zero products were found,
+        # so has_backfilled() is True and the endpoint won't re-run the git-log on the
+        # next open of a product-less workspace.
+        self._mutate(lambda data: data.__setitem__("backfilled_at", datetime.now(timezone.utc).isoformat()))

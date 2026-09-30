@@ -34,6 +34,26 @@ export interface DriftResult {
   currentRef?: string;
 }
 
+/** The closed role set (mirrors backend product_registry.Role — Artifacts B′ Run 2).
+ *  `Other` is dropped at write time so it never reaches the frontend, but keep it in
+ *  the union so an unexpected value stays typed (defensive render fallback). */
+export type ProductRole = 'Deliverables' | 'Knowledge' | 'Pipeline' | 'Activity' | 'Other';
+
+/** One product from the workspace product registry (Artifacts B′ Run 2, AC1).
+ *  The role-typed source the Artifacts overlay projects from — replaces the git-log
+ *  RadarArtifact view so gitignored decks surface. ROLE is computed ONCE in the backend
+ *  (product_registry.derive_role); the frontend renders it, NEVER re-derives (run_4de279ca).
+ *  Backend ProductResponse already emits camelCase, so this is a typed passthrough — no
+ *  snake→camel mapper (unlike artifactToCamelCase, which only maps modified_at). */
+export interface Product {
+  path: string;
+  role: ProductRole;
+  kind: string;
+  gitignored: boolean;
+  firstProduced: string;
+  lastTouched: string;
+}
+
 export const radarService = {
   /** Fetch recently modified artifacts from the workspace git tree. */
   async fetchRecentArtifacts(workspaceId: string, limit?: number): Promise<RadarArtifact[]> {
@@ -42,6 +62,16 @@ export const radarService = {
     params.append('limit', String(limit ?? 20));
     const response = await api.get(`/artifacts/recent?${params.toString()}`);
     return response.data.map(artifactToCamelCase);
+  },
+
+  /** Fetch the workspace PRODUCT registry, role-typed (Artifacts B′ Run 2, AC1).
+   *  The overlay's source — includes gitignored decks the git-log view could not see.
+   *  Backend already emits camelCase; response is a typed passthrough. */
+  async fetchProducts(workspaceId: string): Promise<Product[]> {
+    const params = new URLSearchParams();
+    params.append('workspace_id', workspaceId);
+    const response = await api.get(`/artifacts/products?${params.toString()}`);
+    return response.data as Product[];
   },
 
   /**
