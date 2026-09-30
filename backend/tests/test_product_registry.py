@@ -961,3 +961,56 @@ class TestPurgeExcludedOnRebackfill:
         self._seed_store(ws, ["Knowledge/Library/real-deck.html"])
         assert ProductRegistry(ws)._purge_excluded() == 0
         assert ProductRegistry(ws)._purge_excluded() == 0
+
+    def test_purge_KEEPS_pipeline_report_run_cb127db1_regression(self, ws):
+        """run_cb127db1: _purge_excluded called _is_excluded_path DIRECTLY, which
+        returns True for any .artifacts/ dot-folder path — deleting every Pipeline
+        REPORT even though derive_role classifies it Role.PIPELINE (kept). Two doors
+        disagreed. The fix routes purge through derive_role (single door, P8) so a
+        REPORT survives. Mutation-proof: reverting to _is_excluded_path makes this RED.
+        """
+        import json as _json
+        from core.product_registry import ProductRegistry
+
+        self._seed_store(ws, [
+            "Projects/SwarmAI/.artifacts/runs/run_abc123/REPORT.md",  # KEPT: Role.PIPELINE
+            "Projects/AIDLC/assets/slide-2x.png",                     # excluded (assets image)
+            "Knowledge/Library/real-deck.html",                       # KEPT (real deliverable)
+        ])
+        removed = ProductRegistry(ws)._purge_excluded()
+        assert removed == 1, f"must purge ONLY the assets image, removed {removed}"
+        data = _json.loads((ws / ".artifacts" / "products.json").read_text())
+        paths = {e["path"] for e in data["products"]}
+        assert "Projects/SwarmAI/.artifacts/runs/run_abc123/REPORT.md" in paths, \
+            "a Pipeline REPORT must NOT be purged (regression)"
+        assert "Projects/AIDLC/assets/slide-2x.png" not in paths
+
+    def test_purge_RE_DERIVES_not_trusts_stale_stored_role(self, ws):
+        """The purge must RE-derive each row via derive_role, NOT trust the stored role.
+
+        DISCRIMINATES the single-door fix (run_cb127db1): _seed_store writes role
+        'Deliverables' for EVERY row. A REPORT under .artifacts/runs/ carries that stale
+        Deliverables role, yet derive_role short-circuits it to PIPELINE → it must SURVIVE;
+        meanwhile the OLD predicate (`_is_excluded_path`) would have PURGED that same REPORT
+        (dot-folder), so this case goes RED under the reverted fix — it is mutation-sound for
+        the single-door change (not merely duplicating the assets/Attachments drop, which
+        BOTH predicates handle identically). Also asserts a stale-role assets image is still
+        dropped (re-derive beats stored role).
+        """
+        import json as _json
+        from core.product_registry import ProductRegistry
+
+        self._seed_store(ws, [
+            "Projects/SwarmAI/.artifacts/runs/run_x/REPORT.md",  # stale role=Deliverables; derive_role→PIPELINE → KEPT (old predicate would PURGE it)
+            "Projects/AIDLC/assets/preview-1.jpg",               # stale role=Deliverables; derives OTHER → dropped
+            "Attachments/2026-01-01/shot.png",                   # stale role=Deliverables; derives OTHER → dropped
+            "Knowledge/Designs/mock.html",                       # genuinely a Deliverable → kept
+        ])
+        removed = ProductRegistry(ws)._purge_excluded()
+        assert removed == 2, f"re-derive must drop 2 stale-role noise rows (keep REPORT + real deck), removed {removed}"
+        data = _json.loads((ws / ".artifacts" / "products.json").read_text())
+        paths = {e["path"] for e in data["products"]}
+        assert paths == {
+            "Projects/SwarmAI/.artifacts/runs/run_x/REPORT.md",  # re-derive keeps it despite stale role
+            "Knowledge/Designs/mock.html",
+        }

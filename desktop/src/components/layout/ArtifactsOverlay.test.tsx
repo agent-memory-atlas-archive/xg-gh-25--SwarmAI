@@ -1,14 +1,13 @@
 /**
- * Tests for ArtifactsOverlay — the ROLE-grouped product gallery (Artifacts B′ Run 2).
+ * Tests for ArtifactsOverlay — the TIME-GROUPED retrieval list (run_cb127db1, mockup v2).
  *
- * Focus (the acceptance contract):
- *  - AC2: role grouping — Deliverables as a dominant card grid; Knowledge/Pipeline/
- *         Activity as collapsible sections (Pipeline/Activity collapsed by default).
- *  - AC2: a gitignored deck (role=Deliverables, gitignored=true) surfaces with a `local` badge.
- *  - AC2: a row/card click dispatches swarm:open-file {detail:{path}} AND calls close().
- *  - AC2: Pipeline REPORT.md rows are labeled by their parent run dir (same-name fix).
- *  - AC6: search filters by filename; empty-data + no-match render a friendly empty state.
- *  - Pure helpers: groupByRole buckets + orders; parentRunLabel derives the run label.
+ * Paradigm (Knowledge/Designs/2026-09-30-artifacts-overlay-v2-mock.html): the overlay is a
+ * scannable retrieval LIST, not a thumbnail gallery. The active role (default Deliverables)
+ * is the PRIMARY, shown time-grouped (This week / Last week / Earlier-fold). The other three
+ * roles are DEMOTED to collapsible drawers below. Type chips switch the primary role; the
+ * time-window chip defaults to "past 2 weeks" (Earlier folded); typing in search IGNORES the
+ * window and matches across all time. Zero thumbnails — each row is badge + friendly title +
+ * full dir + absolute timestamp. Star/favorite is deferred (next round).
  *
  * The fetch is injected via the `fetchProducts` test seam (boundary mock).
  */
@@ -19,15 +18,20 @@ import type { ReactElement } from 'react';
 import type { Product } from '../../services/radar';
 import {
   ArtifactsContent,
-  groupByRole,
-  parentRunLabel,
+  timeBucket,
+  groupByTime,
   relativeTime,
   absoluteTime,
-  elideDir,
+  dirDisplay,
   friendlyTitle,
-  thumbKind,
+  fileBadge,
+  parentRunLabel,
   OPEN_FILE_EVENT,
 } from './ArtifactsOverlay';
+
+// Fixed "now" so time buckets are deterministic across machines/timezones.
+const NOW = new Date('2026-09-30T12:00:00Z').getTime();
+const daysAgo = (d: number) => new Date(NOW - d * 86400000).toISOString();
 
 function prod(path: string, role: Product['role'], extra: Partial<Product> = {}): Product {
   const base = path.replace(/\\/g, '/').split('/').filter(Boolean).pop() ?? path;
@@ -36,20 +40,22 @@ function prod(path: string, role: Product['role'], extra: Partial<Product> = {})
     role,
     kind: 'content',
     gitignored: false,
-    firstProduced: '2026-09-30T00:00:00+00:00',
-    lastTouched: '2026-09-30T00:00:00+00:00',
+    firstProduced: daysAgo(1),
+    lastTouched: daysAgo(1),
     displayLabel: base,
     ...extra,
   };
 }
 
+// A fixture spanning time buckets + all four roles.
 const FIXTURE: Product[] = [
-  prod('Projects/AIDLC/assets/deck.html', 'Deliverables', { gitignored: true, lastTouched: '2026-09-30T10:00:00+00:00' }),
-  prod('Knowledge/Reports/weekly.html', 'Deliverables', { lastTouched: '2026-09-30T09:00:00+00:00' }),
-  prod('Projects/SwarmAI/2-understanding/TECH.md', 'Knowledge', { kind: 'knowledge' }),
-  prod('Projects/SwarmAI/.artifacts/runs/run_2274b401/REPORT.md', 'Pipeline', { kind: 'knowledge', displayLabel: 'Artifacts data root-fix' }),
-  prod('Projects/SwarmAI/.artifacts/runs/run_91cddb8f/REPORT.md', 'Pipeline', { kind: 'knowledge', displayLabel: 'Shared product registry backend' }),
-  prod('Knowledge/DailyActivity/2026-09-30.md', 'Activity'),
+  prod('Projects/AIDLC/assets/2026-09-29-ai-native-deck.html', 'Deliverables', { gitignored: true, lastTouched: daysAgo(1) }),   // This week
+  prod('Knowledge/Reports/pipeline-weekly.md', 'Deliverables', { lastTouched: daysAgo(2) }),                                      // This week
+  prod('Knowledge/Designs/2026-09-20-artifact-lifecycle-tech-design.md', 'Deliverables', { lastTouched: daysAgo(10) }),          // Last week
+  prod('Knowledge/Library/2026-08-30-ai-native-ee-oe-deck.html', 'Deliverables', { lastTouched: daysAgo(40) }),                  // Earlier
+  prod('Projects/SwarmAI/2-understanding/TECH.md', 'Knowledge', { kind: 'knowledge', lastTouched: daysAgo(3) }),
+  prod('Projects/SwarmAI/.artifacts/runs/run_2274b401/REPORT.md', 'Pipeline', { kind: 'knowledge', displayLabel: 'Artifacts data root-fix', lastTouched: daysAgo(1) }),
+  prod('Knowledge/DailyActivity/2026-09-30.md', 'Activity', { lastTouched: daysAgo(1) }),
 ];
 
 function renderWithClient(node: ReactElement) {
@@ -59,229 +65,75 @@ function renderWithClient(node: ReactElement) {
 
 afterEach(() => cleanup());
 
-describe('groupByRole (pure)', () => {
-  it('buckets by role in fixed order, non-empty only, newest-first within a group', () => {
-    const groups = groupByRole(FIXTURE);
-    expect(groups.map((g) => g.role)).toEqual(['Deliverables', 'Knowledge', 'Pipeline', 'Activity']);
-    // Deliverables newest-first: deck (10:00) before weekly (09:00)
-    expect(groups[0].products[0].path).toContain('deck.html');
+// ─────────────────────────── pure helpers ───────────────────────────
+
+describe('timeBucket (pure) — AC3', () => {
+  it('buckets by age: <7d This week, 7-14d Last week, >14d Earlier', () => {
+    expect(timeBucket(daysAgo(1), NOW)).toBe('This week');
+    expect(timeBucket(daysAgo(6), NOW)).toBe('This week');
+    expect(timeBucket(daysAgo(8), NOW)).toBe('Last week');
+    expect(timeBucket(daysAgo(13), NOW)).toBe('Last week');
+    expect(timeBucket(daysAgo(40), NOW)).toBe('Earlier');
+  });
+  it('unparseable / missing date → Earlier (never dropped, AC6)', () => {
+    expect(timeBucket('not-a-date', NOW)).toBe('Earlier');
+    expect(timeBucket('', NOW)).toBe('Earlier');
+  });
+});
+
+describe('groupByTime (pure) — AC3', () => {
+  it('groups in fixed order, newest-first within a bucket, non-empty only', () => {
+    const groups = groupByTime(FIXTURE.filter((p) => p.role === 'Deliverables'), NOW);
+    expect(groups.map((g) => g.bucket)).toEqual(['This week', 'Last week', 'Earlier']);
+    // This week newest-first: 1d before 2d
+    expect(groups[0].products[0].path).toContain('ai-native-deck');
     expect(groups[0].products).toHaveLength(2);
-    expect(groups[2].products).toHaveLength(2); // two REPORT.md
+    expect(groups[1].products).toHaveLength(1);
+    expect(groups[2].products).toHaveLength(1);
   });
-
-  it('folds a stray Other into Knowledge, never drops it', () => {
-    const groups = groupByRole([prod('x.weird', 'Other' as Product['role'])]);
-    expect(groups).toHaveLength(1);
-    expect(groups[0].role).toBe('Knowledge');
-  });
-
   it('returns [] for empty input', () => {
-    expect(groupByRole([])).toEqual([]);
+    expect(groupByTime([], NOW)).toEqual([]);
+  });
+  it('an unparseable-date row lands in Earlier, never dropped', () => {
+    const groups = groupByTime([prod('x/y.md', 'Deliverables', { lastTouched: 'bogus' })], NOW);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].bucket).toBe('Earlier');
   });
 });
 
-describe('parentRunLabel (pure)', () => {
-  it('labels a REPORT.md by its parent run dir', () => {
-    expect(parentRunLabel('Projects/SwarmAI/.artifacts/runs/run_2274b401/REPORT.md')).toBe('run_2274b401');
+describe('dirDisplay (pure) — AC4 (full path; …/ only when too long)', () => {
+  it('shows the FULL dir path when it fits', () => {
+    expect(dirDisplay('Projects/AIDLC/assets/deck.html')).toBe('Projects/AIDLC/assets');
+    expect(dirDisplay('Knowledge/Designs/mock.html')).toBe('Knowledge/Designs');
   });
-  it('falls back to basename when no run segment', () => {
-    expect(parentRunLabel('Knowledge/Reports/weekly.html')).toBe('weekly.html');
-  });
-});
-
-describe('ArtifactsContent', () => {
-  let fetchProducts: ReturnType<typeof vi.fn>;
-  let closeSpy: ReturnType<typeof vi.fn>;
-
-  beforeEach(() => {
-    fetchProducts = vi.fn().mockResolvedValue(FIXTURE);
-    closeSpy = vi.fn();
-  });
-
-  it('AC2: renders Deliverables as a card grid + demoted collapsible sections, no preview pane', async () => {
-    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getAllByTestId('artifacts-card').length).toBeGreaterThan(0));
-    // Deliverables dominant (cards)
-    expect(screen.getByTestId('artifacts-group-Deliverables')).toBeInTheDocument();
-    expect(screen.getByText('Deck')).toBeInTheDocument();
-    expect(screen.getByText('Weekly')).toBeInTheDocument();
-    // Demoted sections present
-    expect(screen.getByTestId('artifacts-group-Knowledge')).toBeInTheDocument();
-    expect(screen.getByTestId('artifacts-group-Pipeline')).toBeInTheDocument();
-    // No preview pane / diff (selector only)
-    expect(screen.queryByTestId('artifacts-preview')).toBeNull();
-    expect(screen.queryByText(/show diff/i)).toBeNull();
-  });
-
-  it('AC2: a gitignored deck surfaces with a `local` badge (the blind-spot fix)', async () => {
-    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getByText('Deck')).toBeInTheDocument());
-    expect(screen.getByTestId('artifacts-gitignored-badge')).toBeInTheDocument();
-  });
-
-  it('AC2: Pipeline + Activity are collapsed by default; Knowledge is expanded', async () => {
-    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getByTestId('artifacts-group-Pipeline')).toBeInTheDocument());
-    // Pipeline collapsed → its REPORT rows are NOT rendered until toggled
-    expect(screen.queryByText('Artifacts data root-fix')).toBeNull();
-    // Knowledge expanded → its row IS rendered
-    expect(screen.getByText('TECH.md')).toBeInTheDocument();
-    // Expand Pipeline → REPORT rows appear, labeled by run dir (same-name fix)
-    fireEvent.click(screen.getByTestId('artifacts-section-toggle-Pipeline'));
-    await waitFor(() => expect(screen.getByText('Artifacts data root-fix')).toBeInTheDocument());
-    expect(screen.getByText('Shared product registry backend')).toBeInTheDocument();
-  });
-
-  it('AC2: clicking a deliverable card dispatches swarm:open-file with the path AND calls close()', async () => {
-    const onOpen = vi.fn();
-    document.addEventListener(OPEN_FILE_EVENT, onOpen as EventListener);
-    try {
-      renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
-      await waitFor(() => expect(screen.getByText('Deck')).toBeInTheDocument());
-      fireEvent.click(screen.getByText('Deck'));
-      expect(onOpen).toHaveBeenCalledTimes(1);
-      const ev = onOpen.mock.calls[0][0] as CustomEvent;
-      expect(ev.detail).toEqual({ path: 'Projects/AIDLC/assets/deck.html' });
-      expect(closeSpy).toHaveBeenCalledTimes(1);
-    } finally {
-      document.removeEventListener(OPEN_FILE_EVENT, onOpen as EventListener);
-    }
-  });
-
-  it('AC6: search filters by filename (debounced)', async () => {
-    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getByText('Deck')).toBeInTheDocument());
-    fireEvent.change(screen.getByTestId('artifacts-search'), { target: { value: 'weekly' } });
-    await waitFor(() => expect(screen.queryByText('Deck')).toBeNull());
-    expect(screen.getByText('Weekly')).toBeInTheDocument();
-  });
-
-  it('AC6: empty data renders the friendly empty state (no crash)', async () => {
-    fetchProducts.mockResolvedValue([]);
-    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getByTestId('artifacts-empty')).toBeInTheDocument());
-    expect(screen.getByText(/No products yet/i)).toBeInTheDocument();
-  });
-
-  it('AC6: search with no match renders the no-match empty state', async () => {
-    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getByText('Deck')).toBeInTheDocument());
-    fireEvent.change(screen.getByTestId('artifacts-search'), { target: { value: 'zzzznomatch' } });
-    await waitFor(() => expect(screen.getByTestId('artifacts-empty')).toBeInTheDocument());
-    expect(screen.getByText(/No products match your search/i)).toBeInTheDocument();
-  });
-});
-
-// ── run_7220ff2a: mockup alignment — role-filter chips + relative timestamps ──
-describe('relativeTime (pure)', () => {
-  const NOW = new Date('2026-09-30T12:00:00Z').getTime();
-  it('buckets now / minutes / hours / days, else a date', () => {
-    expect(relativeTime(new Date(NOW - 20 * 1000).toISOString(), NOW)).toBe('now');
-    expect(relativeTime(new Date(NOW - 5 * 60000).toISOString(), NOW)).toBe('5m');
-    expect(relativeTime(new Date(NOW - 3 * 3600000).toISOString(), NOW)).toBe('3h');
-    expect(relativeTime(new Date(NOW - 2 * 86400000).toISOString(), NOW)).toBe('2d');
-    // >7d → a YYYY-MM-DD date stamp (not "60d")
-    expect(relativeTime(new Date(NOW - 60 * 86400000).toISOString(), NOW)).toMatch(/^\d{4}-\d{2}-\d{2}$/);
-  });
-  it('unparseable → empty string (never crashes a row)', () => {
-    expect(relativeTime('not-a-date', NOW)).toBe('');
-  });
-});
-
-describe('ArtifactsContent — role chips + timestamps', () => {
-  let fetchProducts: ReturnType<typeof vi.fn>;
-  let closeSpy: ReturnType<typeof vi.fn>;
-  beforeEach(() => {
-    fetchProducts = vi.fn().mockResolvedValue(FIXTURE);
-    closeSpy = vi.fn();
-  });
-
-  it('AC1: renders a role-filter chip row (4 canonical roles)', async () => {
-    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getByTestId('artifacts-rolefilter')).toBeInTheDocument());
-    for (const role of ['Deliverables', 'Knowledge', 'Pipeline', 'Activity']) {
-      expect(screen.getByTestId(`artifacts-chip-${role}`)).toBeInTheDocument();
-    }
-  });
-
-  it('AC1: clicking a chip filters to that role; clicking it again clears', async () => {
-    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getByText('Deck')).toBeInTheDocument());
-    // Filter to Knowledge → Deliverables cards gone, Knowledge shown
-    fireEvent.click(screen.getByTestId('artifacts-chip-Knowledge'));
-    await waitFor(() => expect(screen.queryByText('Deck')).toBeNull());
-    expect(screen.getByText('TECH.md')).toBeInTheDocument();
-    // Click active chip again → all roles back
-    fireEvent.click(screen.getByTestId('artifacts-chip-Knowledge'));
-    await waitFor(() => expect(screen.getByText('Deck')).toBeInTheDocument());
-  });
-
-  it('AC2: a deliverable card renders a relative timestamp', async () => {
-    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getByText('Deck')).toBeInTheDocument());
-    // The card for deck.html must contain a time element (data-testid).
-    const times = screen.getAllByTestId('artifacts-card-time');
-    expect(times.length).toBeGreaterThan(0);
-    // Each has non-empty text (a relative time or date).
-    expect(times[0].textContent && times[0].textContent.length).toBeGreaterThan(0);
-  });
-
-  it('AC1: filtering to a collapsed-by-default role (Pipeline) auto-expands it (no dead end)', async () => {
-    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getByText('Deck')).toBeInTheDocument());
-    // Pipeline is collapsed by default → its run rows are NOT visible initially.
-    expect(screen.queryByText('Artifacts data root-fix')).toBeNull();
-    // Click the Pipeline chip → filter to Pipeline AND force-expand it → rows visible.
-    fireEvent.click(screen.getByTestId('artifacts-chip-Pipeline'));
-    await waitFor(() => expect(screen.getByText('Artifacts data root-fix')).toBeInTheDocument());
-    expect(screen.getByText('Shared product registry backend')).toBeInTheDocument();
-  });
-});
-
-describe('absoluteTime (pure) — AC6', () => {
-  it('renders YYYY-MM-DD HH:MM in local time', () => {
-    // A fixed instant; assert the shape, not a tz-specific value.
-    const out = absoluteTime('2026-06-04T01:13:16+00:00');
-    expect(out).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
-  });
-  it('unparseable → empty string (never crashes a row)', () => {
-    expect(absoluteTime('not-a-date')).toBe('');
-    expect(absoluteTime('')).toBe('');
-  });
-});
-
-describe('elideDir (pure) — AC7', () => {
-  it('shows the last two dirs, eliding deeper prefixes with …/', () => {
-    expect(elideDir('Projects/SwarmAI/.artifacts/runs/run_x/REPORT.md'))
-      .toBe('…/runs/run_x');
-  });
-  it('two-level path shows both, no ellipsis', () => {
-    expect(elideDir('Knowledge/Library/deck.html')).toBe('Knowledge/Library');
-  });
-  it('one-level path shows the single dir', () => {
-    expect(elideDir('Knowledge/deck.html')).toBe('Knowledge');
+  it('elides with a leading …/ only when the dir path is too long', () => {
+    const out = dirDisplay('Projects/AIDLC/assets/2026-07-28-cntech-allhands-slides/lightweight.html');
+    expect(out.startsWith('…/')).toBe(true);
+    expect(out).toContain('2026-07-28-cntech-allhands-slides');
+    expect(out.length).toBeLessThan(48);
   });
   it('bare filename → empty', () => {
-    expect(elideDir('deck.html')).toBe('');
+    expect(dirDisplay('deck.html')).toBe('');
   });
 });
 
-describe('Pipeline rows use server displayLabel — AC8', () => {
-  it('renders the task-name displayLabel, not the raw run-id', async () => {
-    const fetchProducts = vi.fn().mockResolvedValue([
-      prod('Projects/SwarmAI/.artifacts/runs/run_abc12345/REPORT.md', 'Pipeline', {
-        kind: 'knowledge',
-        displayLabel: 'Fix the artifacts overlay timestamps',
-      }),
-    ]);
-    renderWithClient(<ArtifactsContent close={() => {}} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getByTestId('artifacts-group-Pipeline')).toBeInTheDocument());
-    // Pipeline is collapsed by default — expand it.
-    fireEvent.click(screen.getByTestId('artifacts-section-toggle-Pipeline'));
-    await waitFor(() =>
-      expect(screen.getByText('Fix the artifacts overlay timestamps')).toBeInTheDocument(),
-    );
-    expect(screen.queryByText('run_abc12345')).not.toBeInTheDocument();
+describe('fileBadge (pure) — AC4 (extension-typed badge, incl. MD/DOCX)', () => {
+  it('classifies by extension: DECK / IMG / PDF / MD / HTML / DOCX / DOC', () => {
+    expect(fileBadge('Projects/AIDLC/assets/x.pptx').badge).toBe('DECK');
+    expect(fileBadge('Projects/AIDLC/assets/2026-08-30-ai-native-deck.html').badge).toBe('DECK'); // -deck name
+    expect(fileBadge('Knowledge/Designs/pic.png').badge).toBe('IMG');
+    expect(fileBadge('Knowledge/Library/report.pdf').badge).toBe('PDF');
+    expect(fileBadge('Knowledge/Reports/pipeline-weekly.md').badge).toBe('MD'); // .md → MD (mockup)
+    expect(fileBadge('Knowledge/Library/page.html').badge).toBe('HTML');
+    expect(fileBadge('Knowledge/Docs/spec.docx').badge).toBe('DOCX');
+    expect(fileBadge('Knowledge/Notes/plain.txt').badge).toBe('DOC'); // default
+  });
+  it('every badge is non-empty and carries a color', () => {
+    for (const p of ['a.pptx', 'b.png', 'c.pdf', 'd.md', 'e.html', 'f.docx', 'g.txt']) {
+      const b = fileBadge(p);
+      expect(b.badge.length).toBeGreaterThan(0);
+      expect(b.color.length).toBeGreaterThan(0);
+    }
   });
 });
 
@@ -289,74 +141,161 @@ describe('friendlyTitle (pure) — AC4', () => {
   it('strips a leading YYYY-MM-DD date + extension, de-slugs, title-cases', () => {
     expect(friendlyTitle('2026-08-30-ai-native-ee-oe-deck.html')).toBe('Ai Native Ee Oe Deck');
   });
-  it('no date prefix: just de-slug + title-case', () => {
-    expect(friendlyTitle('SecDLC-flywheel.png')).toBe('SecDLC Flywheel'); // preserves acronym caps
+  it('no date prefix: just de-slug + title-case, preserves acronym caps', () => {
+    expect(friendlyTitle('SecDLC-flywheel.png')).toBe('SecDLC Flywheel');
   });
   it('strips ONLY the last extension (dots in the middle survive)', () => {
     expect(friendlyTitle('v1.2-deck.html')).toBe('V1.2 Deck');
   });
-  it('all-date name → falls back to the basename, never empty (Gate-1 F2)', () => {
+  it('all-date name → basename fallback, never empty', () => {
     expect(friendlyTitle('2026-09-30.md')).toBe('2026-09-30.md');
   });
-  it('degenerate empty → basename fallback', () => {
-    expect(friendlyTitle('')).toBe('');
+});
+
+describe('absoluteTime (pure) — AC4', () => {
+  it('renders YYYY-MM-DD HH:MM in local time', () => {
+    expect(absoluteTime('2026-06-04T01:13:16+00:00')).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+  });
+  it('unparseable → empty string (never crashes a row)', () => {
+    expect(absoluteTime('not-a-date')).toBe('');
+    expect(absoluteTime('')).toBe('');
   });
 });
 
-describe('thumbKind (pure) — AC2', () => {
-  it('classifies deck / image / pdf / html / report / doc', () => {
-    expect(thumbKind('Projects/AIDLC/assets/x.pptx').kind).toBe('deck');
-    expect(thumbKind('Knowledge/Pollinate/y/index.html').kind).toBe('deck'); // Pollinate = content package deck (deliberate)
-    expect(thumbKind('Knowledge/Designs/pic.png').kind).toBe('image');
-    expect(thumbKind('Knowledge/Library/report.pdf').kind).toBe('pdf');
-    expect(thumbKind('Knowledge/Library/page.html').kind).toBe('html');
-    expect(thumbKind('Knowledge/Reports/weekly.md').kind).toBe('report');
-    expect(thumbKind('Knowledge/Notes/whatever.md').kind).toBe('doc'); // default
+describe('relativeTime (pure) — hover title', () => {
+  it('unparseable → empty string', () => {
+    expect(relativeTime('not-a-date', NOW)).toBe('');
   });
-  it('every kind carries a non-empty badge label', () => {
-    for (const p of ['a.pptx', 'b.png', 'c.pdf', 'd.html', 'Reports/e.md', 'f.txt']) {
-      expect(thumbKind(p).badge.length).toBeGreaterThan(0);
+});
+
+describe('parentRunLabel (pure) — Pipeline row fallback', () => {
+  it('labels a REPORT.md by its parent run dir', () => {
+    expect(parentRunLabel('Projects/SwarmAI/.artifacts/runs/run_2274b401/REPORT.md')).toBe('run_2274b401');
+  });
+});
+
+// ─────────────────────────── render contract ───────────────────────────
+
+describe('ArtifactsContent — time-grouped list', () => {
+  let fetchProducts: ReturnType<typeof vi.fn>;
+  let closeSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    fetchProducts = vi.fn().mockResolvedValue(FIXTURE);
+    closeSpy = vi.fn();
+  });
+
+  it('AC3: renders the primary role (Deliverables) as a TIME-GROUPED list with This week / Last week headers', async () => {
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} now={NOW} />);
+    await waitFor(() => expect(screen.getByText('This week')).toBeInTheDocument());
+    expect(screen.getByText('Last week')).toBeInTheDocument();
+    // primary rows shown as list rows (not thumbnail cards)
+    expect(screen.getAllByTestId('artifacts-row').length).toBeGreaterThan(0);
+    expect(screen.queryByTestId('artifacts-card-thumb')).toBeNull(); // no thumbnails
+  });
+
+  it('AC4: a row shows badge + friendly title + full dir + absolute timestamp', async () => {
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} now={NOW} />);
+    await waitFor(() => expect(screen.getByText('Ai Native Deck')).toBeInTheDocument()); // friendly title
+    expect(screen.queryByText('2026-09-29-ai-native-deck.html')).toBeNull();             // not raw filename
+    const badges = screen.getAllByTestId('artifacts-row-badge');
+    expect(badges.some((b) => /DECK/i.test(b.textContent ?? ''))).toBe(true);
+    expect(screen.getByText('Projects/AIDLC/assets')).toBeInTheDocument();               // FULL dir
+    const times = screen.getAllByTestId('artifacts-row-time');
+    expect(times[0].textContent).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);              // absolute time
+  });
+
+  it('AC5: type chips switch the primary role; the time-window chip defaults to past-2-weeks', async () => {
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} now={NOW} />);
+    // wait for DATA (the rolefilter renders immediately during loading, so it's not a data anchor)
+    await waitFor(() => expect(screen.getByText('Ai Native Deck')).toBeInTheDocument());
+    for (const role of ['Deliverables', 'Knowledge', 'Pipeline', 'Activity']) {
+      expect(screen.getByTestId(`artifacts-chip-${role}`)).toBeInTheDocument();
+    }
+    // window chip defaults to the 2-week label
+    expect(screen.getByTestId('artifacts-window-chip').textContent).toMatch(/两周|2\s*week/i);
+    // switch primary to Knowledge → its item becomes a primary time-grouped row
+    // (friendlyTitle strips the extension: TECH.md → "TECH")
+    fireEvent.click(screen.getByTestId('artifacts-chip-Knowledge'));
+    await waitFor(() => expect(screen.getByText('TECH')).toBeInTheDocument());
+  });
+
+  it('AC6: rows beyond the 2-week window fold into a "▸ N more" row that expands', async () => {
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} now={NOW} />);
+    await waitFor(() => expect(screen.getByText('This week')).toBeInTheDocument());
+    // the 40-day-old deck is Earlier → folded, not shown
+    expect(screen.queryByText('Ai Native Ee Oe Deck')).toBeNull();
+    expect(screen.getByTestId('artifacts-fold')).toBeInTheDocument();
+    // expand the fold → Earlier rows appear
+    fireEvent.click(screen.getByTestId('artifacts-fold'));
+    await waitFor(() => expect(screen.getByText('Ai Native Ee Oe Deck')).toBeInTheDocument());
+  });
+
+  it('AC5: search IGNORES the time window — a match older than 2 weeks appears', async () => {
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} now={NOW} />);
+    await waitFor(() => expect(screen.getByText('This week')).toBeInTheDocument());
+    // "ee-oe" only matches the 40-day-old (Earlier, folded) deck
+    fireEvent.change(screen.getByTestId('artifacts-search'), { target: { value: 'ee-oe' } });
+    await waitFor(() => expect(screen.getByText('Ai Native Ee Oe Deck')).toBeInTheDocument());
+    // and the window chip reads as ignored while searching
+    expect(screen.getByTestId('artifacts-window-chip').textContent).toMatch(/忽略|ignore/i);
+  });
+
+  it('demoted drawers: the non-primary roles render as collapsible drawers below', async () => {
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} now={NOW} />);
+    await waitFor(() => expect(screen.getByText('This week')).toBeInTheDocument());
+    // Knowledge/Pipeline/Activity are demoted drawers (Deliverables is primary)
+    expect(screen.getByTestId('artifacts-drawer-Knowledge')).toBeInTheDocument();
+    expect(screen.getByTestId('artifacts-drawer-Pipeline')).toBeInTheDocument();
+    expect(screen.getByTestId('artifacts-drawer-Activity')).toBeInTheDocument();
+    // a drawer is collapsed by default → its row not shown until toggled
+    expect(screen.queryByText('Artifacts data root-fix')).toBeNull();
+    fireEvent.click(screen.getByTestId('artifacts-drawer-toggle-Pipeline'));
+    await waitFor(() => expect(screen.getByText('Artifacts data root-fix')).toBeInTheDocument());
+  });
+
+  it('AC8: a Pipeline row shows the server displayLabel (task name), not the raw run-id', async () => {
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} now={NOW} />);
+    await waitFor(() => expect(screen.getByText('This week')).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId('artifacts-drawer-toggle-Pipeline'));
+    await waitFor(() => expect(screen.getByText('Artifacts data root-fix')).toBeInTheDocument());
+    expect(screen.queryByText('run_2274b401')).toBeNull();
+  });
+
+  it('a gitignored primary row surfaces a `local` badge (the blind-spot fix)', async () => {
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} now={NOW} />);
+    await waitFor(() => expect(screen.getByText('Ai Native Deck')).toBeInTheDocument());
+    expect(screen.getByTestId('artifacts-gitignored-badge')).toBeInTheDocument();
+  });
+
+  it('clicking a row dispatches swarm:open-file with the path AND calls close()', async () => {
+    const onOpen = vi.fn();
+    document.addEventListener(OPEN_FILE_EVENT, onOpen as EventListener);
+    try {
+      renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} now={NOW} />);
+      await waitFor(() => expect(screen.getByText('Ai Native Deck')).toBeInTheDocument());
+      fireEvent.click(screen.getByText('Ai Native Deck'));
+      expect(onOpen).toHaveBeenCalledTimes(1);
+      const ev = onOpen.mock.calls[0][0] as CustomEvent;
+      expect(ev.detail).toEqual({ path: 'Projects/AIDLC/assets/2026-09-29-ai-native-deck.html' });
+      expect(closeSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      document.removeEventListener(OPEN_FILE_EVENT, onOpen as EventListener);
     }
   });
-});
 
-describe('Deliverables tile — AC1/AC2/AC3 render', () => {
-  it('renders a thumbnail zone + type badge + friendly title (not the raw filename)', async () => {
-    const fetchProducts = vi.fn().mockResolvedValue([
-      prod('Knowledge/Library/2026-08-30-ai-native-ee-oe-deck.html', 'Deliverables'),
-    ]);
-    renderWithClient(<ArtifactsContent close={() => {}} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getByTestId('artifacts-card')).toBeInTheDocument());
-    expect(screen.getByTestId('artifacts-card-thumb')).toBeInTheDocument();
-    // friendly title shown, raw filename NOT the visible label
-    expect(screen.getByText('Ai Native Ee Oe Deck')).toBeInTheDocument();
-    expect(screen.queryByText('2026-08-30-ai-native-ee-oe-deck.html')).toBeNull();
-    // type badge (HTML for a .html)
-    expect(screen.getByTestId('artifacts-card-badge')).toHaveTextContent(/DECK/i); // name has -deck
+  it('empty data renders the friendly empty state (no crash)', async () => {
+    fetchProducts.mockResolvedValue([]);
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} now={NOW} />);
+    await waitFor(() => expect(screen.getByTestId('artifacts-empty')).toBeInTheDocument());
+    expect(screen.getByText(/No products yet/i)).toBeInTheDocument();
   });
 
-  it('AC5: gallery is a 4-column grid with a flatter (16:7) thumbnail tile', async () => {
-    const fetchProducts = vi.fn().mockResolvedValue([
-      prod('Knowledge/Library/a-deck.html', 'Deliverables'),
-    ]);
-    renderWithClient(<ArtifactsContent close={() => {}} fetchProducts={fetchProducts} />);
-    await waitFor(() => expect(screen.getByTestId('artifacts-card')).toBeInTheDocument());
-    // 4-col grid (the card's grid container)
-    const card = screen.getByTestId('artifacts-card');
-    expect(card.parentElement?.className).toMatch(/grid-cols-4/);
-    // flatter thumbnail aspect (16:7, not the old 16:10)
-    expect(screen.getByTestId('artifacts-card-thumb').className).toMatch(/aspect-\[16\/7\]/);
-  });
-});
-
-describe('Gate-2 adversarial fixes', () => {
-  it('thumbKind: report matches only a whole token, not a substring (preport.md → doc)', () => {
-    expect(thumbKind('Knowledge/Notes/preport.md').kind).toBe('doc');
-    expect(thumbKind('Knowledge/Notes/reporter-bio.md').kind).toBe('doc');
-    expect(thumbKind('Knowledge/Reports/x.md').kind).toBe('report'); // Reports/ dir
-    expect(thumbKind('Knowledge/Notes/weekly-report.md').kind).toBe('report'); // token
-  });
-  it('friendlyTitle: no trailing dot from a double-extension (report..md → Report)', () => {
-    expect(friendlyTitle('report..md')).toBe('Report');
+  it('search with no match renders the no-match empty state', async () => {
+    renderWithClient(<ArtifactsContent close={closeSpy} fetchProducts={fetchProducts} now={NOW} />);
+    await waitFor(() => expect(screen.getByText('This week')).toBeInTheDocument());
+    fireEvent.change(screen.getByTestId('artifacts-search'), { target: { value: 'zzzznomatch' } });
+    await waitFor(() => expect(screen.getByTestId('artifacts-empty')).toBeInTheDocument());
+    expect(screen.getByText(/No products match/i)).toBeInTheDocument();
   });
 });

@@ -91,7 +91,7 @@ _STORE_VERSION = 1
 # re-backfill ADDS/refreshes via register_batch AND runs _purge_excluded, which drops
 # stored rows a NEW exclusion rule now rejects — so a version bump both re-adds with the
 # new logic AND removes now-excluded noise (register_batch alone never removes).
-_BACKFILL_VERSION = 3  # run_fe228bc0: bumped so the re-backfill PURGES the existing noise rows (assets images / .claude / Attachments) on deploy
+_BACKFILL_VERSION = 4  # run_cb127db1: bumped so the re-backfill re-runs once and RESTORES the Pipeline REPORT rows a prior _purge_excluded wrongly deleted (fix routes purge through derive_role, single door)
 
 # Run 2 AC4: bounded store. Registering past this cap evicts the OLDEST entries by
 # last_touched inside the same flock-guarded _upsert (never a parallel writer, P8).
@@ -766,7 +766,21 @@ class ProductRegistry:
         Reconciliation for a version-bump re-backfill: register_batch/_upsert never
         REMOVE, so a newly-excluded path (assets image, dot-folder, Attachments,
         garbage byproduct) already in the store would persist forever. This re-applies
-        _is_excluded_path + _is_garbage to EXISTING rows and removes the rejects.
+        the SAME two drop-gates _classify uses on write — `_is_garbage` OR
+        `derive_role(path, None) == Role.OTHER` — so the purge and the write path are
+        ONE door (P8), never a divergent predicate.
+
+        run_cb127db1: this MUST route through derive_role, NOT call _is_excluded_path
+        directly. _is_excluded_path returns True for any .artifacts/ dot-folder path,
+        but derive_role short-circuits a `.artifacts/runs/*/REPORT.md` to Role.PIPELINE
+        (a kept product) BEFORE the exclusion — so calling _is_excluded_path directly
+        wrongly purged every Pipeline REPORT. derive_role is the single source of truth
+        for "is this a product?"; repo=None is safe because the exclusion / REPORT /
+        DailyActivity / product-dir branches never read repo (repo only feeds
+        _classify_kind's knowledge/source split, which never yields OTHER).
+
+        RE-derives, does NOT trust the stored role: a stale role=Deliverables (written
+        before the exclusion shipped) must not shield a noise row from purge.
 
         SUBTRACTIVE + SAFE: only removes rows the classifier no longer considers
         products; never adds, never rewrites a kept row. flock-guarded via _mutate.
@@ -778,7 +792,10 @@ class ProductRegistry:
             products = data.get("products", [])
             kept = [
                 e for e in products
-                if not (_is_excluded_path(e.get("path", "")) or _is_garbage(e.get("path", "")))
+                if not (
+                    _is_garbage(e.get("path", ""))
+                    or derive_role(e.get("path", ""), None) == Role.OTHER
+                )
             ]
             removed["n"] = len(products) - len(kept)
             if removed["n"]:
