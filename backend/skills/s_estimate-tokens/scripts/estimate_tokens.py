@@ -32,10 +32,10 @@ from pathlib import Path
 
 # Effective context-file budget for our default 1M-context models — DERIVED from
 # the budget SoT (context_directory_loader.EFFECTIVE_1M_BUDGET = BUDGET_1M_MODEL −
-# EPHEMERAL_HEADROOM), so a base-budget change propagates here automatically
-# (run_72ca2a97). Falls back to the current value only if the canonical module is
-# unreachable (e.g. run from a frozen bundle with no source) — a fail-SAFE default,
-# not a 2nd source of truth: when the module IS reachable, this always tracks it.
+# EPHEMERAL_HEADROOM), so a base-budget change propagates here automatically.
+# Falls back to the current value only if the canonical module is unreachable
+# (e.g. run from a frozen bundle with no source) — a fail-SAFE default, not a 2nd
+# source of truth: when the module IS reachable, this always tracks it.
 _DEFAULT_WINDOW_FALLBACK = 141_000
 
 

@@ -18,7 +18,7 @@ import { chromium } from 'playwright';
 import { ariaPerceive, resolveAriaLocator } from './aria-perceive.mjs';
 
 const CHROME = process.env.BROWSER_AGENT_EXECUTABLE ||
-  "/Users/gawan/Library/Caches/ms-playwright/chromium-1228/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing";
+  `${process.env.HOME}/Library/Caches/ms-playwright/chromium-1228/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`;
 
 let passed = 0, failed = 0;
 function ok(cond, msg) { if (cond) { passed++; console.log(`  ✓ ${msg}`); } else { failed++; console.log(`  ✗ FAIL: ${msg}`); } }

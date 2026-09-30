@@ -14,7 +14,8 @@ import { dirname, join } from 'path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const { chromium } = await import(join(__dirname, 'node_modules', 'playwright', 'index.mjs'));
-const EXEC = '/Users/gawan/Library/Caches/ms-playwright/chromium-1228/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+const EXEC = process.env.BROWSER_AGENT_EXECUTABLE ||
+  `${process.env.HOME}/Library/Caches/ms-playwright/chromium-1228/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`;
 const CDP_PORT = 9222;
 const STATE_FILE = '/tmp/.browser-agent-state.json';
 const CLI = join(__dirname, 'browser-agent.mjs');

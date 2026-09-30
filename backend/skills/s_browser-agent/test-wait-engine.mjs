@@ -25,7 +25,8 @@ const {
   diffElementMap,
 } = await import(join(__dirname, 'wait-engine.mjs'));
 
-const EXEC = '/Users/gawan/Library/Caches/ms-playwright/chromium-1228/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing';
+const EXEC = process.env.BROWSER_AGENT_EXECUTABLE ||
+  `${process.env.HOME}/Library/Caches/ms-playwright/chromium-1228/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`;
 
 let passed = 0, failed = 0;
 function assert(cond, msg) {
