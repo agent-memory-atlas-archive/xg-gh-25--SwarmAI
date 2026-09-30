@@ -160,7 +160,7 @@ Key design decisions:
 
 | Model Context Window | Token Budget | Constant |
 |---------------------|-------------|----------|
-| ≥ 500K tokens | 100,000 | `BUDGET_1M_MODEL` |
+| ≥ 500K tokens | 150,000 | `BUDGET_1M_MODEL` |
 | ≥ 200K tokens | 50,000 | `BUDGET_LARGE_MODEL` |
 | 64K – 200K | 30,000 | `DEFAULT_TOKEN_BUDGET` |
 | < 64K | 30,000 (instance default) | `self.token_budget` |
@@ -180,7 +180,7 @@ EPHEMERAL_HEADROOM breakdown:
   Total                                         = 9,000
 ```
 
-This means for a 1M model, the actual budget for context files is ~91,000 tokens (100,000 - 9,000).
+This means for a 1M model, the actual budget for context files is ~141,000 tokens (150,000 - 9,000).
 
 ### Token Estimation
 
@@ -332,7 +332,7 @@ _DEFAULT_CONTEXT_WINDOW = 200_000
 
 Bedrock model IDs are stripped of prefix/suffix before lookup: `us.anthropic.claude-opus-4-6-v1[1m]` → `claude-opus-4-6`.
 
-Note: Claude Opus 4.6 with 1M context (`us.anthropic.claude-opus-4-6-v1[1m]`) maps to 1,000,000 window size, triggering the `BUDGET_1M_MODEL` tier (100,000 tokens).
+Note: Claude Opus 4.6 with 1M context (`us.anthropic.claude-opus-4-6-v1[1m]`) maps to 1,000,000 window size, triggering the `BUDGET_1M_MODEL` tier (150,000 tokens).
 
 ---
 
@@ -618,11 +618,11 @@ Current date/time: 2026-03-07 10:30 UTC / 2026-03-07 18:30 CST
 
 ```
 Context window: 1,000,000 tokens (Claude Opus 4.6 with 1M context)
-Token budget: 100,000 (BUDGET_1M_MODEL)
-Effective budget: ~91,000 (after EPHEMERAL_HEADROOM of 9,000)
+Token budget: 150,000 (BUDGET_1M_MODEL)
+Effective budget: ~141,000 (after EPHEMERAL_HEADROOM of 9,000)
 
 Fixed overhead:
-  System prompt (.context/ files)        ~50,000-91,000  (5-9%)
+  System prompt (.context/ files)        ~50,000-141,000  (5-14%)
   Ephemeral context (DailyActivity+resume) ~9,000        (<1%)
   SDK internal instructions               ~8,000          (<1%)
   MCP tool definitions (5 servers)        ~10,000-20,000  (1-2%)

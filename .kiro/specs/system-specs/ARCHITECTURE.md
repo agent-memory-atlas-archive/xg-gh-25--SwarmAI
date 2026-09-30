@@ -405,7 +405,7 @@ Dynamic budgets scale with model context window:
 
 | Model Context | Token Budget | Constant | Strategy |
 |---------------|-------------|----------|----------|
-| ≥ 500K | 100,000 | `BUDGET_1M_MODEL` | L1 full assembly or source files |
+| ≥ 500K | 150,000 | `BUDGET_1M_MODEL` | L1 full assembly or source files |
 | ≥ 200K | 50,000 | `BUDGET_LARGE_MODEL` | L1 full assembly or source files |
 | ≥ 64K | 30,000 | `DEFAULT_TOKEN_BUDGET` | L1 full assembly |
 | < 64K | 30,000 | `DEFAULT_TOKEN_BUDGET` | L0 compact cache |

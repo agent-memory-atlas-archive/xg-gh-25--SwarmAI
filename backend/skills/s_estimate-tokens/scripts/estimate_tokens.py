@@ -19,8 +19,8 @@ Usage:
     estimate_tokens.py [--window N] <file> [<file> ...]
     <command> | estimate_tokens.py [--window N]      # reads stdin
 
---window defaults to 91000 (the effective context-file assembly budget for a 1M
-model: 100K base budget − 9K ephemeral headroom). Override for other budgets.
+--window defaults to 141000 (the effective context-file assembly budget for a 1M
+model: 150K base budget − 9K ephemeral headroom). Override for other budgets.
 """
 from __future__ import annotations
 
@@ -29,9 +29,9 @@ import sys
 from pathlib import Path
 
 # Effective context-file budget for our default 1M-context models:
-#   compute_token_budget() → 100_000 base, minus EPHEMERAL_HEADROOM (9_000).
-# NOT the old hardcoded 200_000 (which was a wrong window for our models).
-DEFAULT_WINDOW = 91_000
+#   compute_token_budget() → 150_000 base, minus EPHEMERAL_HEADROOM (9_000).
+# (Base raised 100K→150K on 2026-09-30; see BUDGET_1M_MODEL docstring.)
+DEFAULT_WINDOW = 141_000
 
 
 def _load_canonical_estimator():

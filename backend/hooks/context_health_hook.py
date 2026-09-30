@@ -3067,11 +3067,16 @@ class ContextHealthHook:
     # files it loads are healthy and within spec"). These thresholds only emit a
     # WARNING/EMERGENCY finding to the deep-check report so the SEPARATE write-side
     # management line (decay/archive/trim — deferred #3) has a signal. WARNING is
-    # anchored to the 91K effective assembly budget; EMERGENCY is a clear-over.
+    # anchored to the effective assembly budget; EMERGENCY is a clear-over.
     # Measured with the calibrated estimate_tokens — the same estimator the
     # assembly uses, so this number matches what actually enters the prompt.
-    _WARNING_THRESHOLD = 91_000
-    _EMERGENCY_THRESHOLD = 130_000
+    # WARNING = BUDGET_1M_MODEL (150K) − EPHEMERAL_HEADROOM (9K) = 141K, the
+    # effective context-file budget for a 1M model (raised 2026-09-30 with the
+    # BUDGET_1M_MODEL 100K→150K bump; the old 91K derived from the old 100K base).
+    # NOTE (follow-up): these mirror compute_token_budget()−EPHEMERAL_HEADROOM by
+    # hand; a future change should derive them so a base bump propagates on its own.
+    _WARNING_THRESHOLD = 141_000
+    _EMERGENCY_THRESHOLD = 180_000
 
     def _check_token_budget(self, context_dir: Path) -> list[str]:
         """Measure total token consumption across all 9 context files.

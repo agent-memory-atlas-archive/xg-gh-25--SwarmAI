@@ -49,34 +49,42 @@ class TestTokenBudgetMeasurement:
         })
         findings = hook._check_token_budget(ctx)
         assert findings == []
-        assert hook._token_measurement["total_tokens"] < 91_000
+        # Threshold-relative (raised 2026-09-30: WARNING 91K→141K).
+        assert hook._token_measurement["total_tokens"] < hook._WARNING_THRESHOLD
         assert hook._token_measurement["over_budget"] is False
 
     def test_warning_threshold_emits_finding(self, tmp_path):
-        """Over 91K tokens but under 130K → WARNING finding (observability)."""
+        """Over WARNING (141K) but under EMERGENCY (180K) → WARNING finding.
+
+        Thresholds raised 2026-09-30 with the BUDGET_1M_MODEL 100K→150K bump
+        (WARNING 91K→141K, EMERGENCY 130K→180K).
+        """
         from hooks.context_health_hook import ContextHealthHook
 
         hook = ContextHealthHook()
-        # Latin 2.2 tok/word: ~45K space-separated words ≈ 99K tokens
-        # → over WARNING (91K) but under EMERGENCY (130K)
+        # Latin 2.2 tok/word: ~72K space-separated words ≈ 158K tokens
+        # → over WARNING (141K) but under EMERGENCY (180K)
         ctx = self._make_context_dir(tmp_path, {
-            "MEMORY.md": "word " * 45_000,
+            "MEMORY.md": "word " * 72_000,
         })
         findings = hook._check_token_budget(ctx)
+        total = hook._token_measurement["total_tokens"]
+        assert hook._WARNING_THRESHOLD < total < hook._EMERGENCY_THRESHOLD, total
         assert len(findings) == 1
         assert "WARNING" in findings[0]
         assert hook._token_measurement["over_budget"] is True
 
     def test_emergency_threshold_emits_finding(self, tmp_path):
-        """Over 130K tokens → EMERGENCY finding."""
+        """Over EMERGENCY (180K) → EMERGENCY finding."""
         from hooks.context_health_hook import ContextHealthHook
 
         hook = ContextHealthHook()
-        # Latin 2.2 tok/word: ~70K words ≈ 154K tokens → over EMERGENCY (130K)
+        # Latin 2.2 tok/word: ~90K words ≈ 198K tokens → over EMERGENCY (180K)
         ctx = self._make_context_dir(tmp_path, {
-            "MEMORY.md": "word " * 70_000,
+            "MEMORY.md": "word " * 90_000,
         })
         findings = hook._check_token_budget(ctx)
+        assert hook._token_measurement["total_tokens"] > hook._EMERGENCY_THRESHOLD
         assert len(findings) == 1
         assert "EMERGENCY" in findings[0]
 

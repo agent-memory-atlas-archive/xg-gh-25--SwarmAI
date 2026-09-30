@@ -27,7 +27,7 @@ You **MUST** use the bundled script for all token estimation requests. You **MUS
 1. Run the script with the file path:
    ```bash
    .claude/skills/s_estimate-tokens/scripts/estimate-tokens.sh <filepath>
-   # --window N: context window used for the % calc (default 91000, our 1M-model assembly budget).
+   # --window N: context window used for the % calc (default 141000, our 1M-model assembly budget).
    #             Pass a different window only when sizing against a non-default budget:
    .claude/skills/s_estimate-tokens/scripts/estimate-tokens.sh --window 200000 <filepath>
    ```

@@ -11,7 +11,7 @@ from __future__ import annotations
 from core.context_brain import _health_tag
 
 
-BUDGET = 91_000
+BUDGET = 141_000  # effective 1M-model context budget (raised 91K→141K 2026-09-30)
 
 
 def test_oversized_beats_everything():

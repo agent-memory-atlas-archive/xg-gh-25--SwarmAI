@@ -51,14 +51,14 @@ class TestSkillParity:
     def test_window_parameterized_not_hardcoded_200k(self, tmp_path):
         f = tmp_path / "s.md"
         f.write_text("word " * 1000, encoding="utf-8")
-        # default window (91K) gives a different % than 200K
+        # default window (141K) gives a different % than 200K
         default = subprocess.run([sys.executable, str(PY_ENTRY), str(f)],
                                  capture_output=True, text=True, timeout=30).stdout
         windowed = subprocess.run([sys.executable, str(PY_ENTRY), "--window", "200000", str(f)],
                                   capture_output=True, text=True, timeout=30).stdout
-        assert "91,000 tokens" in default
+        assert "141,000 tokens" in default
         assert "200,000 tokens" in windowed
-        assert "91,000" not in windowed  # window actually applied
+        assert "141,000" not in windowed  # window actually applied
 
     def test_no_wc_w_heuristic_remains(self):
         """The old wc-w*1.8 + hardcoded 200000 must be gone from the shell script."""

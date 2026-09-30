@@ -13,7 +13,7 @@ centralized directory.  It is responsible for:
 - ``CONTEXT_FILES``             — Ordered list of all 11 ContextFileSpec entries
 - ``DEFAULT_TOKEN_BUDGET``      — Default token budget constant (30,000)
 - ``BUDGET_LARGE_MODEL``        — Token budget for >= 200K models (50,000)
-- ``BUDGET_1M_MODEL``           — Token budget for >= 500K models (100,000)
+- ``BUDGET_1M_MODEL``           — Token budget for >= 500K models (150,000)
 - ``L1_CACHE_FILENAME``         — Filename for the full L1 cache
 - ``L0_CACHE_FILENAME``         — Filename for the compact L0 cache
 - ``THRESHOLD_USE_L1``          — Context window threshold for L1 usage (64K)
@@ -81,13 +81,21 @@ THRESHOLD_SKIP_LOW_PRIORITY = 32_000
 BUDGET_LARGE_MODEL = 50_000
 """Token budget for models with >= 200K context window (25% of 200K)."""
 
-BUDGET_1M_MODEL = 100_000
-"""Token budget for models with >= 500K context window (10% of 1M).
+BUDGET_1M_MODEL = 150_000
+"""Token budget for models with >= 500K context window (15% of 1M).
 
-Claude 4.6 models have 1M context GA on Bedrock. With 5x the room,
+Claude 4.6 models have 1M context GA on Bedrock. With 5-15x the room,
 we can afford a richer system prompt (more DailyActivity, fuller
-MEMORY.md, untruncated KNOWLEDGE) while still leaving 90%
-for conversation and tool use."""
+MEMORY.md, untruncated KNOWLEDGE) while still leaving ~85%
+for conversation and tool use.
+
+Raised 100K→150K on 2026-09-30: the old base minus EPHEMERAL_HEADROOM
+(9K, applied in prompt_builder) gave a 91K effective context-file budget
+that a healthy full-injection load (~92K, CJK-aware) exceeded — a false
+``over_budget`` warning, not real pressure (the read-line never truncates
+on 1M models; all context files inject in full). 150K → ~141K effective
+clears it with real growth headroom, and stays far below the 500K tier
+floor so the budget remains strictly inside the model window."""
 
 # Whole-file-private context files — the single source of truth for the
 # private lane (design 2026-07-06 §4). These carry XG's personal / self data
@@ -694,7 +702,7 @@ class ContextDirectoryLoader:
 
         Scales the token budget to the model's capacity:
 
-        - >= 500K tokens → 100,000 (``BUDGET_1M_MODEL``) — Claude 4.6 1M GA
+        - >= 500K tokens → 150,000 (``BUDGET_1M_MODEL``) — Claude 4.6 1M GA
         - >= 200K and < 500K → 50,000 (``BUDGET_LARGE_MODEL``)
         - >= 64K and < 200K → 30,000 (``DEFAULT_TOKEN_BUDGET``)
         - < 64K → ``self.token_budget`` (instance default, L0 path)

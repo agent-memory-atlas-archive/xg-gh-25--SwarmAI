@@ -32,8 +32,10 @@ logger = logging.getLogger(__name__)
 
 # Budget thresholds — mirror context_health_hook.ContextHealthHook (SoT for the
 # WARN/EMERGENCY lines). Kept in sync with that hook; if it changes, this follows.
-_WARNING_THRESHOLD = 91_000
-_EMERGENCY_THRESHOLD = 130_000
+# WARNING = BUDGET_1M_MODEL (150K) − EPHEMERAL_HEADROOM (9K) = 141K effective
+# context-file budget (raised 2026-09-30 with the 100K→150K base bump).
+_WARNING_THRESHOLD = 141_000
+_EMERGENCY_THRESHOLD = 180_000
 
 # filename → 4-way owner category (rail display only — NO logic consumes it; a file's
 # editability/lock comes from `truncatable`, not owner). This is the coarse display

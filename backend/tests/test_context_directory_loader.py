@@ -355,13 +355,13 @@ class TestComputeTokenBudget:
         assert loader.compute_token_budget(499_999) == BUDGET_LARGE_MODEL
 
     def test_1m_model_500k(self, tmp_dirs):
-        """>=500K context window → BUDGET_1M_MODEL (100,000)."""
+        """>=500K context window → BUDGET_1M_MODEL (150,000)."""
         from core.context_directory_loader import BUDGET_1M_MODEL
         loader = self._make_loader(tmp_dirs)
         assert loader.compute_token_budget(500_000) == BUDGET_1M_MODEL
 
     def test_1m_model_1m(self, tmp_dirs):
-        """1M context window → BUDGET_1M_MODEL (100,000)."""
+        """1M context window → BUDGET_1M_MODEL (150,000)."""
         from core.context_directory_loader import BUDGET_1M_MODEL
         loader = self._make_loader(tmp_dirs)
         assert loader.compute_token_budget(1_000_000) == BUDGET_1M_MODEL
@@ -400,6 +400,40 @@ class TestComputeTokenBudget:
         """Zero model_context_window → DEFAULT_TOKEN_BUDGET."""
         loader = self._make_loader(tmp_dirs)
         assert loader.compute_token_budget(0) == DEFAULT_TOKEN_BUDGET
+
+    def test_1m_budget_value_is_150k(self, tmp_dirs):
+        """BUDGET_1M_MODEL is 150,000 (raised 2026-09-30 from 100K).
+
+        Rationale: a 1M-context model has 5-15x the room; the old 100K base
+        minus the 9K EPHEMERAL_HEADROOM gave a 91K effective budget that a
+        healthy full-injection context load (~92K, CJK-aware) exceeded — a
+        false over_budget warning, not real pressure (read-line never
+        truncates on 1M models). 150K → 141K effective clears it with real
+        headroom. See run_1b2655df / IMPROVEMENT.md (raise-cap not compress).
+        """
+        from core.context_directory_loader import BUDGET_1M_MODEL
+        assert BUDGET_1M_MODEL == 150_000
+        loader = self._make_loader(tmp_dirs)
+        assert loader.compute_token_budget(1_000_000) == 150_000
+
+    def test_1m_budget_stays_bounded_below_window(self, tmp_dirs):
+        """The raised 1M budget must stay strictly inside the model window.
+
+        Mirrors the eval_spine_probe PROMPT_BUDGET invariant (0 < b < window):
+        an over-window budget = silent truncation = degraded cognition. 150K
+        is far below the 500K tier floor, so this holds by a wide margin.
+        """
+        loader = self._make_loader(tmp_dirs)
+        for window in (500_000, 1_000_000):
+            b = loader.compute_token_budget(window)
+            assert 0 < b < window
+
+    def test_other_tiers_unchanged_by_1m_raise(self, tmp_dirs):
+        """Raising the 1M tier must not touch the 200K / 64K / <64K tiers."""
+        loader = self._make_loader(tmp_dirs)
+        assert loader.compute_token_budget(200_000) == BUDGET_LARGE_MODEL  # 50K
+        assert loader.compute_token_budget(499_999) == BUDGET_LARGE_MODEL  # 50K
+        assert loader.compute_token_budget(128_000) == DEFAULT_TOKEN_BUDGET  # 30K
 
 
 # ── _enforce_token_budget() truncate_from unit tests ──────────────────

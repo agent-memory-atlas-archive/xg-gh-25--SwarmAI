@@ -373,7 +373,7 @@ class TestBudgetReachesConsumer:
         # And the tiers the panel now renders are the ones the loader computes —
         # the panel must never re-derive these, only display what it is told.
         loader = ContextDirectoryLoader(context_dir=tmp_path)
-        assert loader.compute_token_budget(1_000_000) == 100_000
+        assert loader.compute_token_budget(1_000_000) == 150_000
         assert loader.compute_token_budget(200_000) == 50_000
         assert loader.compute_token_budget(128_000) == 30_000
 
