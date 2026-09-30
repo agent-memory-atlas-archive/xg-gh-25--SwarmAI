@@ -342,4 +342,28 @@ describe('ThreeColumnLayout - ChatContextBar Removal', () => {
       expect(chatContent.textContent).toBe(testContent);
     });
   });
+
+  /**
+   * Artifacts nav entry polish (run_270598db): the icon must be a hand-drawn
+   * NavSvgIcon <svg> (matching the sibling nav icons), NOT a material-symbols
+   * FONT-glyph fallback (the inventory_2 mismatch). Plus an H1 left accent bar.
+   */
+  describe('Artifacts nav entry — icon style + highlight', () => {
+    it('AC1: the Artifacts row icon is an inline <svg>, not a material-symbols font glyph', () => {
+      renderThreeColumnLayout(<div data-testid="test-chat-content">x</div>);
+      const iconWrap = screen.getByTestId('artifacts-row-icon');
+      expect(iconWrap.querySelector('svg')).not.toBeNull();
+      // The old fallback rendered a material-symbols span with the raw name text.
+      expect(iconWrap.querySelector('.material-symbols-outlined')).toBeNull();
+      expect(iconWrap.textContent).not.toContain('inventory_2');
+    });
+
+    it('AC2: the Artifacts row has an H1 left accent bar (var(--color-primary))', () => {
+      renderThreeColumnLayout(<div data-testid="test-chat-content">x</div>);
+      const row = screen.getByTestId('artifacts-row');
+      const bar = row.querySelector('[data-testid="artifacts-row-accent-bar"]');
+      expect(bar).not.toBeNull();
+      expect((bar as HTMLElement).getAttribute('style') || '').toContain('var(--color-primary)');
+    });
+  });
 });

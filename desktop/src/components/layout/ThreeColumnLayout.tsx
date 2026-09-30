@@ -234,15 +234,26 @@ function LeftSidebar() {
             Opens the artifacts overlay via OverlayHost; the host re-derives this row's
             rect from its testid (sourceCardTestId: 'artifacts-row') for the spout. */}
         <button
-          className="a10-histrow mt-0.5 w-full flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-[var(--color-text-muted)] hover:bg-[var(--color-hover)] hover:text-[var(--color-text)] transition-colors"
+          className="a10-histrow relative mt-0.5 w-full flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-[var(--color-text-muted)] hover:bg-[var(--color-hover)] hover:text-[var(--color-text)] transition-colors"
           onClick={() => { if (activeModal) closeModal(); openOverlay('artifacts'); }}
           title="Artifacts"
           data-testid="artifacts-row"
         >
+          {/* H1 highlight: a left accent bar (same language as the Canvas rail
+              selected row) — marks Artifacts as the highlighted twin of History,
+              without a full-row background that would fight the hover state. */}
+          <span
+            aria-hidden="true"
+            data-testid="artifacts-row-accent-bar"
+            className="absolute left-0.5 top-1.5 bottom-1.5 w-[2.5px] rounded-full"
+            style={{ backgroundColor: 'var(--color-primary)' }}
+          />
           {/* Fixed accent color (always-on, theme-tracked) — emphasizes the new
               twin entry vs the muted History icon. NavSvgIcon strokes currentColor,
-              so an inline color on the wrapper tints the glyph. */}
-          <span data-testid="artifacts-row-icon" className="w-4 flex items-center justify-center" style={{ color: 'var(--color-primary)' }}><NavSvgIcon name="inventory_2" /></span>
+              so an inline color on the wrapper tints the glyph. gallery = the 2×2
+              grid matching the overlay's card gallery (was inventory_2 → material
+              font-glyph fallback, mismatched with the stroke-SVG siblings). */}
+          <span data-testid="artifacts-row-icon" className="w-4 flex items-center justify-center" style={{ color: 'var(--color-primary)' }}><NavSvgIcon name="gallery" /></span>
           <span className="flex-1 text-left text-[11.5px] font-mono tracking-wide">Artifacts</span>
           <span className="text-[13px] text-[var(--color-text-faint)]">›</span>
         </button>
@@ -603,6 +614,20 @@ function NavSvgIcon({ name }: { name: string }) {
           <path d="M12 6.5C10.5 5 8 4.5 4 5v13c4-.5 6.5 0 8 1.5" />
           <path d="M12 6.5C13.5 5 16 4.5 20 5v13c-4-.5-6.5 0-8 1.5" />
           <line x1="12" y1="6.5" x2="12" y2="20" />
+        </svg>
+      );
+    case 'gallery':
+      // Artifacts — a 2×2 rounded-grid, echoing the overlay's card-gallery layout
+      // (Deliverables/Knowledge/Pipeline/Activity). Four evenly-spaced rounded
+      // squares at the NavSvgIcon 19px stroke weight — reads as "a chart of
+      // products" and stays visually consistent with the sibling stroke icons
+      // (was: name=inventory_2 → material-symbols font-glyph fallback, mismatched).
+      return (
+        <svg {...svgProps} aria-hidden="true">
+          <rect x="3.5" y="3.5" width="7" height="7" rx="1.6" />
+          <rect x="13.5" y="3.5" width="7" height="7" rx="1.6" />
+          <rect x="3.5" y="13.5" width="7" height="7" rx="1.6" />
+          <rect x="13.5" y="13.5" width="7" height="7" rx="1.6" />
         </svg>
       );
     default:
