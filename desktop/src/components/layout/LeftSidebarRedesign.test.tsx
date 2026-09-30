@@ -110,14 +110,23 @@ describe('LeftSidebar A10 — chat hero + history', () => {
     expect(history.compareDocumentPosition(artifacts) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  // AC1: the Artifacts entry icon carries a FIXED accent color (always-on, not
-  // hover/active-gated) — the new twin entry is emphasized vs the muted History
-  // icon. Verified by an inline accent color on the icon wrapper.
-  it('gives the Artifacts row icon a fixed accent color (History icon stays muted)', () => {
+  // AC1: the Artifacts entry is highlighted by a FIXED accent color (always-on,
+  // not hover/active-gated) — the twin entry is emphasized vs the muted History
+  // row. The highlight lives on the icon + label; the left accent bar was removed.
+  it('gives the Artifacts row icon + label a fixed accent color (History row stays muted)', () => {
     renderSidebar();
+    const artRow = screen.getByTestId('artifacts-row');
+    // The left accent bar was removed.
+    expect(artRow.querySelector('[data-testid="artifacts-row-accent-bar"]')).toBeNull();
+    // The icon wrapper carries the always-on accent color (var-based → theme-tracked).
     const artIcon = screen.getByTestId('artifacts-row-icon');
-    // Always-on accent color inline style (var-based so it tracks the theme).
     expect(artIcon.getAttribute('style') || '').toContain('var(--color-primary)');
+    // The "Artifacts" label also carries the accent color.
+    const artLabel = Array.from(artRow.querySelectorAll('span')).find(
+      (s) => s.textContent === 'Artifacts',
+    );
+    expect(artLabel).toBeDefined();
+    expect(artLabel!.getAttribute('style') || '').toContain('var(--color-primary)');
     // History icon must NOT carry the accent — it stays the muted default.
     const histIcon = screen.getByTestId('history-row-icon');
     expect(histIcon.getAttribute('style') || '').not.toContain('var(--color-primary)');

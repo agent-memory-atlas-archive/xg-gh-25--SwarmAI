@@ -239,22 +239,15 @@ function LeftSidebar() {
           title="Artifacts"
           data-testid="artifacts-row"
         >
-          {/* H1 highlight: a left accent bar (same language as the Canvas rail
-              selected row) — marks Artifacts as the highlighted twin of History,
-              without a full-row background that would fight the hover state. */}
-          <span
-            aria-hidden="true"
-            data-testid="artifacts-row-accent-bar"
-            className="absolute left-0.5 top-1.5 bottom-1.5 w-[2.5px] rounded-full"
-            style={{ backgroundColor: 'var(--color-primary)' }}
-          />
-          {/* Fixed accent color (always-on, theme-tracked) — emphasizes the new
-              twin entry vs the muted History icon. NavSvgIcon strokes currentColor,
-              so an inline color on the wrapper tints the glyph. gallery = the 2×2
-              grid matching the overlay's card gallery (was inventory_2 → material
-              font-glyph fallback, mismatched with the stroke-SVG siblings). */}
+          {/* Highlight lives on the icon + label (theme-tracked primary color),
+              not on a left accent bar — the bar was removed. gallery = the 2×2
+              grid matching the overlay's card gallery. NavSvgIcon strokes
+              currentColor, so an inline color on the wrapper tints the glyph. */}
           <span data-testid="artifacts-row-icon" className="w-4 flex items-center justify-center" style={{ color: 'var(--color-primary)' }}><NavSvgIcon name="gallery" /></span>
-          <span className="flex-1 text-left text-[11.5px] font-mono tracking-wide">Artifacts</span>
+          <span
+            className="flex-1 text-left text-[11.5px] font-mono font-medium tracking-wide"
+            style={{ color: 'var(--color-primary)' }}
+          >Artifacts</span>
           <span className="text-[13px] text-[var(--color-text-faint)]">›</span>
         </button>
 

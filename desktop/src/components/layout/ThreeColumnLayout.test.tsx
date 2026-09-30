@@ -344,26 +344,26 @@ describe('ThreeColumnLayout - ChatContextBar Removal', () => {
   });
 
   /**
-   * Artifacts nav entry polish (run_270598db): the icon must be a hand-drawn
-   * NavSvgIcon <svg> (matching the sibling nav icons), NOT a material-symbols
-   * FONT-glyph fallback (the inventory_2 mismatch). Plus an H1 left accent bar.
+   * Artifacts nav entry polish: the entry is highlighted by an accent-colored
+   * icon + label (var(--color-primary)); the LEFT ACCENT BAR was removed (the
+   * icon is a hand-drawn NavSvgIcon <svg>, not a material-symbols font glyph).
    */
-  describe('Artifacts nav entry — icon style + highlight', () => {
-    it('AC1: the Artifacts row icon is an inline <svg>, not a material-symbols font glyph', () => {
+  describe('Artifacts nav entry — icon + label highlight, no accent bar', () => {
+    it('AC1: the Artifacts row icon is an inline <svg> tinted with the accent color', () => {
       renderThreeColumnLayout(<div data-testid="test-chat-content">x</div>);
       const iconWrap = screen.getByTestId('artifacts-row-icon');
       expect(iconWrap.querySelector('svg')).not.toBeNull();
       // The old fallback rendered a material-symbols span with the raw name text.
       expect(iconWrap.querySelector('.material-symbols-outlined')).toBeNull();
       expect(iconWrap.textContent).not.toContain('inventory_2');
+      // The icon wrapper carries the always-on accent color (var-based).
+      expect(iconWrap.getAttribute('style') || '').toContain('var(--color-primary)');
     });
 
-    it('AC2: the Artifacts row has an H1 left accent bar (var(--color-primary))', () => {
+    it('AC2: the Artifacts row has NO left accent bar (removed)', () => {
       renderThreeColumnLayout(<div data-testid="test-chat-content">x</div>);
       const row = screen.getByTestId('artifacts-row');
-      const bar = row.querySelector('[data-testid="artifacts-row-accent-bar"]');
-      expect(bar).not.toBeNull();
-      expect((bar as HTMLElement).getAttribute('style') || '').toContain('var(--color-primary)');
+      expect(row.querySelector('[data-testid="artifacts-row-accent-bar"]')).toBeNull();
     });
   });
 });
