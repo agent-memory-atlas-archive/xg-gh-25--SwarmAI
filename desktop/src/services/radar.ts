@@ -67,7 +67,10 @@ export const radarService = {
     params.append('workspace_id', workspaceId);
     params.append('limit', String(limit ?? 20));
     const response = await api.get(`/artifacts/recent?${params.toString()}`);
-    return response.data.map(artifactToCamelCase);
+    // HTTP-boundary contract: honor Promise<RadarArtifact[]> even if the body is not
+    // an array (backend hiccup / rolled-back shape). A bare `.map` on a non-array
+    // crashes every consumer; validate here so the array contract holds at the seam.
+    return Array.isArray(response.data) ? response.data.map(artifactToCamelCase) : [];
   },
 
   /** Fetch the workspace PRODUCT registry, role-typed (Artifacts B′ Run 2, AC1).
@@ -77,7 +80,10 @@ export const radarService = {
     const params = new URLSearchParams();
     params.append('workspace_id', workspaceId);
     const response = await api.get(`/artifacts/products?${params.toString()}`);
-    return response.data as Product[];
+    // HTTP-boundary contract: never trust the TS cast across the wire. A non-array body
+    // (backend hiccup / rolled-back shape) must degrade to [] so the Promise<Product[]>
+    // contract holds — otherwise the overlay's `data.filter` crashes on a non-iterable.
+    return Array.isArray(response.data) ? (response.data as Product[]) : [];
   },
 
   /**

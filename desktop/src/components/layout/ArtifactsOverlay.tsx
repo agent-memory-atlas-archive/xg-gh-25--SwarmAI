@@ -265,7 +265,10 @@ export function ArtifactsContent({ close, fetchProducts }: ArtifactsContentProps
   }, [searchRaw]);
 
   const groups = useMemo(() => {
-    const all = data ?? [];
+    // Defense in depth: the boundary (radar.fetchProducts) already guarantees an array,
+    // but a non-array `data` must NEVER crash this .filter — `?? []` only catches
+    // null/undefined, so an unexpected object would slip through. Array.isArray is total.
+    const all = Array.isArray(data) ? data : [];
     const filtered = all.filter((p) => {
       if (activeRole && p.role !== activeRole) return false;
       if (search) {
@@ -365,7 +368,7 @@ export function ArtifactsContent({ close, fetchProducts }: ArtifactsContentProps
           >
             <span className="text-[22px]" aria-hidden="true">🐝</span>
             <p className="text-[11px] text-[var(--color-text-muted)] max-w-[240px]">
-              {(data ?? []).length === 0
+              {(Array.isArray(data) ? data : []).length === 0
                 ? 'No products yet. Decks, reports, and files you create show up here.'
                 : 'No products match your search.'}
             </p>
