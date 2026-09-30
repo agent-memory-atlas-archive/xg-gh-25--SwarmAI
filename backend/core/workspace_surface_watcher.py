@@ -171,6 +171,24 @@ class WorkspaceSurfaceWatcher:
                 paths, "written", swarmws_root=str(self._root)
             ),
         )
+
+        # Shared PRODUCT registry write (Artifacts B′ Run 1). Runs on the RAW batch
+        # `paths`, NOT off the filtered verdicts.items() loop below — that loop drops
+        # review_worthy=False/process files (:175/:177), and a gitignored deck under
+        # Projects/*/assets is EXACTLY review_worthy=False/process (the git-ignore
+        # Layer-1 drop). Riding the loop would mean gitignored products — the ones
+        # that MUST surface — never register. ProductRegistry classifies raw paths
+        # independently. Off-loop via the same executors.run_in seam; fail-safe so a
+        # registry error never breaks surface emission.
+        try:
+            from core.product_registry import ProductRegistry
+
+            await executors.run_in(
+                "io", lambda: ProductRegistry(self._root).register_batch(paths)
+            )
+        except Exception:  # noqa: BLE001 — registry write must never break the watcher
+            logger.warning("WorkspaceSurfaceWatcher: product registry write failed", exc_info=True)
+
         for raw_path, verdict in verdicts.items():
             if not verdict.review_worthy:
                 continue
