@@ -4069,8 +4069,8 @@ class TestSecurityBoundaries:
 # Structured Requirement Spec (SRS) + User Story Gate — Phase 1
 # Design SSOT: Knowledge/Designs/2026-10-12-pipeline-requirement-spec-and-scope-depth-design.md
 # All new validator checks are WARN-only (routed through validate() warnings[],
-# NEVER through publish-time validate_artifact_data). Pure helpers (immutability,
-# render) are gate-free utilities.
+# NEVER through publish-time validate_artifact_data). Pure helpers (render) are
+# gate-free utilities.
 # ===========================================================================
 
 from scripts.pipeline_validator import (  # noqa: E402
@@ -4083,7 +4083,6 @@ from scripts.pipeline_validator import (  # noqa: E402
     _check_source_provenance,
     _check_invest,
     _check_requirements_axis,
-    validate_fr_immutability,
     render_requirements_md,
 )
 
@@ -4222,35 +4221,6 @@ class TestSchemaVersionGate:
         data = _reqs_block([_fr(kind="")], schema_version=1)
         warns = validate_requirements_block(data, "full")
         assert warns, "with schema_version present, a sourceless FR must warn (gate is non-vacuous)"
-
-
-class TestFRImmutability:
-    def test_rewriting_confirmed_statement_blocks(self):
-        """AC6 (O1): rewriting a confirmed FR's statement -> BLOCK-class error."""
-        prev = [_fr(id="FR-1", statement="Original", status="confirmed")]
-        new = [_fr(id="FR-1", statement="Rewritten", status="confirmed")]
-        errs = validate_fr_immutability(prev, new)
-        assert errs and any("FR-1" in e for e in errs), errs
-
-    def test_rewriting_confirmed_id_blocks(self):
-        """AC6 (O1): changing a confirmed FR's id (renumber) -> BLOCK."""
-        prev = [_fr(id="FR-1", status="confirmed")]
-        new = [_fr(id="FR-2", status="confirmed", statement="Do X")]  # same stmt, renumbered
-        errs = validate_fr_immutability(prev, new)
-        assert errs, "renumbering a confirmed FR must block"
-
-    def test_appending_new_fr_ok(self):
-        """AC6 (O1): appending a new FR + patching status assumed->confirmed is allowed."""
-        prev = [_fr(id="FR-1", status="assumed")]
-        new = [_fr(id="FR-1", status="confirmed"),  # status upgrade allowed
-               _fr(id="FR-2", status="assumed", statement="New req")]  # append allowed
-        assert validate_fr_immutability(prev, new) == []
-
-    def test_source_kind_upgrade_allowed(self):
-        """AC6 (O1 clause d): assumption->user-stated source.kind upgrade is allowed."""
-        prev = [_fr(id="FR-1", kind="assumption", status="confirmed")]
-        new = [_fr(id="FR-1", kind="user-stated", status="confirmed")]
-        assert validate_fr_immutability(prev, new) == []
 
 
 class TestRenderRequirementsMd:

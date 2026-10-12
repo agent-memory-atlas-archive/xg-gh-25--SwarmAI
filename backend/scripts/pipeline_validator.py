@@ -1256,37 +1256,6 @@ def validate_requirements_block(data: dict, profile: str) -> list[str]:
     return warns
 
 
-def validate_fr_immutability(prev: list[dict], new: list[dict]) -> list[str]:
-    """AC6/O1: a confirmed FR's `id` and `statement` are IMMUTABLE downstream.
-    BLOCK-class (returns error strings) if a requirement that was `confirmed` in
-    `prev` has its statement changed OR disappears (renumber/delete) in `new`.
-    ALLOWED downstream writes (NOT flagged): appending a new requirement, upgrading
-    status (assumed->confirmed), filling acceptance, and the source.kind single-
-    direction upgrade (assumption->user-stated, O1 clause d).
-
-    PURE function — not wired into any gate (zero publish/completion blast radius).
-    Callable by Phase-2/3 stages + tests."""
-    errs: list[str] = []
-    new_by_id = {r.get("id"): r for r in new if isinstance(r, dict)}
-    for pr in prev:
-        if not isinstance(pr, dict) or pr.get("status") != "confirmed":
-            continue  # only confirmed FRs are frozen
-        pid = pr.get("id")
-        nr = new_by_id.get(pid)
-        if nr is None:
-            errs.append(
-                f"O1 immutability: confirmed requirement {pid} was removed/renumbered "
-                f"downstream — a minted FR id is a permanent anchor (never reused)."
-            )
-            continue
-        if str(pr.get("statement", "")) != str(nr.get("statement", "")):
-            errs.append(
-                f"O1 immutability: confirmed requirement {pid} statement was rewritten "
-                f"downstream (EVALUATE is the sole author of a confirmed statement)."
-            )
-    return errs
-
-
 def render_requirements_md(data: dict) -> str:
     """AC7: render the requirements block as human-readable markdown for the
     Pipeline card / Canvas. Per-FR: id, work_class, source, status, GWT AC.
