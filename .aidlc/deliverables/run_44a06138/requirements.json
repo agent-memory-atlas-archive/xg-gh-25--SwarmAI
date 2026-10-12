@@ -1,0 +1,98 @@
+{
+  "schema_version": 1,
+  "requirements": [
+    {
+      "id": "FR-1",
+      "statement": "Every caller-supplied path identifier (project, run_id, entry.file) is containment-validated before any filesystem path is built from it",
+      "work_class": "bug",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG: pipeline is primary deliver engine, must be clean; Kiro #1 + adversarial #1b"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "a .. or absolute or sibling-escaping identifier",
+          "when": "publish or read is called",
+          "then": "it raises before any mkdir/write/read and nothing lands outside the project"
+        }
+      ]
+    },
+    {
+      "id": "FR-2",
+      "statement": "Validation happens BEFORE the write so a rejected publish writes nothing (fail-closed order)",
+      "work_class": "bug",
+      "source": {
+        "kind": "user-stated",
+        "ref": "Kiro #2"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "an invalid identifier at CLI cmd_publish",
+          "when": "publish runs",
+          "then": "exit non-zero AND zero artifact files created"
+        }
+      ]
+    },
+    {
+      "id": "FR-3",
+      "statement": "A stage-linked publish to a non-existent run is rejected (no phantom run creation)",
+      "work_class": "bug",
+      "source": {
+        "kind": "user-stated",
+        "ref": "Kiro #3"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "run_id with no runs/<id>/run.json",
+          "when": "stage-linked publish",
+          "then": "raises/404; no runs/<id>/ dir minted"
+        }
+      ]
+    },
+    {
+      "id": "FR-4",
+      "statement": "PublishRequest.run_id is a required str for OpenAPI honesty",
+      "work_class": "bug",
+      "source": {
+        "kind": "user-stated",
+        "ref": "Kiro #13"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "a publish request with absent run_id",
+          "when": "validated by Pydantic",
+          "then": "422, and the schema shows run_id required"
+        }
+      ]
+    }
+  ],
+  "clarifications": [
+    {
+      "qid": "Q1",
+      "question": "run_id format contract?",
+      "options": [
+        "A. ^run_[A-Za-z0-9_]+$",
+        "B. looser",
+        "X. Other"
+      ],
+      "answer": "A. ^run_[A-Za-z0-9_]+$",
+      "answered_by": "self",
+      "resolution": "self-answer: scanned 831 live run dirs, 100% match ^run_[A-Za-z0-9_]+$; _gen_run_id emits run_<8hex>, strictly narrower"
+    },
+    {
+      "qid": "Q2",
+      "question": "Does fixing project traversal risk breaking legit multi-project publishes?",
+      "options": [
+        "A. no — all real projects are direct children of Projects/",
+        "X. Other"
+      ],
+      "answer": "A. no — all real projects are direct children of Projects/",
+      "answered_by": "self",
+      "resolution": "self-answer: all 9 live projects are direct children of Projects/; is_relative_to(projects_root) passes every one"
+    }
+  ]
+}
