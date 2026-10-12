@@ -4242,22 +4242,19 @@ def cmd_run_report(args, reg: ArtifactRegistry) -> str:
     for s in stages:
         stage_name = s.get("stage", "?")
         art_id = s.get("artifact_id")
-        if art_id and art_id != "changeset":
+        if art_id:
             loaded = _load_artifact_for_metrics(args.project, art_id)
             if loaded:
                 art_data[stage_name] = loaded
-        elif art_id == "changeset" and run_date:
-            # Changeset stored as date-stamped file — load matching run date
-            art_data["build"] = _load_artifact_by_date(args.project, "changeset", run_date) or {}
 
     # NOTE (#4): the old date-scoped fallback that reloaded each stage from a bare
     # top-level {type}-{date}.json was DELETED. It overwrote this run's artifact (loaded
     # above by run.json artifact_id) with a run-blind bare file whenever a recommended
     # field was absent (e.g. evaluate lacking scores) — and a bare file is run-blind
     # (last same-day writer wins), so a sibling run's data contaminated this report.
-    # The report now trusts ONLY run.json's per-stage artifact_id. A stage genuinely
-    # without an artifact_id simply shows no data (honest) rather than borrowing another
-    # run's. (changeset above keeps its own by-date load — a separate concern.)
+    # The report now trusts ONLY run.json's per-stage artifact_id (loaded via the
+    # manifest). A stage genuinely without an artifact_id simply shows no data (honest)
+    # rather than borrowing another run's. No bare top-level date-file reader remains.
 
     # ── Determine skipped stages ──────────────────────────────────────
     ALL_STAGES = ["evaluate", "think", "plan", "build", "review", "test", "deliver", "reflect"]
@@ -5427,58 +5424,6 @@ def _load_artifact_for_metrics(project: str, artifact_id: str) -> dict | None:
                 except (json.JSONDecodeError, OSError):
                     return None
     return None
-
-
-def _load_latest_artifact_by_type(project: str, artifact_type: str) -> dict | None:
-    """Load the most recent artifact file by type prefix (e.g. 'evaluation', 'changeset').
-
-    ⚠️ TOP-LEVEL ONLY BY DESIGN: this scans only the top-level ``.artifacts/``
-    dir, never ``runs/<run_id>/``. RUN-SCOPED artifacts must be read via the
-    manifest ``entry['file']`` (get_artifact/discover), NOT reconstructed by
-    name — their on-disk names carry an ``-<artifact_id>`` suffix (run_fc95d24c)
-    precisely because same-type same-day names collide within a run. Do NOT add
-    a ``runs/<id>/{type}-{date}.json`` glob here; it would miss the id-suffixed
-    files. Top-level names remain the bare ``{type}-{date}.json`` scheme.
-
-    Artifacts are stored as <type>-YYYYMMDD.json in .artifacts/ directory.
-    Returns the most recent one (sorted by filename descending).
-
-    WARNING: Only use for non-report contexts (e.g. metrics). For report generation,
-    use _load_artifact_by_date() to prevent cross-contamination between runs.
-    """
-    ws = _get_workspace()
-    artifacts_dir = ws / "Projects" / project / ".artifacts"
-    if not artifacts_dir.is_dir():
-        return None
-    try:
-        candidates = sorted(
-            [f for f in artifacts_dir.iterdir()
-             if f.name.startswith(f"{artifact_type}-") and f.suffix == ".json"],
-            key=lambda p: p.name,
-            reverse=True,
-        )
-        if not candidates:
-            return None
-        return json.loads(candidates[0].read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def _load_artifact_by_date(project: str, artifact_type: str, date_str: str) -> dict | None:
-    """Load artifact file matching exact date (YYYYMMDD format).
-
-    Prevents cross-contamination by only loading artifacts from the same day
-    as the pipeline run. Returns None if no matching file exists.
-    """
-    ws = _get_workspace()
-    artifacts_dir = ws / "Projects" / project / ".artifacts"
-    target = artifacts_dir / f"{artifact_type}-{date_str}.json"
-    if not target.exists():
-        return None
-    try:
-        return json.loads(target.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
 
 
 def cmd_run_metrics(args, reg: ArtifactRegistry) -> None:

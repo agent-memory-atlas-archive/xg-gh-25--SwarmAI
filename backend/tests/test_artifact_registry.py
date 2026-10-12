@@ -598,7 +598,9 @@ class TestRunScopedFilenameCollision:
 
     def test_top_level_filename_scheme_unchanged(self, workspace, registry):
         """Top-level (no run_id) filenames must stay byte-identical to the old
-        scheme so the by-name readers (_load_artifact_by_date etc.) keep working."""
+        scheme: `{type}-YYYYMMDD.json`, no artifact_id suffix. (The run-blind
+        by-name date readers that once consumed this scheme were deleted in #4;
+        the invariant is kept for non-run-scoped bare publishes.)"""
         project = "TopLevelApp"
         (workspace / "Projects" / project).mkdir()
 

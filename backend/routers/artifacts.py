@@ -688,6 +688,11 @@ class PublishRequest(BaseModel):
     producer: str
     summary: str
     topic: str = ""
+    # #4: run_id is REQUIRED in practice (fail-closed in the handler). A publish
+    # without it would write a bare top-level {type}-{date}.json — a run-blind file
+    # that the last same-day writer overwrites, the cross-run contamination source.
+    # Optional in the model (clean 400, not a 422) but rejected by the handler.
+    run_id: str | None = None
 
 
 class AdvanceRequest(BaseModel):
@@ -770,6 +775,17 @@ async def get_pipeline_state(
 @router.post("/artifacts/pipeline/publish")
 async def publish_pipeline_artifact(req: PublishRequest) -> dict:
     """Publish a new artifact for a project."""
+    # #4 fail-closed: a publish without run_id would write a run-blind bare
+    # top-level file (cross-run contamination source). Reject it — matching the
+    # CLI's `--stage publish without --run-id` guard. The ability to guess a
+    # target run is the root of cross-run contamination.
+    if not req.run_id or not req.run_id.strip():
+        raise HTTPException(
+            status_code=400,
+            detail=("run_id is required: a run-blind publish writes a bare "
+                    "top-level artifact that a sibling run can overwrite. "
+                    "Pass run_id to publish run-scoped."),
+        )
     reg = _get_registry()
 
     def _publish():
@@ -780,6 +796,7 @@ async def publish_pipeline_artifact(req: PublishRequest) -> dict:
             producer=req.producer,
             summary=req.summary,
             topic=req.topic,
+            run_id=req.run_id,
         )
 
     try:

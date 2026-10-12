@@ -216,10 +216,11 @@ class ArtifactRegistry:
         # 1st on disk while the manifest kept both ids, so id1 resolved to id2's
         # data (build lost to deliver; think lost to plan — both hit in one
         # session). The id makes run-scoped filenames unique. TOP-LEVEL names
-        # are LEFT UNCHANGED ("{type}-{date}[-topic].json") because the by-name
-        # readers (_load_artifact_by_date / _load_latest_artifact_by_type) parse
-        # the top-level dir by that exact scheme; run-scoped artifacts are ALWAYS
-        # read via the manifest entry['file'], never reconstructed by name.
+        # are LEFT UNCHANGED ("{type}-{date}[-topic].json"): the run-blind by-name
+        # date readers that once relied on this scheme were DELETED (#4 — they fed
+        # cross-run report contamination); the top-level name is kept only for
+        # non-run-scoped bare publishes. Run-scoped artifacts are ALWAYS read via
+        # the manifest entry['file'], never reconstructed by name.
         # The id is APPENDED (not prepended) so `startswith("{type}-")` filters
         # keep matching. bare_filename feeds BOTH the disk write (below) and the
         # manifest `filename` — computing it once keeps them consistent.
