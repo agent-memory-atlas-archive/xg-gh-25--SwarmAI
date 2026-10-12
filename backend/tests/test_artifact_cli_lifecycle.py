@@ -890,32 +890,44 @@ class TestAdvanceDriftGuard:
         """
         import scripts.artifact_cli as cli
         from datetime import datetime, timezone
+        from core.artifact_registry import ArtifactRegistry
 
-        # Build a run created "today" so the date-scoped artifact loader matches.
         today = datetime.now(timezone.utc)
         run_id = "run_qualscore"
+        monkeypatch.setenv("SWARM_WORKSPACE", str(workspace))
+        monkeypatch.setattr(cli, "_get_workspace", lambda: workspace)
+
+        # project DDD docs (publish/report expect the project dir to exist).
+        proj = workspace / "Projects" / "TestProject"
+        for name in ("PRODUCT.md", "TECH.md", "IMPROVEMENT.md", "PROJECT.md"):
+            (proj / name).write_text("# T\n")
+
+        # Publish a RUN-SCOPED evaluation artifact (manifest + runs/<id>/ file) with a
+        # QUALITATIVE (string) dimension score — the report loads it via the run.json
+        # artifact_id (manifest path), NOT the deleted date-scoped fallback (#4).
+        reg = ArtifactRegistry(workspace)
+        ev = reg.publish(project="TestProject", artifact_type="evaluation",
+                         producer="test", summary="qualscore", run_id=run_id,
+                         data={
+                             "scores": {"strategic": "high", "priority": 3.0,
+                                        "roi": "high — strong fit"},
+                             "recommendation": "GO",
+                         })
+        ev_id = ev["id"] if isinstance(ev, dict) else ev
+
         run_dir = workspace / "Projects" / "TestProject" / ".artifacts" / "runs" / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "run.json").write_text(json.dumps({
             "id": run_id, "project": "TestProject",
             "requirement": "x", "profile": "trivial", "status": "running",
-            "stages": [{"stage": "evaluate", "status": "completed"}],
+            "stages": [{"stage": "evaluate", "status": "completed", "artifact_id": ev_id}],
             "created_at": today.isoformat(), "updated_at": today.isoformat(),
         }))
 
-        # Date-scoped evaluation artifact with a QUALITATIVE (string) dimension score.
-        date_str = today.isoformat()[:10].replace("-", "")
-        artifacts_dir = workspace / "Projects" / "TestProject" / ".artifacts"
-        (artifacts_dir / f"evaluation-{date_str}.json").write_text(json.dumps({
-            "scores": {"strategic": "high", "priority": 3.0, "roi": "high — strong fit"},
-            "recommendation": "GO",
-        }))
-
-        monkeypatch.setattr(cli, "_get_workspace", lambda: workspace)
         args = type("A", (), {"project": "TestProject", "run_id": run_id, "force": True})()
 
         # On buggy code this raises ValueError before REPORT.md is written.
-        cli.cmd_run_report(args, None)
+        cli.cmd_run_report(args, reg)
 
         report_path = run_dir / "REPORT.md"
         assert report_path.exists(), "REPORT.md should be written"

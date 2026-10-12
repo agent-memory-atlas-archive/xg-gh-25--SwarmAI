@@ -4250,38 +4250,14 @@ def cmd_run_report(args, reg: ArtifactRegistry) -> str:
             # Changeset stored as date-stamped file — load matching run date
             art_data["build"] = _load_artifact_by_date(args.project, "changeset", run_date) or {}
 
-    # Date-scoped fallback for stages without manifest-linked artifacts
-    # Only loads artifacts from the SAME DATE as the run (prevents cross-contamination)
-    if run_date:
-        if "evaluate" not in art_data or not art_data["evaluate"].get("scores"):
-            dated = _load_artifact_by_date(args.project, "evaluation", run_date)
-            if dated:
-                art_data["evaluate"] = dated
-        if "plan" not in art_data and "think" not in art_data:
-            dated = _load_artifact_by_date(args.project, "design_doc", run_date)
-            if dated:
-                art_data["plan"] = dated
-        elif "plan" in art_data and not art_data["plan"].get("approach"):
-            # plan artifact from manifest lacks approach — try date-scoped
-            dated = _load_artifact_by_date(args.project, "design_doc", run_date)
-            if dated and dated.get("approach"):
-                art_data["plan"] = dated
-        if "build" not in art_data or not art_data["build"].get("files_changed"):
-            dated = _load_artifact_by_date(args.project, "changeset", run_date)
-            if dated:
-                art_data["build"] = dated
-        if "review" not in art_data:
-            dated = _load_artifact_by_date(args.project, "review", run_date)
-            if dated:
-                art_data["review"] = dated
-        if "test" not in art_data or not art_data["test"].get("total"):
-            dated = _load_artifact_by_date(args.project, "test_report", run_date)
-            if dated:
-                art_data["test"] = dated
-        if "deliver" not in art_data or not art_data["deliver"].get("title"):
-            dated = _load_artifact_by_date(args.project, "delivery", run_date)
-            if dated:
-                art_data["deliver"] = dated
+    # NOTE (#4): the old date-scoped fallback that reloaded each stage from a bare
+    # top-level {type}-{date}.json was DELETED. It overwrote this run's artifact (loaded
+    # above by run.json artifact_id) with a run-blind bare file whenever a recommended
+    # field was absent (e.g. evaluate lacking scores) — and a bare file is run-blind
+    # (last same-day writer wins), so a sibling run's data contaminated this report.
+    # The report now trusts ONLY run.json's per-stage artifact_id. A stage genuinely
+    # without an artifact_id simply shows no data (honest) rather than borrowing another
+    # run's. (changeset above keeps its own by-date load — a separate concern.)
 
     # ── Determine skipped stages ──────────────────────────────────────
     ALL_STAGES = ["evaluate", "think", "plan", "build", "review", "test", "deliver", "reflect"]
