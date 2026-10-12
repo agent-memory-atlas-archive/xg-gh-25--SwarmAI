@@ -874,7 +874,11 @@ def _auto_validate_before_advance(
     for s in reversed(stages):
         status = s.get("status", "")
         if status in ("done", "completed"):
-            current_stage = s.get("stage", "?")
+            # No default: the `if not current_stage` guard below depends on a
+            # key-less (corrupt) record staying falsy — a "?" default would make
+            # it truthy and run validation against a bogus stage. (3b: the dead
+            # `name` fallback is removed; the None default is preserved on purpose.)
+            current_stage = s.get("stage")
             current_record = s
             break
 

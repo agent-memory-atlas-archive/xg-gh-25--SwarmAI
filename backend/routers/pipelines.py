@@ -1,6 +1,6 @@
 """Pipeline runs API router.
 
-Reads pipeline run state from ``.artifacts/runs/*/run.json`` files (with legacy ``pipeline-run-*.json`` fallback)
+Reads pipeline run state from ``.artifacts/runs/*/run.json`` files
 across all projects in SwarmWS. Serves real data to the Radar pipeline panel.
 
 Key endpoints:
@@ -150,9 +150,7 @@ def _load_pipeline_runs() -> list[dict]:
         if not artifacts_dir.exists():
             continue
 
-        seen_ids: set[str] = set()
-
-        # New path: .artifacts/runs/*/run.json
+        # Run path: .artifacts/runs/*/run.json
         runs_subdir = artifacts_dir / "runs"
         if runs_subdir.exists():
             for rd in runs_subdir.iterdir():
@@ -161,21 +159,9 @@ def _load_pipeline_runs() -> list[dict]:
                     try:
                         state = json.loads(rf.read_text(encoding="utf-8"))
                         state["_project"] = project_dir.name
-                        seen_ids.add(state.get("id", ""))
                         runs.append(state)
                     except (json.JSONDecodeError, OSError, KeyError) as e:
                         logger.debug("Skipping %s: %s", rf, e)
-
-        # Legacy path: .artifacts/pipeline-run-*.json
-        for run_file in artifacts_dir.glob("pipeline-run-*.json"):
-            try:
-                state = json.loads(run_file.read_text(encoding="utf-8"))
-                if state.get("id") in seen_ids:
-                    continue
-                state["_project"] = project_dir.name
-                runs.append(state)
-            except (json.JSONDecodeError, OSError, KeyError) as e:
-                logger.debug("Skipping %s: %s", run_file.name, e)
 
     runs.sort(key=lambda r: r.get("updated_at", ""), reverse=True)
     return runs

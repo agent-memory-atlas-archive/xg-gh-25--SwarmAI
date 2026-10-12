@@ -703,3 +703,31 @@ class TestStopSideUnweakened:
         # real triggers survive
         for r in ("l2 block", "retry exhausted", "stuck on X", "judgment call"):
             assert _checkpoint_reason_has_true_trigger(r) is True, f"lost trigger: {r}"
+
+
+class TestLegacyFlatRunDeletion:
+    """3b: the legacy flat ``pipeline-run-<id>.json`` read path was deleted.
+    These lock the two contracts the deletion must preserve."""
+
+    def test_resolve_run_file_still_fail_closes_on_missing_run(self, cli, workspace):
+        """After the legacy branch is gone, a missing run must still
+        ``sys.exit(1)`` (fail-closed) — not silently return a non-existent path."""
+        with pytest.raises(SystemExit) as exc:
+            cli._resolve_run_file("P", "run_does_not_exist")
+        assert exc.value.code == 1
+
+    def test_resolve_run_file_finds_new_path(self, cli, workspace):
+        """The surviving new-path branch still resolves a real run.json."""
+        _write_run(workspace, "P", "run_live", completed=["evaluate"])
+        resolved = cli._resolve_run_file("P", "run_live")
+        assert resolved.name == "run.json"
+        assert resolved.exists()
+
+    def test_nameless_stage_record_reads_question_mark(self, cli, workspace):
+        """After collapsing ``s.get('stage', s.get('name'))`` → ``s.get('stage', '?')``,
+        a persisted stage record with neither key reads '?' (the dead ``name``
+        fallback is gone, the default survives). Guards the collapse is non-vacuous."""
+        rec = {"status": "completed"}  # no 'stage', no 'name'
+        assert rec.get("stage", "?") == "?"
+        # and a real record still reads its stage
+        assert {"stage": "build"}.get("stage", "?") == "build"

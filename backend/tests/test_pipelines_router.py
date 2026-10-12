@@ -42,9 +42,12 @@ def client(workspace):
 
 
 def _create_run(workspace: Path, project: str, run_id: str, **overrides) -> Path:
-    """Helper: create a pipeline run file on disk."""
-    artifacts_dir = workspace / "Projects" / project / ".artifacts"
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    """Helper: create a pipeline run file on disk at the run path
+    (``.artifacts/runs/<run_id>/run.json``). 3b: the legacy flat
+    ``pipeline-run-<id>.json`` layout + its reader were deleted; this helper now
+    writes the only layout the router reads."""
+    run_dir = workspace / "Projects" / project / ".artifacts" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     # Use current time as default for running pipelines (avoids stale detection)
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -67,7 +70,7 @@ def _create_run(workspace: Path, project: str, run_id: str, **overrides) -> Path
     if "abandon_reason" in overrides:
         state["abandon_reason"] = overrides["abandon_reason"]
 
-    run_file = artifacts_dir / f"pipeline-run-{run_id}.json"
+    run_file = run_dir / "run.json"
     run_file.write_text(json.dumps(state), encoding="utf-8")
     return run_file
 
@@ -185,9 +188,13 @@ class TestPipelinesEndpoint:
         # Create a valid run
         _create_run(workspace, "Proj", "run_valid")
 
-        # Create a corrupt file
-        artifacts_dir = workspace / "Projects" / "Proj" / ".artifacts"
-        (artifacts_dir / "pipeline-run-run_corrupt.json").write_text("not json{{{")
+        # Create a corrupt run at the run path (3b: corrupt-skip must stay
+        # covered on the only layout the router reads)
+        corrupt_dir = (
+            workspace / "Projects" / "Proj" / ".artifacts" / "runs" / "run_corrupt"
+        )
+        corrupt_dir.mkdir(parents=True, exist_ok=True)
+        (corrupt_dir / "run.json").write_text("not json{{{")
 
         resp = client.get("/api/pipelines")
         assert resp.status_code == 200

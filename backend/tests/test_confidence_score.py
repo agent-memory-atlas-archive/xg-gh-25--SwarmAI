@@ -50,13 +50,16 @@ def _make_run_dir(
             "project": "TestProject",
             "profile": "full",
             "status": "running",
+            # Realistic persisted shape: stage records key on "stage" with
+            # status "completed" (the normalizer + _append_stage_to_run both emit
+            # "stage"; "name"/"complete" never reach a persisted run.json). 3b.
             "stages": [
-                {"name": "evaluate", "status": "complete"},
-                {"name": "think", "status": "complete"},
-                {"name": "plan", "status": "complete"},
-                {"name": "build", "status": "complete"},
-                {"name": "review", "status": "complete"},
-                {"name": "test", "status": "complete"},
+                {"stage": "evaluate", "status": "completed"},
+                {"stage": "think", "status": "completed"},
+                {"stage": "plan", "status": "completed"},
+                {"stage": "build", "status": "completed"},
+                {"stage": "review", "status": "completed"},
+                {"stage": "test", "status": "completed"},
             ],
             "taste_decisions": [],
         }
@@ -259,7 +262,7 @@ class TestConfidenceScoring:
                 "profile": "full",
                 "status": "running",
                 "stages": [
-                    {"name": "plan", "status": "complete"},
+                    {"stage": "plan", "status": "completed"},
                 ],
                 "taste_decisions": [],
                 "completion_audit": {
@@ -300,7 +303,7 @@ class TestConfidenceScoring:
                 "profile": "full",
                 "status": "running",
                 "stages": [
-                    {"name": "plan", "status": "complete"},
+                    {"stage": "plan", "status": "completed"},
                 ],
                 "taste_decisions": [],
                 "completion_audit": {
@@ -340,7 +343,7 @@ class TestConfidenceScoring:
                 "profile": "full",
                 "status": "running",
                 "stages": [
-                    {"name": "plan", "status": "complete"},
+                    {"stage": "plan", "status": "completed"},
                 ],
                 "taste_decisions": [],
                 "completion_audit": {
@@ -380,7 +383,7 @@ class TestConfidenceScoring:
                 "profile": "full",
                 "status": "running",
                 "stages": [
-                    {"name": "plan", "status": "complete"},
+                    {"stage": "plan", "status": "completed"},
                     {
                         "stage": "deliver",
                         "status": "complete",
@@ -425,7 +428,7 @@ class TestConfidenceScoring:
                 "profile": "full",
                 "status": "running",
                 "stages": [
-                    {"name": "plan", "status": "complete"},
+                    {"stage": "plan", "status": "completed"},
                 ],
                 "taste_decisions": [],
                 "completion_audit": {
@@ -485,6 +488,28 @@ class TestConfidenceScoring:
         assert len(audit_rules) == 0
         assert len(audit_penalties) == 0
 
+    def test_design_doc_available_on_realistic_persisted_run(self):
+        """A real persisted run.json uses stage records keyed 'stage' (not 'name')
+        with status 'completed' (not 'complete'). The +1 design_doc_available point
+        MUST fire for such a run. (3b: pre-existing bug — line 181 keyed 'name' +
+        'complete', so the point was dead on every real run; the name fallback was
+        the only reason the unrealistic 'name'-keyed test fixtures masked it.)"""
+        d = _make_run_dir(
+            run_json={
+                "id": "run_realistic", "project": "P", "profile": "full",
+                "status": "running",
+                "stages": [
+                    {"stage": "evaluate", "status": "completed"},
+                    {"stage": "plan", "status": "completed"},
+                    {"stage": "build", "status": "completed"},
+                ],
+                "taste_decisions": [],
+            }
+        )
+        result = _run_score(d)
+        rules = [b["rule"] for b in result["breakdown"]]
+        assert "design_doc_available" in rules
+
 
 class TestACVerification:
     """Test AC verification scoring — verified vs claimed vs failed."""
@@ -497,7 +522,7 @@ class TestACVerification:
                 "project": "TestProject",
                 "profile": "full",
                 "status": "running",
-                "stages": [{"name": "plan", "status": "complete"}],
+                "stages": [{"stage": "plan", "status": "completed"}],
                 "taste_decisions": [],
                 "ac_verification": {
                     "status": "verified",
@@ -527,7 +552,7 @@ class TestACVerification:
                 "project": "TestProject",
                 "profile": "full",
                 "status": "running",
-                "stages": [{"name": "plan", "status": "complete"}],
+                "stages": [{"stage": "plan", "status": "completed"}],
                 "taste_decisions": [],
                 "ac_verification": {"status": "claimed"},
             },
@@ -552,7 +577,7 @@ class TestACVerification:
                 "project": "TestProject",
                 "profile": "full",
                 "status": "running",
-                "stages": [{"name": "plan", "status": "complete"}],
+                "stages": [{"stage": "plan", "status": "completed"}],
                 "taste_decisions": [],
                 "ac_verification": {
                     "status": "failed",

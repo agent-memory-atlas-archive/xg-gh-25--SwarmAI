@@ -178,7 +178,8 @@ def calculate_score(
     # +1: design_doc was available
     stages = run.get("stages", [])
     plan_done = any(
-        s.get("name") == "plan" and s.get("status") == "complete" for s in stages
+        s.get("stage") == "plan" and s.get("status") in ("completed", "complete")
+        for s in stages
     )
     if plan_done:
         breakdown.append({
@@ -193,7 +194,7 @@ def calculate_score(
     audit = run.get("completion_audit", {})
     if not audit:
         deliver_stage = next(
-            (s for s in stages if s.get("stage", s.get("name")) == "deliver"),
+            (s for s in stages if s.get("stage") == "deliver"),
             {},
         )
         audit = deliver_stage.get("completion_audit", {})

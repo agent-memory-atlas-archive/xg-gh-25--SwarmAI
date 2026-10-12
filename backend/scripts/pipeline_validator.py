@@ -1811,7 +1811,7 @@ def _check_security_boundaries(
 
     # Locate the evaluation stage's artifact and read cross_boundary.
     eval_stage = next(
-        (s for s in stages_list if s.get("stage", s.get("name")) == "evaluate"), None
+        (s for s in stages_list if s.get("stage", "?") == "evaluate"), None
     )
     eval_art_id = eval_stage.get("artifact_id") if eval_stage else None
     eval_data = _load_artifact_data(project, run_id, eval_art_id) if eval_art_id else None
@@ -2967,7 +2967,7 @@ def _check_semantic_depth(
         review_findings = 0
         test_failures = 0
         for s in run.get("stages", []):
-            s_name = s.get("stage", s.get("name", ""))
+            s_name = s.get("stage", "")
             s_art_id = s.get("artifact_id")
             if not s_art_id:
                 continue
@@ -3116,9 +3116,9 @@ def _check_output_routing(
             stages_list = run.get("stages", [])
             prior_produced = False
             for s in stages_list:
-                if s.get("stage", s.get("name")) == stage:
+                if s.get("stage", "?") == stage:
                     break
-                s_routing = STAGE_ROUTING.get(s.get("stage", s.get("name", "")), {})
+                s_routing = STAGE_ROUTING.get(s.get("stage", ""), {})
                 if required_type in s_routing.get("produces", []):
                     if s.get("status") in ("completed", "done"):
                         prior_produced = True
@@ -3301,7 +3301,7 @@ def validate(project: str, run_id: str, stage: str) -> dict[str, Any]:
     # Find the stage record for the stage being validated
     stage_record = None
     for s in stages_list:
-        if s.get("stage", s.get("name")) == stage:
+        if s.get("stage", "?") == stage:
             stage_record = s
 
     if stage_record is None:
@@ -3557,7 +3557,7 @@ def validate(project: str, run_id: str, stage: str) -> dict[str, Any]:
 
                     # Cross-reference: load PLAN artifact ACs and check coverage
                     plan_stage = next(
-                        (s for s in stages_list if s.get("stage", s.get("name")) == "plan"),
+                        (s for s in stages_list if s.get("stage", "?") == "plan"),
                         None,
                     )
                     if plan_stage and plan_stage.get("artifact_id"):
@@ -3696,7 +3696,7 @@ def validate(project: str, run_id: str, stage: str) -> dict[str, Any]:
             build_data = None  # PE-1 fix: initialize before conditional assignment
             # Look for frontend files in the build stage's changeset artifact
             build_stage = next(
-                (s for s in stages_list if s.get("stage", s.get("name")) == "build"),
+                (s for s in stages_list if s.get("stage", "?") == "build"),
                 None,
             )
             if build_stage and build_stage.get("artifact_id"):
@@ -3863,7 +3863,7 @@ def validate(project: str, run_id: str, stage: str) -> dict[str, Any]:
                         ac_pass_count = ac_driven.get("pass", 0)
                         # Load BUILD artifact to get ac_coverage count
                         build_stage = next(
-                            (s for s in stages_list if s.get("stage", s.get("name")) == "build"),
+                            (s for s in stages_list if s.get("stage", "?") == "build"),
                             None,
                         )
                         if build_stage and build_stage.get("artifact_id"):
@@ -4276,7 +4276,7 @@ def _check_profile_respected(stage: str, profile: str) -> bool:
 def _find_stage_record(stage_name: str, stages_list: list[dict]) -> dict | None:
     """Find the most recent record for a given stage name."""
     for s in reversed(stages_list):
-        if s.get("stage", s.get("name")) == stage_name:
+        if s.get("stage", "?") == stage_name:
             return s
     return None
 
@@ -4349,7 +4349,7 @@ def main() -> None:
         total_warnings = 0
 
         for stage_rec in run.get("stages", []):
-            stage_name = stage_rec.get("stage", stage_rec.get("name"))
+            stage_name = stage_rec.get("stage", "?")
             if stage_rec.get("status") in ("completed", "done", "running"):
                 result = validate(args.project, args.run_id, stage_name)
                 all_results.append(result)
