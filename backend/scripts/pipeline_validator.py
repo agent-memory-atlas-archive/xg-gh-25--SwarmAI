@@ -857,6 +857,40 @@ def _safe_list(value) -> list:
     return value if isinstance(value, list) else []
 
 
+# Canonical AC/FR/NFR id grammar, anchored with a BOUNDARY (#2). Without the trailing
+# (?![\w-]) a prefix-collision token (`FR-1-placeholder`, `AC3garbage`, `NFR-2unrelated`)
+# matches as the real id (`FR-1`/`AC3`/`NFR-2`), letting BUILD ac_coverage mark an
+# uncovered PLAN AC "covered". The boundary rejects any trailing word-char OR hyphen —
+# so `AC1`, `AC1:`, `AC1 — x`, `FR-1: stmt` match, but `AC1garbage`/`FR-1-foo` do not.
+# (Scope note: the AC-coverage path uses digit-only ids — no `AC5b`/`FR-1a` sub-id form
+# exists there, verified Gate-0 — so excluding a trailing hyphen-word is safe here.)
+_AC_ID_RE = re.compile(r"^(AC\d+|FR-\d+|NFR-\d+)(?![\w-])")
+
+
+def _extract_ac_id(text) -> str | None:
+    """Extract a canonical AC/FR/NFR id from the START of a coverage string, or None.
+    Boundary-anchored (#2) — a prefix-collision token returns None, not a false id."""
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    m = _AC_ID_RE.match(text.strip())
+    return m.group(1) if m else None
+
+
+def _hashable_id(value) -> str:
+    """Coerce a requirement id to a hashable str for use as a set member / dict key (#7).
+    A list/dict-typed id would raise `TypeError: unhashable type` inside a set/dict
+    comprehension; that crash is caught by the SRS _CheckGuard and swallowed as a generic
+    ERRORED, LOSING every other SRS/clarification check for the artifact. Coercing to a
+    stable str keeps the id usable as a key while the malformed-id itself is WARNed
+    separately by _check_requirements_shape. A str passes through unchanged, int/bool via
+    str(); other types get a repr so two distinct malformed ids don't collide."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, bool)):
+        return str(value)
+    return repr(value)
+
+
 def _acceptance_is_present(acceptance) -> bool:
     """AC4: an acceptance list is 'present' if it has >=1 entry that is EITHER a
     non-empty free-text string (legacy) OR a COMPLETE GWT object — given AND when
@@ -1020,6 +1054,59 @@ def _check_clarifications(data: dict) -> list[str]:
     return warns
 
 
+def _check_requirements_shape(requirements: list[dict]) -> list[str]:
+    """#6: structural conformance of the declared SRS schema — WARN-only. The enum
+    sets REQ_WORK_CLASSES / REQ_STATUSES were defined but never enforced, so typos
+    (`user-stroy`, `confirmd`), missing/duplicate ids, and missing statements all
+    passed silently. Checks (all advisory, never errors — strangler/autonomy-first):
+      - work_class ∈ REQ_WORK_CLASSES
+      - status ∈ REQ_STATUSES
+      - id present + unique (crash-safe via _hashable_id — a list/dict id is itself a
+        malformed-id WARN here AND must not crash the dup detection, #6↔#7 coupling)
+      - statement present (non-empty)
+    Wired FIRST in validate_requirements_block so a malformed id is WARNed before any
+    downstream set/dict comprehension could trip on it."""
+    warns: list[str] = []
+    # dup detection counts ONLY present, hashable-coerced ids — a missing/empty id is
+    # reported by the missing-id WARN, never fed into the dup map (so a literal string
+    # id "None" can't collide with a None sentinel: Gate-2 LOW false-negative closed).
+    seen: dict[str, int] = {}
+    for r in requirements:
+        rid_raw = r.get("id")
+        rid = rid_raw if isinstance(rid_raw, str) and rid_raw.strip() else None
+        rid_label = rid if rid else "<no-id>"
+        if not rid:
+            warns.append(
+                f"SRS shape[{rid_label}]: id is missing or not a string "
+                f"(got {type(rid_raw).__name__})."
+            )
+        else:
+            key = _hashable_id(rid_raw)
+            seen[key] = seen.get(key, 0) + 1
+        wc = r.get("work_class")
+        if wc not in REQ_WORK_CLASSES:
+            warns.append(
+                f"SRS shape[{rid_label}]: work_class={wc!r} is not one of "
+                f"{list(REQ_WORK_CLASSES)}."
+            )
+        st = r.get("status")
+        if st not in REQ_STATUSES:
+            warns.append(
+                f"SRS shape[{rid_label}]: status={st!r} is not one of "
+                f"{list(REQ_STATUSES)}."
+            )
+        stmt = str(r.get("statement", "")).strip()
+        if not stmt:
+            warns.append(f"SRS shape[{rid_label}]: statement is missing or empty.")
+    for key, n in seen.items():
+        if n > 1:
+            warns.append(
+                f"SRS shape: duplicate id {key} appears {n}× "
+                f"(ids must be unique within a run)."
+            )
+    return warns
+
+
 def _check_invest(requirements: list[dict], profile: str) -> list[str]:
     """AC3/AC10: INVEST self-check — WARN-only, and ONLY for work_class in
     {user-story, enabler-story}. spike/bug/task are exempt (anti-ceremony). The
@@ -1031,7 +1118,10 @@ def _check_invest(requirements: list[dict], profile: str) -> list[str]:
     if normalize_profile(profile) == "goal":
         return []  # AC10 goal carve-out
     warns: list[str] = []
-    all_ids = {r.get("id") for r in requirements}
+    # #7: coerce ids to a hashable key — a list/dict id would raise TypeError here and
+    # the _CheckGuard would swallow the ENTIRE SRS layer. dangling-ref comparison below
+    # uses the same coercion so a dep referencing a (coerced) id still resolves.
+    all_ids = {_hashable_id(r.get("id")) for r in requirements}
     # Cycle detection is a GRAPH-level property — compute ONCE, not per-requirement
     # (meta-review LOW: per-requirement call was O(n*(V+E)) + emitted N duplicate WARNs).
     if _has_dependency_cycle(requirements):
@@ -1047,7 +1137,7 @@ def _check_invest(requirements: list[dict], profile: str) -> list[str]:
         # _safe_list: a string depends_on would iterate char-by-char (bogus WARN/char).
         deps = _safe_list(r.get("depends_on"))
         for d in deps:
-            if d not in all_ids:
+            if _hashable_id(d) not in all_ids:
                 warns.append(
                     f"SRS INVEST[{rid}]: Independent — depends_on references '{d}' "
                     f"which is not a requirement in this run (dangling)."
@@ -1068,7 +1158,11 @@ def _check_invest(requirements: list[dict], profile: str) -> list[str]:
 
 def _has_dependency_cycle(requirements: list[dict]) -> bool:
     """DFS cycle detection over the depends_on graph (ids only)."""
-    graph = {r.get("id"): list(_safe_list(r.get("depends_on"))) for r in requirements}
+    # #7: coerce ids/deps to hashable keys — a list/dict id would crash this dict-comp.
+    graph = {
+        _hashable_id(r.get("id")): [_hashable_id(d) for d in _safe_list(r.get("depends_on"))]
+        for r in requirements
+    }
     WHITE, GRAY, BLACK = 0, 1, 2
     color = {node: WHITE for node in graph}
 
@@ -1125,6 +1219,9 @@ def validate_requirements_block(data: dict, profile: str) -> list[str]:
     if not requirements:
         return []
     warns: list[str] = []
+    # #6 wired FIRST (before _check_invest) so a malformed/unhashable id is WARNed
+    # before any downstream set/dict comprehension could trip on it (#6↔#7 coupling).
+    warns.extend(_check_requirements_shape(requirements))
     warns.extend(_check_source_provenance(requirements))
     warns.extend(_check_invest(requirements, profile))
     warns.extend(_check_requirements_axis(requirements, str(data.get("scope", ""))))
@@ -3482,18 +3579,18 @@ def validate(project: str, run_id: str, stage: str) -> dict[str, Any]:
                                 covered_ac_ids = set()
                                 for entry in ac_coverage:
                                     entry_ac = entry.get("ac", "").strip()
-                                    m = re.match(r"^(AC\d+|FR-\d+|NFR-\d+)", entry_ac)
-                                    if m:
-                                        covered_ac_ids.add(m.group(1))
+                                    _aid = _extract_ac_id(entry_ac)
+                                    if _aid:
+                                        covered_ac_ids.add(_aid)
                                 covered_texts = {entry.get("ac", "").strip() for entry in ac_coverage}
 
                                 # Detect duplicate AC IDs in PLAN (AC ID match unsafe if dupes)
                                 plan_id_counts: dict[str, int] = {}
                                 for p in plan_acs:
                                     p_str = p.strip() if isinstance(p, str) else str(p).strip()
-                                    m = re.match(r"^(AC\d+|FR-\d+|NFR-\d+)", p_str)
-                                    if m:
-                                        plan_id_counts[m.group(1)] = plan_id_counts.get(m.group(1), 0) + 1
+                                    _aid = _extract_ac_id(p_str)
+                                    if _aid:
+                                        plan_id_counts[_aid] = plan_id_counts.get(_aid, 0) + 1
                                 # AC IDs that appear exactly once in PLAN (safe for ID-based match)
                                 unique_plan_ids = {k for k, v in plan_id_counts.items() if v == 1}
 
@@ -3501,9 +3598,8 @@ def validate(project: str, run_id: str, stage: str) -> dict[str, Any]:
                                     pac_str = pac.strip() if isinstance(pac, str) else str(pac).strip()
 
                                     # Strategy 1: identifier match (AC1, AC2, etc.)
-                                    # Extract "ACN:" prefix from plan AC
-                                    ac_id_match = re.match(r"^(AC\d+|FR-\d+|NFR-\d+)", pac_str)
-                                    ac_id = ac_id_match.group(1) if ac_id_match else None
+                                    # Extract "ACN:" prefix from plan AC (boundary-anchored, #2)
+                                    ac_id = _extract_ac_id(pac_str)
 
                                     matched = False
                                     # Check by plan_ac_ref first (preferred, unambiguous)
@@ -3536,9 +3632,9 @@ def validate(project: str, run_id: str, stage: str) -> dict[str, Any]:
                                 for p in plan_acs:
                                     p_str = p.strip() if isinstance(p, str) else str(p).strip()
                                     plan_ac_texts.add(p_str)
-                                    m = re.match(r"^(AC\d+|FR-\d+|NFR-\d+)", p_str)
-                                    if m:
-                                        plan_ac_ids.add(m.group(1))
+                                    _aid = _extract_ac_id(p_str)
+                                    if _aid:
+                                        plan_ac_ids.add(_aid)
 
                                 for entry in ac_coverage:
                                     entry_ac = entry.get("ac", "").strip()
@@ -3547,10 +3643,10 @@ def validate(project: str, run_id: str, stage: str) -> dict[str, Any]:
                                     # Match by plan_ac_ref identifier
                                     if entry_ref and entry_ref in plan_ac_ids:
                                         reverse_matched = True
-                                    # Match by extracted AC ID from BUILD entry text
+                                    # Match by extracted AC ID from BUILD entry text (boundary, #2)
                                     if not reverse_matched:
-                                        entry_id_match = re.match(r"^(AC\d+|FR-\d+|NFR-\d+)", entry_ac)
-                                        if entry_id_match and entry_id_match.group(1) in plan_ac_ids:
+                                        _eid = _extract_ac_id(entry_ac)
+                                        if _eid and _eid in plan_ac_ids:
                                             reverse_matched = True
                                     # Fallback: bidirectional text matching
                                     if not reverse_matched:

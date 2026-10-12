@@ -4513,28 +4513,32 @@ class TestSRSCrossBoundaryE2E:
     real matcher regex. Each test states its mutation-to-RED."""
 
     def test_ac_matcher_production_source_captures_new_ids(self):
-        """AC9 real-wiring (non-vacuous, partial-revert-proof): the ACTUAL AC-ID
-        matcher literals in the production source must ALL be the extended form.
-        Reads the production string (not a re-typed literal) and counts PER SITE
-        (pre-dedup) so a 1-of-5 revert is caught — a set() would hide it. Also
-        asserts NO bare ^(AC\\d+) remains. MUTATION: revert any site -> RED."""
+        """AC9 real-wiring, UPDATED for #2: the 5 inline `re.match` AC-ID literals were
+        refactored into a single boundary-anchored `_extract_ac_id` helper (`_AC_ID_RE`),
+        so every AC-coverage site now routes through ONE canonical matcher. This test
+        pins the new single-source structure (no inline AC-ID `re.match` literals remain;
+        all 5 sites call `_extract_ac_id`) AND the capture behaviour of the helper."""
         import re
         import pathlib
+        from scripts.pipeline_validator import _extract_ac_id, _AC_ID_RE
         src = (pathlib.Path(__file__).resolve().parent.parent
                / "scripts" / "pipeline_validator.py").read_text()
-        # every AC-ID matcher literal actually present (pre-dedup — count sites)
-        pats = re.findall(r're\.match\(r"(\^\([^"]*\))"', src)
-        assert len(pats) == 5, (
-            f"expected 5 AC-ID matcher sites in production, found {len(pats)}: {pats}")
-        # NO site may be the un-extended legacy form (partial-revert guard)
-        assert '^(AC\\d+)"' not in src, (
-            "a bare ^(AC\\d+) matcher remains — a site was reverted, FR/NFR ids "
-            "would silently drop out of BUILD ac_coverage")
-        # EVERY site must capture all three id shapes
-        for pat in pats:
-            assert re.match(pat, "AC1: legacy"), f"{pat!r} lost legacy AC capture"
-            assert re.match(pat, "FR-1: new"), f"{pat!r} does not capture FR-ids (reverted?)"
-            assert re.match(pat, "NFR-2: n"), f"{pat!r} does not capture NFR-ids"
+        # #2 refactor: NO inline AC-ID re.match literal may remain (single-source).
+        inline = re.findall(r're\.match\(r"\^\(AC\\d\+[^"]*\)"', src)
+        assert inline == [], (
+            f"inline AC-ID re.match literal(s) remain — should route through "
+            f"_extract_ac_id: {inline}")
+        # all 5 AC-coverage sites must call the single helper (count pre-dedup)
+        calls = re.findall(r"_extract_ac_id\(", src)
+        # 5 call sites + 1 def line = 6 occurrences
+        assert len(calls) >= 6, (
+            f"expected >=6 _extract_ac_id references (5 sites + def), found {len(calls)}")
+        # the canonical matcher captures all three id shapes AND rejects prefix collisions
+        assert _extract_ac_id("AC1: legacy") == "AC1"
+        assert _extract_ac_id("FR-1: new") == "FR-1"
+        assert _extract_ac_id("NFR-2: n") == "NFR-2"
+        assert _extract_ac_id("FR-1-placeholder") is None   # #2 boundary
+        assert _AC_ID_RE.match("AC3garbage") is None
 
 
 class TestSRSDefensiveTotality:
@@ -5137,3 +5141,127 @@ class TestProducerInstruction:
             "requirements must NOT be recommended (would noise every non-SRS evaluate)"
         assert "schema_version" not in rec, \
             "schema_version must NOT be recommended (would noise every non-SRS evaluate)"
+
+
+class TestIdPrefixBoundary:
+    """#2: AC-coverage ID extraction must have a boundary — a garbage token that
+    prefix-collides with a real id (FR-1-placeholder, AC3garbage) must NOT be
+    accepted as that id, or BUILD ac_coverage can mark an uncovered PLAN AC covered."""
+
+    def test_garbage_prefix_rejected(self):
+        from scripts.pipeline_validator import _extract_ac_id
+        assert _extract_ac_id("FR-1-placeholder") is None
+        assert _extract_ac_id("AC3garbage") is None
+        assert _extract_ac_id("NFR-2unrelated") is None
+
+    def test_legit_forms_still_match(self):
+        from scripts.pipeline_validator import _extract_ac_id
+        assert _extract_ac_id("AC1") == "AC1"
+        assert _extract_ac_id("AC1: returns 200") == "AC1"
+        assert _extract_ac_id("AC1 — does x") == "AC1"
+        assert _extract_ac_id("FR-1: the statement") == "FR-1"
+        assert _extract_ac_id("NFR-2 performance") == "NFR-2"
+
+    def test_no_id_returns_none(self):
+        from scripts.pipeline_validator import _extract_ac_id
+        assert _extract_ac_id("just prose no id") is None
+        assert _extract_ac_id("") is None
+
+
+class TestRequirementsShapeCheck:
+    """#6: declared enum sets (REQ_WORK_CLASSES / REQ_STATUSES) must actually be
+    enforced — typos, missing/dup ids, missing statement were silently passing."""
+
+    def test_bad_work_class_warns(self):
+        from scripts.pipeline_validator import _check_requirements_shape
+        warns = _check_requirements_shape([_fr(id="FR-1")] )  # baseline clean
+        assert warns == []
+        bad = dict(_fr(id="FR-1")); bad["work_class"] = "user-stroy"
+        warns = _check_requirements_shape([bad])
+        assert any("work_class" in w and "FR-1" in w for w in warns), warns
+
+    def test_bad_status_warns(self):
+        from scripts.pipeline_validator import _check_requirements_shape
+        bad = dict(_fr(id="FR-2")); bad["status"] = "confirmd"
+        warns = _check_requirements_shape([bad])
+        assert any("status" in w and "FR-2" in w for w in warns), warns
+
+    def test_missing_id_warns(self):
+        from scripts.pipeline_validator import _check_requirements_shape
+        bad = dict(_fr()); bad.pop("id", None)
+        warns = _check_requirements_shape([bad])
+        assert any("id" in w.lower() for w in warns), warns
+
+    def test_duplicate_id_warns(self):
+        from scripts.pipeline_validator import _check_requirements_shape
+        warns = _check_requirements_shape([_fr(id="FR-1"), _fr(id="FR-1")])
+        assert any("duplicate" in w.lower() and "FR-1" in w for w in warns), warns
+
+    def test_missing_statement_warns(self):
+        from scripts.pipeline_validator import _check_requirements_shape
+        bad = dict(_fr(id="FR-3")); bad["statement"] = ""
+        warns = _check_requirements_shape([bad])
+        assert any("statement" in w.lower() and "FR-3" in w for w in warns), warns
+
+    def test_two_missing_ids_not_counted_as_duplicate(self):
+        """Gate-2: two requirements both missing an id must NOT be reported as a
+        duplicate id — only the missing-id WARN fires (×2), no dup WARN."""
+        from scripts.pipeline_validator import _check_requirements_shape
+        a = dict(_fr()); a.pop("id", None)
+        b = dict(_fr()); b.pop("id", None)
+        warns = _check_requirements_shape([a, b])
+        assert sum("id is missing" in w for w in warns) == 2, warns
+        assert not any("duplicate" in w.lower() for w in warns), warns
+
+    def test_literal_none_string_id_dup_is_warned(self):
+        """Gate-2 LOW closed: a literal string id 'None' is a PRESENT id, so two of
+        them ARE a real duplicate — must warn (previously suppressed by a repr(None)
+        sentinel collision)."""
+        from scripts.pipeline_validator import _check_requirements_shape
+        warns = _check_requirements_shape([_fr(id="None"), _fr(id="None")])
+        assert any("duplicate" in w.lower() and "None" in w for w in warns), warns
+
+    def test_shape_is_warn_only_wired_before_invest(self):
+        """#6+#7 coupling: _check_requirements_shape is wired into
+        validate_requirements_block and its output appears in warnings (never errors)."""
+        bad = dict(_fr(id="FR-1")); bad["work_class"] = "user-stroy"
+        warns = validate_requirements_block(_reqs_block([bad]), "full")
+        assert any("work_class" in w for w in warns), warns
+
+
+class TestUnhashableIdCrashSafe:
+    """#7: a list/dict-typed id must NOT crash the SRS WARN layer (it used to raise
+    TypeError in the all_ids set-comp / graph dict-comp, which _CheckGuard swallowed
+    as a generic ERRORED, losing every other SRS + clarification check)."""
+
+    def test_list_id_does_not_crash_invest(self):
+        from scripts.pipeline_validator import _check_invest
+        # must not raise
+        warns = _check_invest([_fr(id=["x"], work_class="user-story")], "full")
+        assert isinstance(warns, list)
+
+    def test_dict_depends_on_does_not_crash_cycle(self):
+        from scripts.pipeline_validator import _has_dependency_cycle
+        r = _fr(id="FR-1", work_class="user-story"); r["depends_on"] = {"bogus": 1}
+        # must not raise
+        assert _has_dependency_cycle([r]) in (True, False)
+
+    def test_unhashable_dep_element_does_not_crash_cycle(self):
+        # #7 (graph dep-element coercion, pipeline_validator.py:1163): a nested-list
+        # element INSIDE depends_on is unhashable — the graph membership test (`nxt in
+        # graph`) crashes with TypeError unless each dep is coerced. This is the only
+        # test that forces that coercion (reverting line 1163 must turn this RED).
+        from scripts.pipeline_validator import _has_dependency_cycle
+        r = _fr(id="FR-1", work_class="user-story"); r["depends_on"] = [["nested"]]
+        # must not raise (unhashable nested element coerced to a hashable key)
+        assert _has_dependency_cycle([r]) in (True, False)
+
+    def test_unhashable_id_preserves_downstream_checks(self):
+        """The decisive blast-radius test: an unhashable id must NOT abort the rest of
+        validate_requirements_block. A SECOND requirement with a blank source.kind must
+        STILL produce its provenance WARN (which lives AFTER _check_invest)."""
+        bad_id = dict(_fr(id="FR-1", work_class="user-story")); bad_id["id"] = ["x"]
+        blank_src = _fr(id="FR-2", kind="")
+        warns = validate_requirements_block(_reqs_block([bad_id, blank_src]), "full")
+        assert any("FR-2" in w and "source" in w.lower() for w in warns), \
+            f"downstream provenance check must still run after an unhashable id, got {warns}"
