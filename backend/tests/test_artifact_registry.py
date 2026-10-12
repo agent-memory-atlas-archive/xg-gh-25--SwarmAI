@@ -187,6 +187,160 @@ class TestPublish:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Trust boundary — path-identifier containment (P0 security, run_44a06138)
+# project / run_id / entry.file are caller-supplied; none may escape Projects/.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestTrustBoundary:
+    """All caller-supplied path identifiers are containment-validated before
+    any filesystem path is built from them (Kiro #1 run_id + #1b project)."""
+
+    def test_project_traversal_blocked(self, workspace, registry):
+        """AC1: project='../Sibling' must raise and write NOTHING outside Projects/."""
+        # A real sibling dir OUTSIDE Projects/ — is_dir() returns True for it.
+        sibling = workspace / "Knowledge"
+        sibling.mkdir()
+        with pytest.raises(ValueError):
+            registry.publish(
+                "../Knowledge", "evaluation",
+                data={"escaped": True}, producer="attacker",
+                summary="project traversal", run_id="run_legit",
+            )
+        # Nothing landed under the sibling dir.
+        assert not list(sibling.rglob("*.json")), "project traversal escaped to sibling dir"
+
+    def test_run_id_traversal_blocked(self, workspace, registry):
+        """AC2: run_id='../../../Victim/...' must raise and write NOTHING outside the project's runs/."""
+        (workspace / "Projects" / "Source").mkdir()
+        (workspace / "Projects" / "Victim").mkdir()
+        with pytest.raises(ValueError):
+            registry.publish(
+                "Source", "evaluation",
+                data={"escaped": True}, producer="attacker",
+                summary="run_id traversal",
+                run_id="../../../Victim/.artifacts/runs/run_victim",
+            )
+        victim_files = list((workspace / "Projects" / "Victim").rglob("*.json"))
+        assert not victim_files, "run_id traversal escaped into sibling project"
+
+    def test_run_id_bad_format_blocked(self, workspace, registry):
+        """run_id outside ^run_[A-Za-z0-9_]+$ is rejected (no slashes/dots/spaces)."""
+        (workspace / "Projects" / "App").mkdir()
+        for bad in ("run_x/y", "run_x..y", "notrun_abc", "run_a b", " run_x",
+                    "evaluate-latest", "run_x\n", "run_x\n../etc"):
+            with pytest.raises(ValueError):
+                registry.publish(
+                    "App", "evaluation", data={}, producer="t",
+                    summary="bad run_id", run_id=bad,
+                )
+
+    def test_legit_project_and_run_id_pass(self, workspace, registry):
+        """AC3 (RP50): a legit project + run_<hex> must SUCCEED — no false-block."""
+        (workspace / "Projects" / "SwarmAI").mkdir()
+        aid = registry.publish(
+            "SwarmAI", "evaluation",
+            data={"ok": True}, producer="s_autonomous-pipeline",
+            summary="legit", run_id="run_abc12345",
+        )
+        assert aid.startswith("art_")
+        run_file = (workspace / "Projects" / "SwarmAI" / ".artifacts"
+                    / "runs" / "run_abc12345")
+        assert run_file.is_dir()
+
+    def test_bare_publish_still_works(self, workspace, registry):
+        """RP50: a no-run_id bare publish (standalone skills) is unaffected."""
+        (workspace / "Projects" / "App").mkdir()
+        aid = registry.publish(
+            "App", "evaluation", data={"bare": True}, producer="s_evaluate",
+            summary="bare publish, no run",
+        )
+        assert aid.startswith("art_")
+
+    def test_entry_file_traversal_rejected_on_read(self, workspace, registry):
+        """AC7: a tampered manifest entry.file with ../ escape must NOT be read
+        (containment), while bare + runs/<id>/ shapes still load."""
+        project = "App"
+        (workspace / "Projects" / project).mkdir()
+        # Legit bare artifact
+        registry.publish(project, "evaluation", data={"legit": True},
+                         producer="t", summary="legit bare")
+        # Tamper: inject a malicious entry pointing outside .artifacts/
+        secret = workspace / "secret.json"
+        secret.write_text(json.dumps({"stolen": True}))
+        manifest_path = workspace / "Projects" / project / ".artifacts" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["artifacts"].append({
+            "id": "art_evil", "type": "evaluation", "producer": "attacker",
+            "created": "2026-10-12T00:00:00", "file": "../../../secret.json",
+            "summary": "tampered", "superseded_by": None,
+        })
+        manifest_path.write_text(json.dumps(manifest))
+        # Reading the evil entry must NOT surface the escaped file's contents.
+        # Tightened (Gate-2 correctness nit): assert the entry is DROPPED (None),
+        # not merely emptied — proves containment fired, not file-not-found.
+        evil = registry.get_artifact(project, "art_evil")
+        assert evil is None, "entry.file traversal must drop the entry (containment), got leaked data"
+        # Legit bare artifact still loads fine.
+        legit = registry.discover(project, "evaluation")
+        assert any(a.data.get("legit") for a in legit), "containment false-killed a legit bare artifact"
+
+    def test_read_path_project_traversal_blocked(self, workspace, registry):
+        """Gate-2 security: the READ path (discover/_read_manifest) must also reject
+        a ..-escaping project — not just the write path. A traversal project fails
+        CLOSED (empty/None), never reads a manifest outside Projects/."""
+        # Plant a manifest OUTSIDE Projects/ that a traversal would reach.
+        outside = workspace / "secret_area" / ".artifacts"
+        outside.mkdir(parents=True)
+        (outside / "manifest.json").write_text(json.dumps({
+            "project": "x", "pipeline_state": "build",
+            "artifacts": [{"id": "art_leak", "type": "evaluation", "producer": "a",
+                           "created": "2026-10-12T00:00:00", "file": "m.json", "superseded_by": None}],
+        }))
+        # discover with a traversal project must return [] (fail-closed), not the planted manifest.
+        assert registry.discover("../secret_area", "evaluation") == []
+        assert registry.get_pipeline_state("../secret_area") is None
+        assert registry.get_artifact("../secret_area", "art_leak") is None
+
+    def test_advance_pipeline_project_traversal_blocked(self, workspace, registry):
+        """Gate-2 (adversarial, this run): advance_pipeline → _mutate_manifest is a
+        WRITE sink that bypassed the SSOT. A traversal project must raise BEFORE any
+        mkdir/write, never create a manifest outside Projects/ (the publish-path twin
+        on the mutate side)."""
+        with pytest.raises(ValueError):
+            registry.advance_pipeline("../Knowledge", "deliver")
+        # Nothing written outside Projects/ (the manifest/.artifacts must not appear).
+        assert not (workspace / "Knowledge" / ".artifacts").exists()
+        assert not (workspace / "Knowledge" / ".artifacts" / "manifest.json").exists()
+
+    def test_supersede_project_traversal_blocked(self, workspace, registry):
+        """supersede() reaches _mutate_manifest only AFTER its own _read_manifest,
+        which fails-closed to None for a traversal project → early-return no-op (no
+        write, no escape). The SECURITY property this locks is 'nothing written
+        outside Projects/', NOT the mechanism (early-return vs the _mutate_manifest
+        ValueError backstop) — both layers hold. If supersede is ever refactored to
+        mutate without the pre-read, the _mutate_manifest guard raises instead; either
+        way nothing escapes, which is what this asserts."""
+        registry.supersede("../Knowledge", "art_old", "art_new")  # no-op, no raise
+        assert not (workspace / "Knowledge" / ".artifacts").exists()
+        assert not (workspace / "Knowledge" / ".artifacts" / "manifest.json").exists()
+
+    def test_record_outcome_project_traversal_blocked(self, workspace, registry):
+        """record_outcome() builds projects_root/project/decision-strategy.json — a
+        traversal project must raise before the path build (defense-in-depth)."""
+        # Plant a decision-strategy.json OUTSIDE Projects/ that a traversal would reach.
+        outside = workspace / "Knowledge"
+        outside.mkdir(parents=True)
+        planted = outside / "decision-strategy.json"
+        planted.write_text(json.dumps({"calibration": []}))
+        before = planted.read_text()
+        with pytest.raises(ValueError):
+            registry.record_outcome("../Knowledge", "art_eval", "success")
+        # The planted file is untouched (not rewritten by the traversal).
+        assert planted.read_text() == before
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Discovery
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -688,11 +688,13 @@ class PublishRequest(BaseModel):
     producer: str
     summary: str
     topic: str = ""
-    # #4: run_id is REQUIRED in practice (fail-closed in the handler). A publish
-    # without it would write a bare top-level {type}-{date}.json — a run-blind file
-    # that the last same-day writer overwrites, the cross-run contamination source.
-    # Optional in the model (clean 400, not a 422) but rejected by the handler.
-    run_id: str | None = None
+    # run_44a06138 (Kiro #13): run_id is REQUIRED — OpenAPI must say so. The old
+    # `str | None = None` told generated clients the field was optional while the
+    # handler always rejected an absent value at runtime (a 400 the schema didn't
+    # predict). A required `str` makes Pydantic reject an absent value with a 422
+    # that the schema DOES predict — honest contract. Containment of the value is
+    # enforced by the registry trust boundary (_validate_path_identifiers).
+    run_id: str
 
 
 class AdvanceRequest(BaseModel):
@@ -775,10 +777,9 @@ async def get_pipeline_state(
 @router.post("/artifacts/pipeline/publish")
 async def publish_pipeline_artifact(req: PublishRequest) -> dict:
     """Publish a new artifact for a project."""
-    # #4 fail-closed: a publish without run_id would write a run-blind bare
-    # top-level file (cross-run contamination source). Reject it — matching the
-    # CLI's `--stage publish without --run-id` guard. The ability to guess a
-    # target run is the root of cross-run contamination.
+    # run_44a06138: run_id is a required `str` on the model (Pydantic 422s an
+    # absent value — OpenAPI-honest, Kiro #13). The empty-string case the schema
+    # can't catch still fails closed here.
     if not req.run_id or not req.run_id.strip():
         raise HTTPException(
             status_code=400,
@@ -787,6 +788,13 @@ async def publish_pipeline_artifact(req: PublishRequest) -> dict:
                     "Pass run_id to publish run-scoped."),
         )
     reg = _get_registry()
+    # TRUST BOUNDARY (run_44a06138): delegate project+run_id containment to the
+    # registry SSOT BEFORE any write. reg.publish() also validates internally;
+    # doing it here maps a traversal attempt to a clean 400 before threading.
+    try:
+        reg._validate_path_identifiers(req.project, req.run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     def _publish():
         return reg.publish(

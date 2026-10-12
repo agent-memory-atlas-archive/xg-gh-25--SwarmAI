@@ -2613,3 +2613,103 @@ class TestSingleCallCompletionFilesTouched:
             "an EMPTY incoming list must leave files_touched as None — the value the "
             "gate judged — instead of persisting [] and silently dropping the legacy "
             f"nudge; got {persisted.get('files_touched')!r}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trust boundary — CLI fail-closed order + phantom-run (run_44a06138, P0 sec)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _stub_validator(monkeypatch):
+    import sys
+    from pathlib import Path as _P
+    _scripts_dir = str(_P(__file__).resolve().parent.parent / "scripts")
+    if _scripts_dir not in sys.path:
+        sys.path.insert(0, _scripts_dir)
+    import pipeline_validator
+    monkeypatch.setattr(pipeline_validator, "validate_artifact_data", lambda *a, **k: [])
+
+
+class TestCLITrustBoundary:
+    """cmd_publish validates path identifiers BEFORE writing (Kiro #2) and
+    rejects a stage publish to a non-existent run (Kiro #3)."""
+
+    def test_bad_run_id_writes_nothing_before_refusing(self, workspace, monkeypatch):
+        """AC4: a ..-bearing run_id must exit non-zero AND create ZERO artifact files."""
+        import scripts.artifact_cli as cli
+        from core.artifact_registry import ArtifactRegistry
+        _stub_validator(monkeypatch)
+        (workspace / "Projects" / "TestProject").mkdir(parents=True, exist_ok=True)
+        reg = ArtifactRegistry(workspace)
+
+        class _Args:
+            project = "TestProject"
+            type = "evaluation"
+            data = '{"recommendation":"GO","scope":"standard"}'
+            producer = "s_autonomous-pipeline"
+            summary = "traversal attempt"
+            topic = ""
+            stage = "evaluate"
+            run_id = "../../../Victim/x"
+            quiet = True
+
+        with pytest.raises(SystemExit) as ei:
+            cli.cmd_publish(_Args(), reg)
+        assert ei.value.code != 0
+        # No artifact files anywhere under the workspace (nothing written).
+        artifacts = list((workspace / "Projects").rglob("evaluation-*.json"))
+        assert artifacts == [], f"fail-closed violated — files written: {artifacts}"
+
+    def test_phantom_run_rejected(self, workspace, monkeypatch):
+        """AC5: a --stage publish to a run with no run.json is rejected, mints no dir."""
+        import scripts.artifact_cli as cli
+        from core.artifact_registry import ArtifactRegistry
+        _stub_validator(monkeypatch)
+        (workspace / "Projects" / "TestProject").mkdir(parents=True, exist_ok=True)
+        reg = ArtifactRegistry(workspace)
+
+        class _Args:
+            project = "TestProject"
+            type = "evaluation"
+            data = '{"recommendation":"GO","scope":"standard"}'
+            producer = "s_autonomous-pipeline"
+            summary = "phantom run"
+            topic = ""
+            stage = "evaluate"
+            run_id = "run_doesnotexist"
+            quiet = True
+
+        with pytest.raises(SystemExit) as ei:
+            cli.cmd_publish(_Args(), reg)
+        assert ei.value.code != 0
+        phantom_dir = (workspace / "Projects" / "TestProject" / ".artifacts"
+                       / "runs" / "run_doesnotexist")
+        assert not phantom_dir.exists(), "phantom run dir was minted"
+
+    def test_legit_stage_publish_to_existing_run_succeeds(self, workspace, monkeypatch):
+        """RP50: a real run + legit run_id still publishes fine (no false-block)."""
+        import scripts.artifact_cli as cli
+        from core.artifact_registry import ArtifactRegistry
+        _stub_validator(monkeypatch)
+        _create_run(workspace, "TestProject", "run_real01", "running", stages=[])
+        reg = ArtifactRegistry(workspace)
+
+        class _Args:
+            project = "TestProject"
+            type = "evaluation"
+            data = '{"recommendation":"GO","scope":"standard"}'
+            producer = "s_autonomous-pipeline"
+            summary = "legit"
+            topic = ""
+            stage = "evaluate"
+            run_id = "run_real01"
+            quiet = True
+
+        # Should NOT raise a non-zero exit (publish succeeds).
+        try:
+            cli.cmd_publish(_Args(), reg)
+        except SystemExit as e:
+            assert e.code in (0, None), f"legit publish was blocked: exit {e.code}"
+        arts = list((workspace / "Projects" / "TestProject" / ".artifacts"
+                     / "runs" / "run_real01").glob("evaluation-*.json"))
+        assert len(arts) == 1

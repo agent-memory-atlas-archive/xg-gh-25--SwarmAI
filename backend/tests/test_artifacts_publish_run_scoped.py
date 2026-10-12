@@ -83,19 +83,51 @@ async def test_publish_with_run_id_lands_run_scoped(app_with_reg):
     assert entry and entry.get("run_id") == run_id, f"manifest entry must carry run_id={run_id}: {entry}"
 
 
-async def test_publish_without_run_id_fails_closed(app_with_reg):
-    """WITHOUT run_id → 400 fail-closed, no bare file written (the contamination guard)."""
+async def test_publish_without_run_id_422_openapi_honest(app_with_reg):
+    """AC6 (run_44a06138, Kiro #13): run_id is a REQUIRED str on the model, so an
+    ABSENT run_id is a Pydantic 422 (the schema predicts it) — NOT a runtime 400
+    the OpenAPI contract hid. Either way nothing is written."""
     app, ws = app_with_reg
     resp = await _post_publish(app, {
         "project": "TestProj", "artifact_type": "evaluation",
         "data": {"recommendation": "GO"}, "producer": "test",
         "summary": "no-run-id",
     })
-    assert resp.status_code == 400, f"publish without run_id must fail closed (got {resp.status_code}: {resp.text})"
+    assert resp.status_code == 422, (
+        f"absent run_id must be a schema-level 422 (OpenAPI-honest), got {resp.status_code}: {resp.text}")
     # nothing written (no bare top-level file)
     artifacts_dir = ws / "Projects" / "TestProj" / ".artifacts"
     bare = list(artifacts_dir.glob("evaluation-*.json")) if artifacts_dir.exists() else []
     assert not bare, f"a rejected publish must write nothing (got: {bare})"
+
+
+async def test_publish_traversal_run_id_fails_closed(app_with_reg):
+    """A ..-bearing run_id must be rejected (400 from the registry trust boundary)
+    and write NOTHING into any sibling project."""
+    app, ws = app_with_reg
+    (ws / "Projects" / "Victim").mkdir(parents=True, exist_ok=True)
+    resp = await _post_publish(app, {
+        "project": "TestProj", "artifact_type": "evaluation",
+        "data": {"recommendation": "GO"}, "producer": "attacker",
+        "summary": "traversal", "run_id": "../../../Victim/.artifacts/runs/run_x",
+    })
+    assert resp.status_code == 400, f"traversal run_id must fail closed (got {resp.status_code}: {resp.text})"
+    victim = list((ws / "Projects" / "Victim").rglob("*.json"))
+    assert not victim, f"traversal escaped into sibling project: {victim}"
+
+
+async def test_publish_traversal_project_fails_closed(app_with_reg):
+    """A ..-bearing project (Kiro #1b) must be rejected and escape nothing outside Projects/."""
+    app, ws = app_with_reg
+    (ws / "Knowledge").mkdir(parents=True, exist_ok=True)
+    resp = await _post_publish(app, {
+        "project": "../Knowledge", "artifact_type": "evaluation",
+        "data": {"recommendation": "GO"}, "producer": "attacker",
+        "summary": "project traversal", "run_id": "run_legit",
+    })
+    assert resp.status_code in (400, 404), f"project traversal must fail (got {resp.status_code}: {resp.text})"
+    escaped = list((ws / "Knowledge").rglob("*.json"))
+    assert not escaped, f"project traversal escaped to sibling dir: {escaped}"
 
 
 async def test_publish_whitespace_run_id_fails_closed(app_with_reg):

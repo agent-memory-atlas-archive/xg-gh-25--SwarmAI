@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -36,6 +37,14 @@ from utils.file_lock import flock_exclusive, flock_unlock
 logger = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
+
+# Trust-boundary contract for caller-supplied path identifiers (run_44a06138,
+# P0 security). A run_id is the one component the pipeline concatenates straight
+# into a filesystem path, so it is pinned to a strict charset — verified against
+# every live run dir (100% match) and `_gen_run_id`'s `run_<hex>` output. The
+# `project` identifier is validated by containment (not a regex) because project
+# names are richer; see `_validate_path_identifiers`.
+_RUN_ID_RE = re.compile(r"^run_[A-Za-z0-9_]+$")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Valid artifact types and pipeline states
@@ -118,6 +127,77 @@ class ArtifactRegistry:
         self.workspace_root = Path(workspace_root).expanduser().resolve()
         self.projects_root = self.workspace_root / "Projects"
 
+    # ── Trust boundary (path-identifier containment) ───────────────────
+    #
+    # SINGLE SOURCE OF TRUTH for "is this caller-supplied identifier safe to
+    # build a path from?" (run_44a06138). Every write/read sink that turns a
+    # `project` / `run_id` / manifest `entry['file']` into a real filesystem
+    # path MUST pass through here BEFORE the path is used — the whole point is
+    # that validation is not scattered or forgotten at a new call site. The
+    # defect this closes: `is_dir()` is a predicate on the RESOLVED target, not
+    # a containment check, so `project='../Knowledge'` resolves to a real
+    # sibling, `is_dir()` returns True, and the write escapes `Projects/`.
+    #
+    # Containment uses `Path.is_relative_to` on RESOLVED paths, never a string
+    # `startswith`: the macOS default FS is case-INSENSITIVE (so `SwarmAI` and
+    # `swarmai` resolve to one inode), which makes a raw prefix compare on
+    # resolved output unsound.
+
+    @staticmethod
+    def _is_contained(target: Path, base: Path) -> bool:
+        """True iff `target` resolves to a location inside `base` (inclusive).
+
+        Both sides are `.resolve()`d so `..` segments and symlinks are
+        collapsed before the ancestry test — a `../escape` target resolves
+        outside `base` and returns False. `base` itself counts as contained.
+        """
+        try:
+            return target.resolve().is_relative_to(base.resolve())
+        except (OSError, ValueError):
+            # Un-resolvable path (e.g. a null byte, or a path that errors on
+            # resolve) is treated as NOT contained — fail closed.
+            return False
+
+    def _validate_path_identifiers(
+        self, project: str, run_id: str | None = None
+    ) -> None:
+        """Raise ValueError if `project` (always) or `run_id` (when given) could
+        escape its intended directory. The gate every write path calls FIRST.
+
+        ORDER MATTERS: `project` is validated before `run_id`, because the
+        run_id containment base is `(<project>/.artifacts/runs)` — if `project`
+        could escape, a run_id check against an already-escaped base would
+        "pass" vacuously. Validate the outer boundary before the inner one.
+        """
+        # ── project: reject obvious traversal tokens, then prove containment ──
+        if (
+            not project
+            or not isinstance(project, str)
+            or project in (".", "..")
+            or "/" in project
+            or "\\" in project
+            or "\x00" in project
+            or project != project.strip()
+            or Path(project).is_absolute()
+        ):
+            raise ValueError(f"unsafe project name (path traversal): {project!r}")
+        if not self._is_contained(self.projects_root / project, self.projects_root):
+            raise ValueError(f"project dir escapes Projects/: {project!r}")
+
+        # ── run_id (optional): strict charset, then prove containment ──
+        if run_id is not None:
+            # fullmatch (not match): `$` matches before a trailing newline, so
+            # `.match("run_x\n")` would accept a newline-bearing run_id (log-
+            # injection / garbage-dir hygiene — not a traversal escape, but closed
+            # here regardless). fullmatch anchors the WHOLE string. (Gate-2 LOW.)
+            if not isinstance(run_id, str) or not _RUN_ID_RE.fullmatch(run_id):
+                raise ValueError(
+                    f"unsafe run_id (must match ^run_[A-Za-z0-9_]+$): {run_id!r}"
+                )
+            runs_base = self.projects_root / project / ".artifacts" / "runs"
+            if not self._is_contained(runs_base / run_id, runs_base):
+                raise ValueError(f"run_id escapes the project's runs/ dir: {run_id!r}")
+
     # ── Discovery ─────────────────────────────────────────────────────
 
     def discover(
@@ -195,6 +275,12 @@ class ArtifactRegistry:
                 f"Unknown artifact type '{artifact_type}'. "
                 f"Valid types: {sorted(ARTIFACT_TYPES)}"
             )
+
+        # TRUST BOUNDARY (run_44a06138): validate project + run_id BEFORE any
+        # mkdir/write — a ..-bearing identifier would otherwise escape Projects/.
+        # Must come before `is_dir()` (which is existence, not containment) and
+        # before the mkdir below.
+        self._validate_path_identifiers(project, run_id)
 
         project_dir = self.projects_root / project
         if not project_dir.is_dir():
@@ -401,6 +487,15 @@ class ArtifactRegistry:
 
         Returns whatever ``mutator`` returns.
         """
+        # TRUST BOUNDARY — fail-closed BEFORE any path construction. _mutate_manifest
+        # is the common write chokepoint for every manifest writer (advance_pipeline,
+        # supersede), none of which validate `project` themselves. Validating here (not
+        # per-caller) makes the SSOT actually cover all writers: a traversal `project`
+        # (e.g. "../Knowledge") must never reach the mkdir/write below, or it escapes
+        # Projects/ exactly as the publish() path once did. publish() has its own
+        # pre-write _validate_path_identifiers; this closes the mutate-side twin.
+        self._validate_path_identifiers(project)
+
         # Ensure .artifacts/ exists before opening the sidecar — supersede and
         # advance_pipeline (unlike publish) don't mkdir it, and open('w') on a
         # missing dir raises FileNotFoundError.
@@ -425,7 +520,28 @@ class ArtifactRegistry:
             lock_fd.close()
 
     def _read_manifest(self, project: str) -> dict | None:
-        """Read manifest.json, returning None if missing or corrupt."""
+        """Read manifest.json, returning None if missing or corrupt.
+
+        TRUST BOUNDARY — READ SIDE (run_44a06138, Gate-2 security finding):
+        `_read_manifest` is the single chokepoint every read path funnels through
+        (discover / get_artifact / get_pipeline_state / supersede / advance), and
+        the HTTP GET /artifacts/pipeline/{discover,state} handlers pass `project`
+        straight from an untrusted query string. Without containment here, a
+        `project='../../../etc'` is a read-side traversal (manifest existence
+        oracle + JSON disclosure) — the READ twin of the publish() write fix.
+        Validate FIRST; a traversal project fails CLOSED to None (preserving the
+        'missing/corrupt → None' contract + the L0-safe `[]` that callers expect),
+        never raises — list_projects passes its own iterdir() names, which always
+        pass, so legit reads are unaffected.
+        """
+        try:
+            self._validate_path_identifiers(project)
+        except ValueError:
+            logger.error(
+                "SECURITY: manifest read refused for out-of-bounds project %r "
+                "(read-side path traversal).", project,
+            )
+            return None
         path = self._manifest_path(project)
         if not path.is_file():
             return None
@@ -481,6 +597,12 @@ class ArtifactRegistry:
             actual_effort: Actual effort (T-shirt size or sessions).
             lessons: Short strings describing what to adjust.
         """
+        # TRUST BOUNDARY — fail-closed before building a project-scoped path, same
+        # SSOT as the mutate/publish writers. Low blast radius (only rewrites an
+        # already-existing decision-strategy.json), but a traversal `project` must
+        # not reach a path build here either — defense-in-depth, no ungated sink.
+        self._validate_path_identifiers(project)
+
         strategy_path = self.projects_root / project / "decision-strategy.json"
         if not strategy_path.is_file():
             logger.info("No decision-strategy.json for '%s', skipping learn", project)
@@ -559,9 +681,23 @@ class ArtifactRegistry:
     ) -> Artifact | None:
         """Convert a manifest entry to an Artifact, loading data from disk."""
         try:
-            data_path = (
-                self.projects_root / project / ".artifacts" / entry["file"]
-            )
+            artifacts_dir = self.projects_root / project / ".artifacts"
+            data_path = artifacts_dir / entry["file"]
+            # TRUST BOUNDARY (run_44a06138, Gate-1 amendment B): the manifest's
+            # `file` is caller-influenced data; a tampered `../../../secret.json`
+            # must NOT be read. Both legit shapes — bare `type-date-id.json` and
+            # run-scoped `runs/<id>/..` — resolve INSIDE `.artifacts/`, so only a
+            # `..`-escape fails this. Surface the attempt LOUDLY (not a silent
+            # None that reads as "artifact not found" and masks tampering), then
+            # drop the entry (return None) — never read the escaped file.
+            if not self._is_contained(data_path, artifacts_dir):
+                logger.error(
+                    "SECURITY: manifest entry '%s' in project '%s' has an "
+                    "out-of-bounds file path %r — refusing to read (possible "
+                    "manifest tampering).",
+                    entry.get("id", "?"), project, entry.get("file"),
+                )
+                return None
             data = {}
             if data_path.is_file():
                 try:
