@@ -650,25 +650,18 @@ def _next_stage_continuation(
     plain payload on any failure.
     """
     stages = _get_profile_stages("full")
-    should_checkpoint = False
-    # Tri-state on purpose, NOT a bool: "no checkpoint is due" and "I could not
-    # measure whether one is due" must yield different instructions. Collapsing
-    # them is fail-OPEN on the STOP side — an unreadable run.json, a partial
-    # `budget` dict, or a --run-id-less invocation would silently read as "not
-    # due" and the payload would urge continuation over a checkpoint that may be
-    # pending. Both REVIEW reviewers flagged that direction independently, and it
-    # is the one direction this feature must never take: for a stall-prevention
-    # nudge the safe fallback is SILENCE, never urging.
-    budget_known = False
-
+    # Budget is NEVER a reason to withhold continuation (STEERING #2 + XG directive
+    # "budget 从来不应该是 block run 的重要因素"). The former should_checkpoint /
+    # budget_known tri-state existed ONLY to stop a missing token_cost from
+    # fail-opening a budget-due judgment to "not due" — with budget removed as a
+    # checkpoint producer, there is no budget-due judgment to protect, so the whole
+    # tri-state is dead-weight (R25: a good fix deletes code). advance always
+    # continues; a REAL checkpoint (L2/retry/stuck) is surfaced by the pause gates
+    # and the stage docs' Escalation Routing Protocol, not by this budget probe.
+    # `stages` is still resolved per-profile so an off-profile state resolves to no
+    # doc rather than a confidently-wrong one.
     if run_id:
         try:
-            # NOTE: read the run file directly rather than via _resolve_run_file —
-            # that helper is a CLI-command entry point and calls sys.exit(1) when a
-            # run is missing. SystemExit does NOT inherit from Exception, so it
-            # would escape this guard and kill an otherwise-successful advance for
-            # the sake of an optional hint. Resolve the two known layouts inline,
-            # reusing the canonical helpers for both.
             run_dir = _run_dir(project, run_id)
             candidates = (
                 run_dir / "run.json",
@@ -677,38 +670,17 @@ def _next_stage_continuation(
             run_file = next((p for p in candidates if p.is_file()), None)
             if run_file is not None:
                 run_state = json.loads(run_file.read_text(encoding="utf-8"))
-                if not isinstance(run_state, dict):
-                    raise TypeError("run.json is not an object")
-                stages = _get_profile_stages(run_state.get("profile", "full"))
-                should_checkpoint = bool(
-                    _compute_should_checkpoint(run_state, project)["should_checkpoint"]
-                )
-                # A completed stage with no token_cost makes `consumed` an
-                # UNDER-count, and the SSOT derives should_checkpoint from it — so
-                # a missing cost silently biases the answer toward "not due". That
-                # is the same fail-open this tri-state exists to prevent, entered
-                # through the front door: measured 162/740 (22%) of completed
-                # stages across the last 120 real runs have no token_cost. Treat an
-                # under-countable run as UNMEASURED rather than as "plenty left".
-                incomplete_cost = any(
-                    s.get("status") == "completed" and not s.get("token_cost")
-                    for s in run_state.get("stages", [])
-                    if isinstance(s, dict)
-                )
-                budget_known = not incomplete_cost
+                if isinstance(run_state, dict):
+                    stages = _get_profile_stages(run_state.get("profile", "full"))
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
-            # Narrow by design: a missing/unreadable run.json (OSError), malformed
-            # JSON (ValueError), or a partial/non-dict `budget` (KeyError/TypeError
-            # raised inside the SSOT) leaves budget_known False, which routes to
-            # the neutral "status unknown" instruction below instead of "keep
-            # going". Anything outside this set is a real defect and should
-            # surface; the caller's own guard still keeps it from failing advance.
+            # Narrow by design: a missing/unreadable/malformed run.json just leaves
+            # `stages` at the full-profile default — advance still continues (budget
+            # is no longer a gating consideration). Anything outside this set is a
+            # real defect and should surface; the caller's own guard keeps it from
+            # failing advance.
             pass
 
     # The stage to execute next IS next_state (see the docstring's warning).
-    # `stages` is still consulted so an off-profile state (e.g. advancing to a
-    # stage this profile does not run) resolves to no doc rather than a
-    # confidently-wrong one.
     target = next_state if next_state in stages else None
 
     doc_path = None
@@ -716,31 +688,6 @@ def _next_stage_continuation(
         candidate = _STAGE_DOC_DIR / f"{target}.md"
         if candidate.is_file():
             doc_path = str(candidate)
-
-    if should_checkpoint:
-        # A real checkpoint trigger outranks continuation. Return doc_path=None as
-        # well as omitting the phrase: every stage doc tells the agent "advance
-        # prints the next doc's path as next_stage_doc — read it", so a POPULATED
-        # field is itself a continuation affordance. The string obeying the
-        # contract while the field invites the opposite is the gap the security
-        # reviewer caught; suppress both.
-        return None, (
-            "A checkpoint is DUE for this run (budget measured, not guessed): run "
-            "`run-budget` for this run and follow the Checkpoint Protocol before "
-            "doing any more stage work. Do not read the next stage doc yet."
-        )
-
-    if not budget_known:
-        # Checkpoint status could not be measured — say exactly that and withhold
-        # the continuation phrase. Naming the doc is still useful (it is derived
-        # from the closed profile enum, not from the unreadable run state), but the
-        # agent must resolve the budget question before continuing.
-        return doc_path, (
-            f"Checkpoint status could NOT be measured for this run (missing or "
-            f"unreadable run state). Run `run-budget` first and follow the "
-            f"Checkpoint Protocol if one is due; only then continue"
-            + (f" with {target}." if target else ".")
-        )
 
     if doc_path:
         return doc_path, (
@@ -1890,23 +1837,32 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
             })
 
         # ── Single choke-point for the paused transition (COE10 dual-write guard) ──
-        # run-update --status paused is the OTHER door to a pause; it must honor the
-        # same confabulation gate as run-checkpoint, or the gate is trivially bypassed
-        # (adversarial run_a822b3e8 finding F). run-checkpoint is the sanctioned pause
-        # path (it also writes the checkpoint artifact + Radar todo); a bare status
-        # flip to paused is refused unless it already measures should_checkpoint=true
-        # or carries --force-checkpoint.
+        # run-update --status paused is the OTHER door to a pause; it MUST honor the
+        # EXACT SAME confabulation guard as run-checkpoint (:3832), or the gate is
+        # trivially bypassed (adversarial run_a822b3e8 finding F). Since budget was
+        # removed as a should_checkpoint producer, `measured_checkpoint` is always
+        # False here, so it drops out of the guard — leaving the SAME two legs as
+        # run-checkpoint: force / denylist / true-trigger. A budget-only reason is
+        # refused (budget no longer a true-trigger); a real L2/retry/stuck reason
+        # passes; a confabulation reason carrying a borrowed trigger word is still
+        # denylist-blocked (this denylist leg is what Gate-1 flagged — a two-term
+        # force-OR-trigger check would reopen finding F).
         if args.status == "paused" and not getattr(args, "force_checkpoint", False):
-            _info = _compute_should_checkpoint(run_state, args.project)
-            if not _info["should_checkpoint"]:
+            _reason = getattr(args, "reason", None) or ""
+            _hits_denylist = _checkpoint_reason_hits_denylist(_reason)
+            _has_true_trigger = _checkpoint_reason_has_true_trigger(_reason)
+            if _hits_denylist or not _has_true_trigger:
+                _why = ("reason matches the confabulation denylist (self-state is not a "
+                        "measurable signal)" if _hits_denylist
+                        else "no true-trigger reason (budget is NOT a trigger)")
                 print(json.dumps({
                     "blocked": True,
-                    "error": "PAUSE REFUSED via run-update — use `run-checkpoint` "
-                             "(the sanctioned pause path) or pass --force-checkpoint. "
-                             "should_checkpoint=false. continue, period.",
-                    "measurement": {"should_checkpoint": False,
-                                    "pct_consumed": _info["pct_consumed"],
-                                    "consumed": _info["consumed"]},
+                    "error": "PAUSE REFUSED via run-update — " + _why + ". Use "
+                             "`run-checkpoint` (the sanctioned pause path with a real "
+                             "trigger reason) or pass --force-checkpoint. continue, period.",
+                    "measurement": {"reason": _reason,
+                                    "hits_denylist": _hits_denylist,
+                                    "has_true_trigger": _has_true_trigger},
                 }), file=sys.stderr)
                 sys.exit(2)
         run_state["status"] = args.status
@@ -2838,12 +2794,14 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
                 "consumed": consumed,
                 "remaining": remaining,
                 "pct": pct,
-                "should_checkpoint": pct > 70,
+                # Budget NEVER triggers a checkpoint (STEERING #2 + XG directive) —
+                # hard-False, same as _compute_should_checkpoint. pct is informational.
+                "should_checkpoint": False,
             }
             if pct > 70:
                 result["budget_warning"] = (
-                    "⚠️ Budget >70% consumed. Run `run-budget` for full analysis "
-                    "before starting next stage."
+                    f"ℹ️ Budget {pct}% consumed (informational — NOT a checkpoint "
+                    "trigger). SDK autocompact handles physical context overflow."
                 )
         except Exception:
             pass  # Budget calculation failure should never block stage update
@@ -3573,7 +3531,12 @@ def _run_summary(state: dict) -> dict:
 # True triggers: a checkpoint with any of these in its reason is a REAL,
 # measurement- or event-backed pause and is always allowed.
 _CHECKPOINT_TRUE_TRIGGERS = (
-    "budget", "l2", "block", "error", "crash", "escalat", "stuck",
+    # NOTE: "budget" is DELIBERATELY ABSENT (removed 2026-10: budget is never a
+    # legitimate pause reason — STEERING #2 + XG directive "budget 从来不应该是 block run
+    # 的重要因素"). A budget-worded pause reason therefore no longer counts as a true
+    # trigger: it is refused by both pause gates and no longer protected from auto-abandon.
+    # Do NOT re-add it. "exhaust" stays (resource/retry exhaustion, not token budget).
+    "l2", "block", "error", "crash", "escalat", "stuck",
     "judgment", "retry", "gate_spawn_blocked", "exhaust",
     "git revert", "external", "mutation", "re-baseline",  # event-triggers (GC11 kept half)
 )
@@ -3790,15 +3753,20 @@ def _compute_should_checkpoint(run_state: dict, project: str) -> dict:
     next_stage = next((s for s in profile_stages if s not in completed_stages), None)
     next_stage_estimate = budget.get("stage_estimates", DEFAULT_STAGE_BUDGETS).get(next_stage, 30_000) if next_stage else 0
 
-    should_checkpoint = next_stage is not None and usable < next_stage_estimate
+    # Budget is NEVER a checkpoint/block trigger (STEERING #2: a budget control that
+    # truncates in-progress real work = 容灾 masquerading as business logic — banned;
+    # XG directive "budget 从来不应该是 block run 的重要因素"; measured 0/809 runs ever
+    # blocked on budget). The two former token judgments — `usable < next_stage_estimate`
+    # and `pct_consumed > 0.7` — are deleted. consumed/remaining/usable/pct_consumed are
+    # STILL computed and returned for run-budget REPORTING (STEERING #3 one-calc-shared);
+    # they are informational numbers, not a verdict. Physical context overflow is handled
+    # by SDK autocompact (session_unit), not this function. should_checkpoint is hard-False.
     pct_consumed = consumed / budget["session_total"] if budget["session_total"] > 0 else 0
-    if pct_consumed > 0.7 and next_stage:
-        should_checkpoint = True
 
     return {
         "consumed": consumed, "remaining": remaining, "usable": usable,
         "pct_consumed": round(pct_consumed * 100, 1), "next_stage": next_stage,
-        "next_stage_estimate": next_stage_estimate, "should_checkpoint": should_checkpoint,
+        "next_stage_estimate": next_stage_estimate, "should_checkpoint": False,
         "budget_total": budget["session_total"],
         "calibration_source": budget.get("calibration_source", "defaults"),
     }
@@ -3857,8 +3825,9 @@ def cmd_run_checkpoint(args, reg: ArtifactRegistry) -> None:
             "reason_given": args.reason,
             "remedy": ("If this is a REAL pause, state a true trigger "
                        "(judgment-class decision / L2 block / retry-exhausted / "
-                       "budget / external-git-mutation) or pass --force-checkpoint "
-                       "with a measurement-backed justification."),
+                       "stuck / external-git-mutation) or pass --force-checkpoint "
+                       "with a measurement-backed justification. NOTE: budget/token "
+                       "consumption is NOT a true trigger (STEERING #2)."),
         }), file=_sys.stderr)
         _sys.exit(2)
 
@@ -4001,11 +3970,14 @@ def cmd_run_history(args, reg: ArtifactRegistry) -> None:
 
 
 def cmd_run_budget(args, reg: ArtifactRegistry) -> None:
-    """Check budget status for an active pipeline run.
+    """Report budget CONSUMPTION for an active pipeline run (informational only).
 
-    Reports consumed tokens, remaining budget, and whether the next
-    stage fits within the budget. Used by the agent to decide when
-    to checkpoint.
+    Reports consumed tokens, remaining budget, and % consumed as NUMBERS for
+    visibility. Budget is NEVER a checkpoint/block trigger (STEERING #2 + XG
+    directive "budget 从来不应该是 block run 的重要因素") — `should_checkpoint` is
+    always False here; a real checkpoint comes only from a true-trigger reason
+    (L2/retry/stuck) via the pause gates, never from these numbers. Physical
+    context overflow is handled by SDK autocompact, not this report.
     """
     run_file = _resolve_run_file(args.project, args.run_id)
     run_state = json.loads(run_file.read_text(encoding="utf-8"))
@@ -4022,14 +3994,12 @@ def cmd_run_budget(args, reg: ArtifactRegistry) -> None:
         "pct_consumed": info["pct_consumed"],
         "next_stage": next_stage,
         "next_stage_estimate": info["next_stage_estimate"],
+        # Always False — budget is not a checkpoint trigger (STEERING #2). Kept for
+        # consumer compatibility; the reason is a plain consumption report, never a
+        # checkpoint verdict (the former "Budget insufficient"/"Context quality
+        # degradation" branches were counterfactual once budget stopped blocking).
         "should_checkpoint": info["should_checkpoint"],
-        "reason": (
-            f"Budget insufficient for {next_stage} (need {info['next_stage_estimate']}, have {info['usable']})"
-            if info["should_checkpoint"] and info["usable"] < info["next_stage_estimate"]
-            else f"Context quality degradation (>{int(info['consumed'] / info['budget_total'] * 100) if info['budget_total'] else 0}% consumed)"
-            if info["should_checkpoint"]
-            else "Budget OK"
-        ),
+        "reason": f"Budget {info['pct_consumed']}% consumed (informational — budget never blocks a run)",
         "calibration_source": info["calibration_source"],
     }
     print(json.dumps(result, indent=2))

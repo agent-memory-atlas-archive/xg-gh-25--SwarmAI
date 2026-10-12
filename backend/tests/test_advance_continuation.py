@@ -341,21 +341,37 @@ class TestStageResolution:
         )
 
 
-# ── AC7: next_action is conditioned on the checkpoint SSOT ──────────────────
+# ── AC7: budget is NEVER a reason to withhold continuation (post-refactor) ───
 
 class TestCheckpointConditioning:
-    """AC7 — a due checkpoint must NOT be argued against (Gate-1 finding #3)."""
+    """AC7 — budget NEVER blocks/withholds continuation (STEERING #2 + XG directive).
 
-    def test_continuation_urged_when_checkpoint_not_due(self, cli, workspace, capsys):
+    SEMANTIC INVERSION (2026-10 budget-cognitive-hygiene refactor): the former
+    contract was "a due BUDGET checkpoint must not be argued against" — advance read
+    `_compute_should_checkpoint` and withheld continuation when budget was high. That
+    budget-block is REMOVED: `_compute_should_checkpoint["should_checkpoint"]` is now
+    always False, budget is no longer a true-trigger, and advance NEVER withholds
+    continuation on a budget/token basis. A real checkpoint (L2/retry/stuck) is
+    surfaced by the pause gates + Escalation Routing Protocol, not by this probe.
+    These tests now assert the INVERTED contract: no matter the token consumption,
+    advance keeps urging continuation.
+    """
+
+    def test_continuation_urged_at_low_consumption(self, cli, workspace, capsys):
         _write_run(workspace, "P", "run_lo", completed=["evaluate"], token_cost=1_000)
         payload = _advance_payload(cli, _Args("P", "think", "run_lo"), capsys)
 
         assert cli._CONTINUATION_PHRASE in payload["next_action"], (
-            "with no checkpoint due, next_action must carry the continuation phrase"
+            "next_action must carry the continuation phrase"
         )
 
-    def test_checkpoint_due_suppresses_the_continuation_urge(self, cli, workspace, capsys):
-        """A genuinely-due checkpoint outranks the continuation hint."""
+    def test_high_token_consumption_still_urges_continuation(self, cli, workspace, capsys):
+        """INVERTED: a high token count is NO LONGER a checkpoint — budget never blocks.
+
+        Pre-refactor this asserted the opposite (400K consumed → checkpoint DUE →
+        continuation suppressed). Budget-block removed (STEERING #2): the same run
+        must now keep urging continuation and name the next stage doc.
+        """
         _write_run(
             workspace, "P", "run_hi",
             completed=["evaluate", "think", "plan"], token_cost=400_000,
@@ -363,24 +379,22 @@ class TestCheckpointConditioning:
         payload = _advance_payload(cli, _Args("P", "build", "run_hi"), capsys)
 
         action = payload["next_action"]
-        assert re.search(r"checkpoint", action, re.I), (
-            f"a due checkpoint must be surfaced in next_action, got: {action!r}"
+        assert cli._CONTINUATION_PHRASE in action, (
+            "budget is never a checkpoint — high consumption must STILL urge "
+            f"continuation, got: {action!r}"
         )
-        assert cli._CONTINUATION_PHRASE not in action, (
-            "must NOT urge continuation when a checkpoint is genuinely due — "
-            "that would compete with a legitimate stop (Rule 19)"
+        assert payload["next_stage_doc"] is not None, (
+            "a high-consumption run must still get its next stage doc (budget never "
+            f"withholds it), got {payload['next_stage_doc']!r}"
         )
 
-    def test_unmeasurable_budget_does_not_urge_continuation(
-        self, cli, workspace, capsys
-    ):
-        """"Unknown" must not be rendered as "not due" — the fail-OPEN direction.
+    def test_partial_budget_dict_still_continues(self, cli, workspace, capsys):
+        """INVERTED: an unmeasurable budget no longer withholds continuation.
 
-        A partial `budget` dict makes the checkpoint SSOT raise (it indexes
-        `budget["session_total"]`). Before this guard, that exception was swallowed
-        into `should_checkpoint=False` and the payload urged continuation over a
-        checkpoint that might well be pending. For a stall-prevention nudge the safe
-        fallback is silence, never urging.
+        Pre-refactor a partial `budget` dict routed to a "could not be measured —
+        resolve budget first" instruction (fail-safe on the STOP side). Budget-block
+        removed: advance resolves `stages` from the profile and continues regardless;
+        budget is never a gating consideration, so there is nothing to "resolve".
         """
         run_dir = workspace / "Projects" / "P" / ".artifacts" / "runs" / "run_bad"
         run_dir.mkdir(parents=True)
@@ -393,21 +407,21 @@ class TestCheckpointConditioning:
         payload = _advance_payload(cli, _Args("P", "review", "run_bad"), capsys)
         action = payload["next_action"]
 
-        assert cli._CONTINUATION_PHRASE not in action, (
-            "an unmeasurable budget must NOT urge continuation (fail-open): "
-            f"{action!r}"
+        assert cli._CONTINUATION_PHRASE in action, (
+            "a partial budget dict must NOT withhold continuation (budget never "
+            f"blocks): {action!r}"
         )
-        assert re.search(r"could not be measured|run-budget", action, re.I), (
-            f"the payload should say the status is unknown, got: {action!r}"
+        assert not re.search(r"could not be measured", action, re.I), (
+            "the old budget-unmeasured instruction must be gone — budget is not a "
+            f"gating consideration anymore: {action!r}"
         )
 
-    def test_missing_token_cost_counts_as_unmeasured(self, cli, workspace, capsys):
-        """A completed stage with no token_cost makes `consumed` an UNDER-count.
+    def test_missing_token_cost_still_continues(self, cli, workspace, capsys):
+        """INVERTED: a missing token_cost is irrelevant — budget never gates advance.
 
-        The SSOT derives should_checkpoint from that sum, so a missing cost biases
-        the answer toward "not due" — the same fail-open, entered through the front
-        door. Measured across the last 120 real runs: 162/740 (22%) of completed
-        stages carry no token_cost, so this is the common shape, not a corner case.
+        Pre-refactor a completed stage without token_cost under-counted `consumed`
+        and routed to "unmeasured → don't urge continuation". Budget-block removed:
+        token_cost presence/absence no longer affects whether advance continues.
         """
         run_dir = workspace / "Projects" / "P" / ".artifacts" / "runs" / "run_nc"
         run_dir.mkdir(parents=True)
@@ -423,36 +437,23 @@ class TestCheckpointConditioning:
         )
 
         payload = _advance_payload(cli, _Args("P", "review", "run_nc"), capsys)
-        assert cli._CONTINUATION_PHRASE not in payload["next_action"], (
-            "an under-countable budget must not urge continuation: "
-            f"{payload['next_action']!r}"
+        assert cli._CONTINUATION_PHRASE in payload["next_action"], (
+            "a missing token_cost is irrelevant to continuation now (budget never "
+            f"blocks): {payload['next_action']!r}"
         )
 
-    def test_missing_run_id_does_not_urge_continuation(self, cli, workspace, capsys):
-        """No --run-id means the checkpoint question was never asked, not answered."""
+    def test_missing_run_id_still_continues(self, cli, workspace, capsys):
+        """INVERTED: no --run-id is fine — budget was the only thing it gated.
+
+        Pre-refactor a run_id-less advance could not measure budget and withheld
+        continuation. Budget-block removed: there is no budget question to answer,
+        so advance continues (resolving `stages` from the full-profile default).
+        """
         payload = _advance_payload(cli, _Args("P", "review", None), capsys)
 
-        assert cli._CONTINUATION_PHRASE not in payload["next_action"], (
-            "without a run id the checkpoint state is unknown — must not urge "
+        assert cli._CONTINUATION_PHRASE in payload["next_action"], (
+            "without a run id there is no budget to gate on — must still urge "
             f"continuation: {payload['next_action']!r}"
-        )
-
-    def test_checkpoint_due_withholds_the_doc_path_too(self, cli, workspace, capsys):
-        """The FIELD must not invite what the STRING forbids.
-
-        Every stage doc says "advance prints the next doc's path as
-        next_stage_doc — read it", so emitting a populated path alongside "a
-        checkpoint is DUE" leaves a standing continuation affordance.
-        """
-        _write_run(
-            workspace, "P", "run_hi2",
-            completed=["evaluate", "think", "plan"], token_cost=400_000,
-        )
-        payload = _advance_payload(cli, _Args("P", "build", "run_hi2"), capsys)
-
-        assert payload["next_stage_doc"] is None, (
-            "a due checkpoint must withhold the doc path as well as the urging, "
-            f"got {payload['next_stage_doc']!r}"
         )
 
     def test_payload_keys_present_even_when_resolution_fails(
@@ -473,28 +474,31 @@ class TestCheckpointConditioning:
         assert payload["next_stage_doc"] is None
         assert payload["next_action"] is None
 
-    def test_conditioning_uses_the_existing_ssot(self, cli, workspace, monkeypatch, capsys):
-        """Must actually CALL _compute_should_checkpoint, not re-derive a judgement.
+    def test_advance_no_longer_gates_on_budget_ssot(self, cli, workspace, monkeypatch, capsys):
+        """INVERTED: advance must NOT make should_checkpoint gate continuation.
 
-        Asserts by INVOCATION, not by grepping the source: the helper's own
-        docstring names `_compute_should_checkpoint`, so a source-substring check
-        stayed green even with the real call deleted — a vacuous test the
-        adversarial reviewer caught. Behaviour is the only honest assertion here.
+        Pre-refactor advance called `_compute_should_checkpoint` and withheld the
+        continuation phrase when it returned should_checkpoint=true. Budget-block
+        removed: even if the SSOT is forced to return should_checkpoint=True, advance
+        must STILL urge continuation — budget can never gate it. This is the
+        mutation-proof that the budget→withhold wiring is truly gone, not just that
+        the SSOT now returns False.
         """
-        _write_run(workspace, "P", "run_ssot", completed=["evaluate"], token_cost=1_000)
-        calls: list = []
-        real = cli._compute_should_checkpoint
+        _write_run(workspace, "P", "run_force", completed=["evaluate"], token_cost=1_000)
 
-        def _spy(run_state, project):
-            calls.append(project)
-            return real(run_state, project)
+        def _force_due(run_state, project):
+            return {"consumed": 999, "remaining": 0, "usable": 0, "pct_consumed": 99.9,
+                    "next_stage": "think", "next_stage_estimate": 30000,
+                    "should_checkpoint": True, "budget_total": 800000,
+                    "calibration_source": "defaults"}
 
-        monkeypatch.setattr(cli, "_compute_should_checkpoint", _spy, raising=True)
-        _advance_payload(cli, _Args("P", "review", "run_ssot"), capsys)
+        monkeypatch.setattr(cli, "_compute_should_checkpoint", _force_due, raising=True)
+        payload = _advance_payload(cli, _Args("P", "think", "run_force"), capsys)
 
-        assert calls, (
-            "the continuation helper never called _compute_should_checkpoint — it is "
-            "deriving its own checkpoint judgement instead of using the SSOT"
+        assert cli._CONTINUATION_PHRASE in payload["next_action"], (
+            "even a forced should_checkpoint=True must NOT withhold continuation — "
+            "budget never gates advance (STEERING #2). If this fails, a budget→"
+            f"checkpoint wire survived the refactor: {payload['next_action']!r}"
         )
 
 
@@ -657,9 +661,45 @@ class TestStopSideUnweakened:
         )
 
     def test_checkpoint_guard_logic_untouched(self):
-        """cmd_run_checkpoint's should_checkpoint hard-block must still be there."""
+        """cmd_run_checkpoint's CONFABULATION hard-block must still be there.
+
+        After the budget-cognitive-hygiene refactor (2026-10) `measured_checkpoint`
+        is always False (budget removed as a producer), so the confab guard rests on
+        denylist + true-trigger — but the hard-block ITSELF must survive. Asserts the
+        guard's real surviving invariant (the CHECKPOINT REFUSED path + the
+        no-true-trigger reason string), NOT the old `should_checkpoint=false.
+        continue, period.` message, which moved when the :1900 paused gate was
+        rewritten to mirror this guard.
+        """
         src = (BACKEND / "scripts" / "artifact_cli.py").read_text(encoding="utf-8")
         assert "_compute_should_checkpoint" in src
-        assert 'should_checkpoint=false. continue, period.' in src, (
-            "the checkpoint hard-block message disappeared — stop side was weakened"
+        assert "CHECKPOINT REFUSED" in src, (
+            "the checkpoint hard-block disappeared — stop side was weakened"
         )
+        assert "should_checkpoint=false and no true-trigger reason" in src, (
+            "the confab guard's no-true-trigger block message disappeared"
+        )
+
+    def test_budget_removed_as_checkpoint_trigger(self):
+        """REFACTOR POSITIVE ASSERTION: budget is no longer a true-trigger.
+
+        The core of the refactor — mutation-proof that a budget-worded reason is NOT
+        treated as a legitimate pause. If 'budget' is ever re-added to
+        _CHECKPOINT_TRUE_TRIGGERS, this goes RED.
+        """
+        import sys as _s
+        _s.path.insert(0, str(BACKEND))
+        from scripts.artifact_cli import (
+            _CHECKPOINT_TRUE_TRIGGERS,
+            _checkpoint_reason_has_true_trigger,
+        )
+        assert "budget" not in _CHECKPOINT_TRUE_TRIGGERS, (
+            "budget was re-added as a true-trigger — the budget-block it enables is "
+            "banned (STEERING #2 + XG directive)"
+        )
+        assert _checkpoint_reason_has_true_trigger("budget exhausted") is False, (
+            "a budget-worded reason must not count as a true trigger"
+        )
+        # real triggers survive
+        for r in ("l2 block", "retry exhausted", "stuck on X", "judgment call"):
+            assert _checkpoint_reason_has_true_trigger(r) is True, f"lost trigger: {r}"

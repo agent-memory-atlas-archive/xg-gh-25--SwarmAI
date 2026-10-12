@@ -113,15 +113,18 @@ code to actually execute.
 
 Each cycle follows this exact sequence:
 
-### 1. Budget Gate
+### 1. Budget Note (informational — NOT a gate)
 
 ```
-remaining_tokens = session_budget - tokens_consumed
-if remaining_tokens < 150_000:
-    → EXIT with BUDGET (save progress, checkpoint)
+remaining_tokens = session_budget - tokens_consumed   # report-only
 ```
 
-150K = enough for 1 more cycle (~50K) + REFLECT (~30K) + overhead.
+Budget is NEVER a loop-exit (STEERING #2 + XG directive "budget 从来不应该是 block run
+的重要因素"). The former `remaining < 150K → EXIT with BUDGET` block is REMOVED — a
+goal loop runs until a REAL termination: **DoD met** (step 2), **Stuck Detection**
+(step 3, zero progress 3 cycles), **max cycles**, or a true-trigger checkpoint
+(L2/retry). Physical context overflow is handled by SDK autocompact, not a token
+count here. Surface `remaining_tokens` for visibility if useful; do not EXIT on it.
 
 ### 2. DoD Check (exit-first)
 
@@ -290,7 +293,8 @@ if 2 consecutive cycles ended in revert:
 
 ### 12. Loop
 
-Return to Step 1 (Budget Gate) for next cycle.
+Return to Step 1 (Budget Note) for next cycle. Termination is DoD-met / Stuck /
+max-cycles / true-trigger checkpoint — never a budget count.
 
 ---
 
@@ -521,11 +525,15 @@ Goal Loop CONFLICT — cannot progress without regression:
 - Suggestion: [refactor needed / relax test / redefine goal scope]
 ```
 
-### EXIT with BUDGET
+### EXIT with BUDGET (rare — physical context limit only, NOT a token-count gate)
 
-Remaining tokens < 150K mid-session.
+This exit is NO LONGER triggered by a 150K token count (that budget-block was
+removed — STEERING #2). It fires ONLY in the rare case that SDK autocompact cannot
+reclaim enough physical context to continue — a genuine physical ceiling, not a
+budget-conservation choice. In normal operation a goal loop ends via DoD-met,
+Stuck Detection, or max-cycles, never here.
 
-**Record Goal Metrics:**
+**Record Goal Metrics** (the `status="budget"` label is kept for metrics continuity):
 ```python
 gm.track_goal_complete(status="budget",
                        total_cycles=current_cycle, dod_met=<met>, dod_total=<total>)
@@ -533,7 +541,7 @@ gm.track_goal_complete(status="budget",
 
 Output:
 ```
-Goal Loop paused — budget conservation:
+Goal Loop paused — physical context limit (not a budget-conservation stop):
 - Cycles completed: N
 - DoD: X/Y met
 - Progress saved to: [progress_path]

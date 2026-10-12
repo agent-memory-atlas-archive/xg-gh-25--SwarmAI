@@ -1456,6 +1456,47 @@ class TestPipelineSupersedeAndActiveSkip:
         assert data["status"] == "abandoned", \
             f"substring-trap reason must NOT be preserved as deliberate, got {data['status']}"
 
+    def test_budget_reason_pause_is_abandon_eligible(self, tmp_path):
+        """REFACTOR AC8 (2026-10 budget-cognitive-hygiene): a paused run whose reason
+        is budget/token consumption is NO LONGER 'deliberate' and IS superseded.
+
+        Removing 'budget' from _CHECKPOINT_TRUE_TRIGGERS has an INTENDED cross-module
+        effect here: `_checkpoint_reason_has_true_trigger('budget …')` now returns
+        False, so a budget-worded pause loses deliberate-protection and a newer
+        completed sibling supersedes it. This is correct — budget is no longer a
+        legitimate pause reason (STEERING #2), so a budget-paused run should not be
+        protected from auto-abandon. (NOT a reopening of the silent-archive bug: that
+        bug archived runs that SHOULD be protected; budget pauses should not be.)
+        """
+        from datetime import datetime, timezone, timedelta
+        older = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        sup = self._make_run(tmp_path, run_id="run_budget_pause", status="paused",
+                             resume_attempts=3, updated_at=older,
+                             reason="budget 99% consumed — pausing for conservation")
+        self._sibling_done(tmp_path)
+        _get_paused_pipeline_highlights(tmp_path)
+        data = json.loads(sup.read_text())
+        assert data["status"] == "abandoned", (
+            "a budget-worded pause must be abandon-eligible now (budget is not a "
+            f"deliberate/true-trigger reason), got {data['status']}"
+        )
+
+    def test_real_trigger_pause_still_protected_after_budget_removal(self, tmp_path):
+        """REFACTOR AC8 companion: removing budget must NOT weaken protection for
+        REAL triggers. An L2/retry/stuck pause stays deliberate → still protected."""
+        from datetime import datetime, timezone, timedelta
+        older = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        sup = self._make_run(tmp_path, run_id="run_retry_pause", status="paused",
+                             resume_attempts=3, updated_at=older,
+                             reason="retry exhausted on the integration test")
+        self._sibling_done(tmp_path)
+        _get_paused_pipeline_highlights(tmp_path)
+        data = json.loads(sup.read_text())
+        assert data["status"] == "paused", (
+            "a real true-trigger (retry) pause must stay protected after budget "
+            f"removal, got {data['status']}"
+        )
+
     # ── AC3: precision — genuine open run still surfaced ──
     def test_genuine_open_paused_run_still_surfaced(self, tmp_path):
         """A paused run with NO newer completed run is genuinely open — must

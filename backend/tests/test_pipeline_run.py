@@ -589,9 +589,17 @@ class TestRunBudget:
         assert result["next_stage"] == "think"
         assert result["should_checkpoint"] is False
 
-    def test_budget_recommends_checkpoint_when_low(self, workspace, run_id):
-        """Simulate high consumption to trigger checkpoint recommendation."""
-        # Add stages totaling >70% of budget (>560K)
+    def test_high_consumption_never_recommends_checkpoint(self, workspace, run_id):
+        """INVERTED (2026-10 budget-cognitive-hygiene refactor): high token
+        consumption NEVER triggers a checkpoint — budget is not a block factor
+        (STEERING #2 + XG directive "budget 从来不应该是 block run 的重要因素").
+
+        Pre-refactor this asserted should_checkpoint=True at 75% consumed. Budget-
+        block removed: should_checkpoint is now always False regardless of %, while
+        the consumed/pct NUMBERS are still reported (STEERING #3). Physical context
+        overflow is handled by SDK autocompact, not this report.
+        """
+        # Add stages totaling >70% of budget (>560K) — formerly the trigger point.
         for stage_name, cost in [("evaluate", 100_000), ("think", 200_000), ("plan", 300_000)]:
             _run_cli(workspace, "run-update",
                      "--project", "TestProject", "--run-id", run_id,
@@ -606,9 +614,12 @@ class TestRunBudget:
 
         result = _run_cli(workspace, "run-budget",
                           "--project", "TestProject", "--run-id", run_id)
-        assert result["consumed"] == 600_000
-        assert result["pct_consumed"] == 75.0
-        assert result["should_checkpoint"] is True
+        assert result["consumed"] == 600_000, "consumed number must still be reported"
+        assert result["pct_consumed"] == 75.0, "pct number must still be reported"
+        assert result["should_checkpoint"] is False, (
+            "budget NEVER triggers a checkpoint now — 75% consumed must still be "
+            "should_checkpoint=False (STEERING #2)"
+        )
 
     def test_budget_respects_profile(self, workspace):
         """Trivial profile skips plan — next stage after evaluate is think."""
@@ -710,11 +721,16 @@ class TestRunCheckpoint:
         assert state["checkpoint"]["completed_stages"] == ["evaluate"]
 
     def test_checkpoint_publishes_artifact(self, workspace, run_with_stages):
+        # Reason uses a real true-trigger (L2 BLOCK). "Budget exhausted" would now
+        # be REFUSED by the confabulation guard — budget is no longer a true-trigger
+        # (2026-10 budget-cognitive-hygiene refactor, STEERING #2). This test's intent
+        # is "a legit checkpoint publishes a discoverable artifact", so it must use a
+        # reason that still legitimately checkpoints.
         result = _run_cli(workspace, "run-checkpoint",
                           "--project", "TestProject",
                           "--run-id", run_with_stages,
                           "--stage", "build",
-                          "--reason", "Budget exhausted")
+                          "--reason", "L2 BLOCK: unresolvable ambiguity")
         assert result["checkpoint_artifact"] is not None
         assert result["checkpoint_artifact"].startswith("art_")
 

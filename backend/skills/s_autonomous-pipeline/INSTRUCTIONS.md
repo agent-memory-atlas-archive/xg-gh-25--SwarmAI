@@ -183,7 +183,7 @@ Where full does BUILD→REVIEW→TEST once, goal loops them inside goal_cycle:
 2. **THINK** — standard (research alternatives, risk probes)
 3. **PLAN** — standard (defines approach for achieving the goal)
 4. **GOAL_CYCLE** — loops internally (replaces BUILD+REVIEW+TEST):
-   - Each cycle: budget gate → DoD check → pick step → BUILD+TEST → progress → mini-reflect
+   - Each cycle: DoD check → pick step → BUILD+TEST → progress → mini-reflect (budget is NOT a cycle gate — STEERING #2)
    - Periodic REVIEW every N cycles on accumulated diff
    - Final ADVERSARIAL on total changeset when DoD met
    - See `stages/goal_cycle.md` for complete behavior
@@ -525,8 +525,8 @@ After verification:
 > transition, so after it you must immediately Read the next stage's doc (the `advance`
 > output prints its absolute path as `next_stage_doc`) and execute that stage **in the same
 > turn**. The ONLY legal handbacks are a stage-boundary **L2 Judgment** via the Escalation
-> Routing Protocol, or a **true checkpoint trigger** (`should_checkpoint=true`, retries
-> exhausted, mid-stage L2). Ending the turn at a stage boundary for any other reason —
+> Routing Protocol, or a **true checkpoint trigger** (retries exhausted, mid-stage L2,
+> stuck — budget is NOT one). Ending the turn at a stage boundary for any other reason —
 > including having just written "proceeding to <STAGE>" — is a stall, not a handoff:
 > announcing the next stage is not the same as executing it. (Measured failure shape:
 > `stop_reason=end_turn` with zero tool calls in that message, no gate having fired.)
@@ -866,10 +866,14 @@ This returns:
 - `remaining`: session budget minus consumed
 - `next_stage`: the next stage in the profile
 - `next_stage_estimate`: calibrated token estimate for that stage
-- `should_checkpoint`: true if budget is insufficient or >70% consumed
+- `should_checkpoint`: **ALWAYS false** — budget is NEVER a checkpoint trigger
+  (STEERING #2 + XG directive "budget 从来不应该是 block run 的重要因素"). consumed/
+  remaining/pct are informational only. A real checkpoint comes from a true-trigger
+  reason (L2 / retry / stuck / escalat), never from a budget count.
 - `calibration_source`: "historical" (from past runs) or "defaults"
 
-**If `should_checkpoint` is true → run the checkpoint protocol below.**
+**Budget never triggers a checkpoint.** Run the checkpoint protocol below ONLY for a
+true-trigger reason (L2/retry/stuck/…), not because of token consumption.
 
 ### After Each Stage
 
@@ -1038,7 +1042,7 @@ of flow-pollution.
 
 ## Checkpoint Protocol
 
-### ⚠️ [GATE·cli] BLOCKING: Budget Check Required Before ANY Checkpoint
+### ⚠️ [GATE·cli] BLOCKING: True-Trigger Required Before ANY Checkpoint
 
 **NEVER checkpoint based on "feeling" or "intuition" about context usage.**
 Before every checkpoint, you MUST run: (the `cmd_run_checkpoint` CLI command HARD-BLOCKS a
@@ -1049,8 +1053,10 @@ the CLI, not a PreToolUse hook, not prose.)
 python backend/scripts/artifact_cli.py run-budget --project <PROJECT> --run-id <RUN_ID>
 ```
 
-**Only checkpoint if `should_checkpoint: true` in the response** OR one of the
-non-budget triggers below fires. With 1M context (SESSION_BUDGET=800K), a full
+**Checkpoint ONLY when a non-budget true-trigger below fires** (L2 / retry / stuck /
+escalat / error). `should_checkpoint` is ALWAYS false now (budget is never a trigger
+— STEERING #2), so it is NOT a checkpoint condition; run-budget is a consumption
+report, not a checkpoint decision. With 1M context (SESSION_BUDGET=800K), a full
 pipeline (evaluate+think+plan+build+review+test+deliver+reflect) fits comfortably
 in ONE session. Historical average is ~230K tokens for a full run.
 
@@ -1065,18 +1071,17 @@ user time and split work unnecessarily.
 digraph checkpoint_decision {
   rankdir=TB;
   stage_done [label="Stage complete", shape=ellipse];
-  run_budget [label="run-budget\nshould_checkpoint?", shape=diamond];
-  checkpoint_yes [label="CHECKPOINT", shape=box, style=filled, fillcolor="#ffcccc"];
   l2_block [label="L2 BLOCK\npending?", shape=diamond];
+  checkpoint_yes [label="CHECKPOINT\n(true-trigger only:\nL2/retry/stuck)", shape=box, style=filled, fillcolor="#ffcccc"];
   esc_route [label="Escalation Routing:\nstage-boundary +\nchannel=direct?", shape=diamond, style=filled, fillcolor="#e6f2ff"];
   inband [label="IN-BAND ASK\n(AskUserQuestion,\ncontinue SAME run)", shape=box, style=filled, fillcolor="#ccffcc"];
   retries [label="Retries >=\nmax_retries?", shape=diamond];
   error [label="Unexpected\nerror?", shape=diamond];
   continue [label="CONTINUE\n(next stage)", shape=box, style=filled, fillcolor="#ccffcc"];
 
-  stage_done -> run_budget;
-  run_budget -> checkpoint_yes [label="true"];
-  run_budget -> l2_block [label="false"];
+  // Budget is NOT an entry — removed (STEERING #2). Stage-done goes straight to the
+  // real triggers; a budget count never routes to CHECKPOINT.
+  stage_done -> l2_block;
   l2_block -> esc_route [label="yes"];
   esc_route -> inband [label="yes (desktop,\nboundary)"];
   esc_route -> checkpoint_yes [label="no (channel/\nheadless/mid-stage\n/timeout → fail-safe)"];
@@ -1096,7 +1101,10 @@ The `retries`/`error` fall-through path is unchanged.
 **NOT valid reasons to checkpoint:**
 - "BUILD is a big stage" (it's ~60K tokens, you have 800K)
 - "I've read a lot of files" (file reads are cheap, ~2K per file)
-- "Context might be getting full" (run `run-budget` to check, don't guess)
+- "Context might be getting full" (SDK autocompact handles physical overflow — don't guess)
+- **ANY budget / token-consumption reason** — budget is NEVER a valid checkpoint
+  reason (STEERING #2 + XG directive). run-budget is a consumption report, not a
+  checkpoint decision; a high % is informational, never a trigger.
 
 ### How to Checkpoint
 
@@ -1329,10 +1337,13 @@ A: ①GO ②3alt ③4AC ④★PASS | B: ⑤3R3G ⑥clean ⑦28/0 | C: ⑧★2fix
 17. **[MUST] No premature completion.** Do not advance to REFLECT or mark
     status=completed unless the Quality Convergence Loop (Step 4c) exits
     push-ready — all 6 gate layers pass, self-assessment positive, goal
-    aligned. Budget pressure is not a valid reason to skip convergence —
-    if budget is low, CHECKPOINT with clear remaining work, don't
-    compress the loop. A half-delivered feature with a checkpoint resume
-    plan is better than a "completed" pipeline with hidden gaps.
+    aligned. Budget pressure is NEVER a valid reason to skip convergence
+    OR to checkpoint — budget is not a block factor (STEERING #2; a
+    budget-worded checkpoint is now refused by the confabulation guard).
+    If you genuinely cannot finish, hand back only via a true trigger
+    (L2 BLOCK / retries exhausted / stuck), not budget. A half-delivered
+    feature with a legitimate checkpoint resume plan is better than a
+    "completed" pipeline with hidden gaps.
 18. **[MUST] Adversarial findings must be specific.** Each adversarial review
     finding must include: (a) file path and line number or function name,
     (b) what's wrong, (c) concrete fix. Findings like "looks good",
@@ -1578,7 +1589,7 @@ advance  --project <P> --state <stage> --run-id <RUN>           # advance state 
 run-create  --project <P> --requirement "<text>" [--profile <profile>]
 run-update  --project <P> --run-id <R> [--stage-json '<json>'] [--status <S>] [--profile <P>]
 run-get     --project <P> [--run-id <R>]
-run-budget  --project <P> --run-id <R>           # check before next stage
+run-budget  --project <P> --run-id <R>           # informational consumed/pct report (NOT a checkpoint gate)
 run-checkpoint --project <P> --run-id <R> --stage <stg> --reason "<why>"
 run-resume  --project <P> --run-id <R>
 run-status  [--active-only]                      # cross-project dashboard
@@ -1682,7 +1693,8 @@ python backend/scripts/artifact_cli.py run-observe --project <PROJECT> --run-id 
 
 **Reason categories:**
 - `user_stopped` — User explicitly said "stop" or closed session
-- `budget` — run-budget returned should_checkpoint: true
+- `budget` — RARE: physical context limit (SDK autocompact could not reclaim enough) —
+  NOT a token-count/should_checkpoint stop (that budget-block was removed, STEERING #2)
 - `session_crash` — No explicit stop, session ended abnormally
 - `blocker` — L2 BLOCK with no resolution available
 - `superseded` — Same requirement started in a new run
@@ -1733,7 +1745,7 @@ python backend/scripts/artifact_cli.py run-status
 
 ### Resuming After Escalation
 
-When a background pipeline checkpoints (L2 BLOCK or budget), a Radar todo appears.
+When a background pipeline checkpoints (L2 BLOCK / retry / stuck — never budget), a Radar todo appears.
 After the user resolves the issue:
 
 ```bash
