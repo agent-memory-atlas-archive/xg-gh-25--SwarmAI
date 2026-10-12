@@ -4505,6 +4505,41 @@ class TestRenderAuditTrail:
         report = (runs_dir / "REPORT.md").read_text(encoding="utf-8")
         assert "需求溯源审计" not in report, "legacy run must not grow the audit section"
 
+    def test_requirements_without_schema_version_no_audit_block(self, workspace):
+        """#8 (Kiro): the audit-render gate must agree with the validator's gate —
+        a requirements[] present WITHOUT schema_version>=1 is a legacy/half-activated
+        artifact and must NOT render the audit block (presence-vs-version drift). The
+        old gate (`if _eval_art.get('requirements')`) would wrongly render it.
+        Mutation-proven: revert the artifact_cli gate to presence-only -> this goes RED."""
+        import json as _json
+        from types import SimpleNamespace
+        project_dir = workspace / "Projects" / "TestProject"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        for name, body in (
+            ("PRODUCT.md", "# T\n\n## Non-Goals\n\n- **Not X** -- skip.\n"),
+            ("TECH.md", "# T\n\n## Architecture\n\nDesktop.\n"),
+            ("IMPROVEMENT.md", "# T\n\n## What Worked\n\n- OK\n\n## What Failed\n\n- **Retry** -- x\n"),
+            ("PROJECT.md", "# T\n"),
+        ):
+            (project_dir / name).write_text(body)
+        artifacts_dir = project_dir / ".artifacts"
+        runs_dir = artifacts_dir / "runs" / "run_test1"
+        # requirements present, but NO schema_version (half-activated / legacy shape)
+        _make_artifact(artifacts_dir, "run_test1", "art_eval", "evaluation", {
+            "recommendation": "GO", "scope": "standard", "scores": {"s": 5},
+            "requirements": [
+                _fr(id="FR-1", kind="user-stated", status="confirmed", statement="user wants refund"),
+            ],
+        })
+        run = _make_run(runs_dir, stages=[_stage_record("evaluate", artifact_id="art_eval")])
+        run["requirement"] = "Build the order refund flow"
+        (runs_dir / "run.json").write_text(_json.dumps(run))
+        cmd_run_report(SimpleNamespace(project="TestProject", run_id="run_test1"),
+                       ArtifactRegistry(_get_workspace()))
+        report = (runs_dir / "REPORT.md").read_text(encoding="utf-8")
+        assert "需求溯源审计" not in report, \
+            "requirements without schema_version must not render the audit block (#8 gate)"
+
 
 class TestSRSCrossBoundaryE2E:
     """Layer 4 (cross_boundary=true): drive the REAL schema contract across the
@@ -5265,3 +5300,83 @@ class TestUnhashableIdCrashSafe:
         warns = validate_requirements_block(_reqs_block([bad_id, blank_src]), "full")
         assert any("FR-2" in w and "source" in w.lower() for w in warns), \
             f"downstream provenance check must still run after an unhashable id, got {warns}"
+
+
+class TestAcceptanceCoercion:
+    """#5 (Kiro): a single GWT object acceptance (as the doc teaching block showed)
+    was silently read as absent by the list-only consumers -> false INVEST 'no
+    acceptance' WARN + `_(none)_` in the audit table (the glass box lies). Fix coerces
+    acceptance to a list at the _iter_requirements boundary, so all 5 consumers see a
+    list. These teeth thread the FULL boundary (validate_requirements_block /
+    render_requirements_md), NOT a direct _acceptance_is_present/_coerce call — a
+    direct-call test would stay green with the boundary coercion reverted (Gate-1 F3)."""
+
+    def test_single_object_acceptance_no_false_invest_warn(self):
+        # thread validate_requirements_block -> _iter_requirements -> _check_invest ->
+        # _acceptance_is_present. A single GWT object must NOT produce the Testable WARN.
+        from scripts.pipeline_validator import validate_requirements_block
+        data = {
+            "schema_version": REQ_SCHEMA_VERSION, "scope": "standard",
+            "requirements": [{
+                "id": "FR-1", "statement": "user wants a refund path",
+                "work_class": "user-story", "source": {"kind": "user-stated", "ref": "user said X"},
+                "status": "confirmed",
+                "acceptance": {"given": "an order", "when": "refund requested", "then": "money returned"},
+            }],
+        }
+        warns = validate_requirements_block(data, "full")
+        testable = [w for w in warns if "Testable" in w and "no acceptance criterion" in w]
+        assert testable == [], f"single-object acceptance falsely flagged absent: {testable}"
+
+    def test_single_object_acceptance_renders_in_requirements_md(self):
+        # thread render_requirements_md -> _iter_requirements. The row must show the
+        # GWT text and the ● glyph, not ○ / _(none)_.
+        from scripts.pipeline_validator import render_requirements_md
+        data = {
+            "schema_version": REQ_SCHEMA_VERSION,
+            "requirements": [{
+                "id": "FR-1", "statement": "refund path",
+                "work_class": "user-story", "source": {"kind": "user-stated", "ref": "x"},
+                "status": "confirmed",
+                "acceptance": {"given": "an order", "when": "refund requested", "then": "money returned"},
+            }],
+        }
+        md = render_requirements_md(data)
+        assert "money returned" in md, "single-object acceptance text not rendered"
+        assert "_(none)_" not in md, "single-object acceptance rendered as none"
+        assert "○" not in md, "single-object acceptance glyph shows absent"
+
+    def test_partial_gwt_still_absent(self):
+        # §4.5 false-green guard preserved: a partial GWT (no given/when) is NOT present.
+        from scripts.pipeline_validator import validate_requirements_block
+        data = {
+            "schema_version": REQ_SCHEMA_VERSION, "scope": "standard",
+            "requirements": [{
+                "id": "FR-1", "statement": "x", "work_class": "user-story",
+                "source": {"kind": "user-stated", "ref": "x"}, "status": "confirmed",
+                "acceptance": {"then": "money returned"},  # partial: no given/when
+            }],
+        }
+        warns = validate_requirements_block(data, "full")
+        testable = [w for w in warns if "Testable" in w and "no acceptance criterion" in w]
+        assert testable, "partial GWT must still be flagged absent (false-green guard)"
+
+    def test_coerce_acceptance_shapes(self):
+        # supplementary micro-test (NOT the sole tooth): the helper's shape contract.
+        from scripts.pipeline_validator import _coerce_acceptance
+        assert _coerce_acceptance({"given": "g", "when": "w", "then": "t"}) == \
+            [{"given": "g", "when": "w", "then": "t"}]
+        assert _coerce_acceptance("free text") == ["free text"]
+        assert _coerce_acceptance([{"given": "g"}]) == [{"given": "g"}]
+        assert _coerce_acceptance(None) == []
+        assert _coerce_acceptance(123) == []
+
+    def test_iter_requirements_does_not_mutate_original(self):
+        # the shallow-copy contract: coercing acceptance must not rewrite the caller's
+        # data["requirements"] shape (single dict stays a single dict in the source).
+        from scripts.pipeline_validator import _iter_requirements
+        src = {"requirements": [{"id": "FR-1", "acceptance": {"given": "g", "when": "w", "then": "t"}}]}
+        out = _iter_requirements(src)
+        assert isinstance(out[0]["acceptance"], list), "boundary did not coerce to list"
+        assert src["requirements"][0]["acceptance"] == {"given": "g", "when": "w", "then": "t"}, \
+            "original data was mutated"

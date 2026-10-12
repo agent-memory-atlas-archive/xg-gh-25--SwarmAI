@@ -4542,11 +4542,22 @@ def cmd_run_report(args, reg: ArtifactRegistry) -> str:
     # a legacy / free-text run skips it (render_audit_trail_md degrades, but we don't
     # even call it unless there's structured data, to keep old reports unchanged).
     _eval_art = art_data.get("evaluate", {}) if isinstance(art_data.get("evaluate"), dict) else {}
+    # #8: gate must AGREE with the validator's gate (validate_requirements_block, which
+    # requires schema_version>=REQ_SCHEMA_VERSION). A requirements[] present WITHOUT a
+    # valid schema_version is a legacy / half-activated artifact — rendering the new
+    # audit block for it would change an old report's format on a presence-only match
+    # (the presence-vs-version drift, same root as finding #1).
     if _eval_art.get("requirements"):
         try:
-            from pipeline_validator import render_audit_trail_md
-            sections.append(render_audit_trail_md(requirement, _eval_art))
+            from pipeline_validator import render_audit_trail_md, REQ_SCHEMA_VERSION
+            _sv = _eval_art.get("schema_version")
+            # gate agrees with the validator's own (schema_version>=REQ_SCHEMA_VERSION);
+            # a requirements[] without a valid version is legacy/half-activated and skips.
+            if isinstance(_sv, int) and _sv >= REQ_SCHEMA_VERSION:
+                sections.append(render_audit_trail_md(requirement, _eval_art))
         except Exception as _audit_err:  # never let the audit block break the whole report
+            # a VALID structured artifact whose render/import fails degrades VISIBLY (not
+            # a silent skip) — the legacy no-version case is handled by the version gate above.
             sections.append(f"## 需求溯源审计\n_(audit render skipped: {type(_audit_err).__name__})_")
 
     # 2. Evaluation

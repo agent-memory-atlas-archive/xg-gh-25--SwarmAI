@@ -913,9 +913,36 @@ def _acceptance_is_present(acceptance) -> bool:
     return False
 
 
+def _coerce_acceptance(acceptance):
+    """#5: normalize a requirement's `acceptance` to a LIST so the list-only consumers
+    (_acceptance_is_present / _render_acceptance / INVEST / the audit neutralizer) read
+    it uniformly. The doc teaching block once showed a single GWT OBJECT, which every
+    consumer silently read as absent (false `_(none)_` / false INVEST WARN — the glass
+    box lied). A single GWT dict becomes a 1-item list; a non-empty free-text str a
+    1-item list; a list/tuple passes through (as a list); anything else -> []. The
+    presence/partial-GWT judgment stays in _acceptance_is_present (§4.5 false-green
+    guard preserved) — this only fixes the SHAPE, never the present-vs-absent verdict."""
+    if isinstance(acceptance, (list, tuple)):
+        return list(acceptance)
+    if isinstance(acceptance, dict):
+        return [acceptance]
+    if isinstance(acceptance, str) and acceptance.strip():
+        return [acceptance]
+    return []
+
+
 def _iter_requirements(data: dict) -> list[dict]:
     reqs = data.get("requirements", []) if isinstance(data, dict) else []
-    return [r for r in reqs if isinstance(r, dict)]
+    # #5: return shallow copies with acceptance coerced to a list at this single
+    # boundary — all 5 consumers route through here, so one coercion covers them all.
+    # The copy exists so coercing a single-dict acceptance does NOT rewrite the caller's
+    # data["requirements"] shape (the same `data` is shared by validate + audit-render);
+    # it is NOT an anti-mutation measure (no consumer writes back — Gate-1 F1).
+    return [
+        {**r, "acceptance": _coerce_acceptance(r.get("acceptance"))}
+        for r in reqs
+        if isinstance(r, dict)
+    ]
 
 
 def _check_source_provenance(requirements: list[dict]) -> list[str]:

@@ -790,7 +790,7 @@ artifact alongside the free-text `acceptance_criteria` (both coexist — strangl
   {"id": "FR-1", "statement": "<what>", "work_class": "user-story|enabler-story|task|spike|bug",
    "source": {"kind": "user-stated|ddd-derived|assumption", "ref": "<the why / origin>"},
    "status": "confirmed|assumed|needs-clarification",
-   "acceptance": {"given": "...", "when": "...", "then": "<measurable>"}}
+   "acceptance": [{"given": "...", "when": "...", "then": "<measurable>"}]}
 ],
 "clarifications": [
   {"qid": "Q1", "question": "...", "options": ["A. ...","B. ...","X. Other"],
