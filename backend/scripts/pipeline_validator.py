@@ -472,7 +472,7 @@ _NO_STORY_SCOPES = ("docs-only", "docs", "research-only", "research")
 STAGE_SCHEMAS: dict[str, dict[str, list[str]]] = {
     "evaluate": {
         "required": ["recommendation", "scope"],
-        "recommended": ["acceptance_criteria", "scores"],
+        "recommended": ["acceptance_criteria", "scores", "clarifications"],
     },
     "think": {
         "required": ["key_findings"],
@@ -897,6 +897,95 @@ def _check_source_provenance(requirements: list[dict]) -> list[str]:
     return warns
 
 
+_CLARIFICATION_ANSWERERS = ("user", "self")
+
+
+def _check_clarifications(data: dict) -> list[str]:
+    """Run 2 (Phase 2) AC2: WARN-only validation of the clarifications[] array.
+
+    Each clarification records one ambiguity and how it was resolved — whether the
+    agent self-answered it (`answered_by: self`) or the user answered an MCQ
+    (`answered_by: user`). Both are recorded identically and distinguished ONLY by
+    the answerer field (design §4.4) so the §4.6 audit trail can show "who decided
+    what". This check enforces that each entry carries the fields that make it
+    auditable, plus the source.kind<->status consistency invariant below.
+
+    Canonical clarification shape (design SSOT §4.1 + the §4.6.1 audit render —
+    which displays 问题/选项/回答/答者): `{qid, question, options?, answer,
+    answered_by}`. `answer` is the AUDIT ANCHOR (what was actually picked) and is
+    required for a user MCQ. `resolution` is an OPTIONAL self-answer rationale
+    (the evidence a `self` answer rests on) — not the audit anchor, so it is only
+    expected when `answered_by == self`.
+
+    Checks (all WARN-only, never BLOCK — routed into validate()'s warnings[]):
+    - each clarification is a dict with non-empty qid / question
+    - answered_by is one of {user, self}
+    - `answer` is non-empty (the recorded pick — the §4.6.1 audit anchor)
+    - a `self` answer should record its `resolution` (the self-answer evidence)
+    - qids are unique within the array (duplicate = corrupted audit trail,
+      esp. on resume-and-re-append)
+    - CONSISTENCY (O1 clause d): a requirement whose source.kind == 'user-stated'
+      (upgraded because the user answered its MCQ) must be status == 'confirmed'.
+      A user-stated requirement left un-confirmed — including status MISSING/empty,
+      the most likely half-upgrade error — is a recording gap worth a WARN.
+
+    Defensive totality: a non-dict `data`, a non-list `clarifications`, a non-dict
+    entry, or an explicit JSON null in any field never throws — it is skipped or
+    WARNed, never raised. (`(c.get(k) or "")` treats null as missing, not 'None'.)"""
+    if not isinstance(data, dict):
+        return []
+    warns: list[str] = []
+    clarifications = _safe_list(data.get("clarifications"))
+    seen_qids: set[str] = set()
+    for i, c in enumerate(clarifications):
+        if not isinstance(c, dict):
+            warns.append(
+                f"SRS clarification: entry #{i} is not a dict ({type(c).__name__}) — "
+                f"each clarification must be an object with qid/question/answer/answered_by."
+            )
+            continue
+        qid = str(c.get("qid") or "").strip()
+        cid = qid or f"#{i}"
+        if not qid:
+            warns.append(f"SRS clarification: entry {cid} has no qid.")
+        elif qid in seen_qids:
+            warns.append(f"SRS clarification: duplicate qid '{qid}' — qid must be "
+                         f"unique within clarifications[] (a repeated id corrupts the "
+                         f"audit trail; check for a double-append on resume).")
+        else:
+            seen_qids.add(qid)
+        if not str(c.get("question") or "").strip():
+            warns.append(f"SRS clarification: entry {cid} has no question.")
+        if not str(c.get("answer") or "").strip():
+            warns.append(f"SRS clarification: entry {cid} has no answer — record the "
+                         f"pick (the §4.6.1 audit anchor: what was actually decided).")
+        answerer = str(c.get("answered_by") or "").strip()
+        if not answerer:
+            warns.append(f"SRS clarification: entry {cid} has no answered_by — "
+                         f"must be one of {_CLARIFICATION_ANSWERERS}.")
+        elif answerer not in _CLARIFICATION_ANSWERERS:
+            warns.append(f"SRS clarification: entry {cid} answered_by='{answerer}' is not "
+                         f"one of {_CLARIFICATION_ANSWERERS}.")
+        elif answerer == "self" and not str(c.get("resolution") or "").strip():
+            warns.append(f"SRS clarification: entry {cid} answered_by='self' but no "
+                         f"resolution — record the evidence the self-answer rests on.")
+    # CONSISTENCY: user-stated requirement should be confirmed (O1 clause d).
+    # A MISSING/empty status is the likeliest half-upgrade (kind set, status
+    # forgotten) — treat it as inconsistent too, NOT a silent pass (RT1).
+    for r in _iter_requirements(data):
+        rid = r.get("id", "<no-id>")
+        kind = str(_safe_dict(r.get("source")).get("kind") or "").strip()
+        status = str(r.get("status") or "").strip()
+        if kind == "user-stated" and status != "confirmed":
+            shown = status or "<missing>"
+            warns.append(
+                f"SRS clarification: requirement {rid} source.kind='user-stated' but "
+                f"status='{shown}' — a user-answered requirement should be status='confirmed' "
+                f"(O1 clause d: the MCQ answer upgraded its source, status should follow)."
+            )
+    return warns
+
+
 def _check_invest(requirements: list[dict], profile: str) -> list[str]:
     """AC3/AC10: INVEST self-check — WARN-only, and ONLY for work_class in
     {user-story, enabler-story}. spike/bug/task are exempt (anti-ceremony). The
@@ -1005,6 +1094,7 @@ def validate_requirements_block(data: dict, profile: str) -> list[str]:
     warns.extend(_check_source_provenance(requirements))
     warns.extend(_check_invest(requirements, profile))
     warns.extend(_check_requirements_axis(requirements, str(data.get("scope", ""))))
+    warns.extend(_check_clarifications(data))
     return warns
 
 

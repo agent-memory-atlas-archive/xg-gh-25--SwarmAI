@@ -451,7 +451,8 @@ class TestValidateIntegration:
 
         _make_artifact(artifacts_dir, "run_test1", "art_eval", "evaluation",
                        {"recommendation": "GO", "scope": "standard",
-                        "acceptance_criteria": ["a"], "scores": {"s": 5}})
+                        "acceptance_criteria": ["a"], "scores": {"s": 5},
+                        "clarifications": []})
         _make_run(runs_dir, stages=[
             _stage_record("evaluate", artifact_id="art_eval"),
         ])
@@ -4392,3 +4393,255 @@ class TestSRSEnablerStoryAxis:
         errs = validate_artifact_data("evaluate", data, profile="full")
         assert errs == [], \
             f"SRS WARNs leaked into publish-gate errors (Gate-1 regression): {errs}"
+
+
+# ===========================================================================
+# Run 2 (Phase 2): clarifications[] WARN validation — _check_clarifications
+# ===========================================================================
+class TestClarifications:
+    """AC2/AC7: WARN-only validation of the clarifications[] array.
+    Canonical shape (SSOT §4.1 + §4.6.1 audit render): qid/question/options?/
+    answer/answered_by(user|self); `answer` is the audit anchor, `resolution` is
+    the optional self-answer evidence (only expected for answered_by=self).
+    Plus: unique qids, and source.kind<->status consistency (a user-stated req —
+    upgraded via a user MCQ answer, O1 clause d — MUST be status=confirmed,
+    including the missing-status half-upgrade). WARN-only, routed into warnings[]."""
+
+    def _clar(self, **over):
+        # Canonical shape (SSOT §4.1 + §4.6.1 audit render): qid/question/options?/
+        # answer/answered_by. `answer` is the audit anchor; `resolution` is the
+        # optional self-answer evidence (only expected for answered_by=self).
+        base = {"qid": "Q1", "question": "Which retry mode?",
+                "options": ["A. exp-backoff", "B. fixed", "X. Other"],
+                "answer": "A. exp-backoff", "answered_by": "self",
+                "resolution": "self-answer: read retry_manager.py:40"}
+        base.update(over)
+        return base
+
+    def test_conforming_clarifications_zero_warn(self):
+        """A well-formed clarifications[] produces no WARN."""
+        from scripts.pipeline_validator import _check_clarifications
+        data = {"requirements": [], "clarifications": [self._clar()]}
+        assert _check_clarifications(data) == [], _check_clarifications(data)
+
+    def test_empty_clarifications_zero_warn(self):
+        """clarifications: [] is valid (no ambiguity surfaced)."""
+        from scripts.pipeline_validator import _check_clarifications
+        assert _check_clarifications({"requirements": [], "clarifications": []}) == []
+
+    def test_missing_qid_warns(self):
+        from scripts.pipeline_validator import _check_clarifications
+        data = {"clarifications": [self._clar(qid="")]}
+        warns = _check_clarifications(data)
+        assert any("qid" in w for w in warns), warns
+
+    def test_missing_answer_warns(self):
+        """A2: `answer` is the §4.6.1 audit anchor (what was decided) — missing WARNs."""
+        from scripts.pipeline_validator import _check_clarifications
+        data = {"clarifications": [self._clar(answer="")]}
+        warns = _check_clarifications(data)
+        assert any("answer" in w for w in warns), warns
+
+    def test_self_answer_missing_resolution_warns(self):
+        """A `self` answer must record its evidence (resolution)."""
+        from scripts.pipeline_validator import _check_clarifications
+        data = {"clarifications": [self._clar(answered_by="self", resolution="")]}
+        warns = _check_clarifications(data)
+        assert any("resolution" in w for w in warns), warns
+
+    def test_user_answer_needs_no_resolution(self):
+        """A `user` answer's anchor is `answer`, not resolution — no resolution WARN."""
+        from scripts.pipeline_validator import _check_clarifications
+        data = {"clarifications": [self._clar(answered_by="user", resolution="")]}
+        warns = _check_clarifications(data)
+        assert not any("resolution" in w for w in warns), warns
+
+    def test_duplicate_qid_warns(self):
+        """RT2: two clarifications sharing a qid corrupt the audit trail."""
+        from scripts.pipeline_validator import _check_clarifications
+        data = {"clarifications": [
+            self._clar(qid="Q1", answered_by="self"),
+            self._clar(qid="Q1", answered_by="user"),
+        ]}
+        warns = _check_clarifications(data)
+        assert any("duplicate" in w.lower() and "Q1" in w for w in warns), warns
+
+    def test_null_qid_treated_as_missing(self):
+        """C1: an explicit JSON null is treated as missing, not the literal 'None'."""
+        from scripts.pipeline_validator import _check_clarifications
+        data = {"clarifications": [self._clar(qid=None)]}
+        warns = _check_clarifications(data)
+        assert any("no qid" in w for w in warns), warns
+        assert not any("None" in w for w in warns), warns
+
+    def test_bad_answered_by_warns(self):
+        from scripts.pipeline_validator import _check_clarifications
+        data = {"clarifications": [self._clar(answered_by="robot")]}
+        warns = _check_clarifications(data)
+        assert any("answered_by" in w for w in warns), warns
+
+    def test_missing_answered_by_warns(self):
+        from scripts.pipeline_validator import _check_clarifications
+        data = {"clarifications": [self._clar(answered_by="")]}
+        warns = _check_clarifications(data)
+        assert any("answered_by" in w for w in warns), warns
+
+    def test_user_stated_requirement_not_confirmed_warns(self):
+        """source.kind<->status consistency: a user-stated req should be confirmed.
+        This is the O1 clause-d invariant (user answered the MCQ -> source upgraded
+        -> status should follow). WARN when it doesn't."""
+        from scripts.pipeline_validator import _check_clarifications
+        data = {
+            "requirements": [
+                {"id": "FR-1", "statement": "x", "source": {"kind": "user-stated"},
+                 "status": "assumed"}
+            ],
+            "clarifications": [self._clar(answered_by="user")],
+        }
+        warns = _check_clarifications(data)
+        assert any("FR-1" in w and ("confirmed" in w or "status" in w) for w in warns), warns
+
+    def test_user_stated_missing_status_warns(self):
+        """RT1: the half-upgrade (kind set, status absent) is the likeliest error
+        and MUST warn — a falsy status does NOT silently pass."""
+        from scripts.pipeline_validator import _check_clarifications
+        data = {
+            "requirements": [
+                {"id": "FR-1", "statement": "x", "source": {"kind": "user-stated"}}
+            ],
+            "clarifications": [self._clar(answered_by="user")],
+        }
+        warns = _check_clarifications(data)
+        assert any("FR-1" in w and ("confirmed" in w or "status" in w) for w in warns), warns
+
+    def test_user_stated_confirmed_is_clean(self):
+        """The consistent case produces no consistency WARN."""
+        from scripts.pipeline_validator import _check_clarifications
+        data = {
+            "requirements": [
+                {"id": "FR-1", "statement": "x", "source": {"kind": "user-stated"},
+                 "status": "confirmed"}
+            ],
+            "clarifications": [self._clar(answered_by="user")],
+        }
+        warns = _check_clarifications(data)
+        assert not any("FR-1" in w for w in warns), warns
+
+    def test_clarifications_not_a_list_is_safe(self):
+        """Defensive totality: a non-list clarifications must not throw."""
+        from scripts.pipeline_validator import _check_clarifications
+        assert _check_clarifications({"clarifications": "nope"}) == []
+        assert _check_clarifications({}) == []
+
+    def test_clarification_not_a_dict_warns(self):
+        """A non-dict entry WARNs (malformed) and never throws — the warn is
+        asserted, not just no-throw (C2: this test was previously vacuous)."""
+        from scripts.pipeline_validator import _check_clarifications
+        data = {"clarifications": ["notadict", self._clar()]}
+        warns = _check_clarifications(data)
+        assert any("not a dict" in w for w in warns), warns
+
+    def test_wired_into_validate_requirements_block(self):
+        """AC2 wiring: validate_requirements_block routes clarification WARNs through."""
+        from scripts.pipeline_validator import validate_requirements_block
+        data = _reqs_block([
+            {"id": "FR-1", "statement": "x", "source": {"kind": "user-stated"},
+             "status": "assumed", "work_class": "task",
+             "acceptance": {"given": "g", "when": "w", "then": "measurable then"}}
+        ])
+        data["clarifications"] = [self._clar(answered_by="user")]
+        warns = validate_requirements_block(data, "full")
+        assert any("FR-1" in w and ("confirmed" in w or "status" in w) for w in warns), warns
+
+
+class TestClarificationsCrossBoundaryE2E:
+    """Layer 4 (cross_boundary=true): drive the REAL validate_requirements_block
+    through the data-schema seam — a schema-conforming evaluation artifact carrying
+    a user-answered clarification whose requirement was NOT upgraded to confirmed.
+    This exercises the actual source.kind<->status consistency contract end-to-end
+    (not a mock of it). Mutation-proven: revert the consistency check -> this goes RED."""
+
+    def test_real_consistency_seam_fires(self):
+        from scripts.pipeline_validator import validate_requirements_block
+        # Real artifact shape as EVALUATE would publish it (schema_version-gated path).
+        data = _reqs_block([
+            {"id": "FR-1", "statement": "the thing the user clarified",
+             "source": {"kind": "user-stated", "ref": "user answered Q1"},
+             "status": "assumed",  # <-- the inconsistency: user-stated but not confirmed
+             "work_class": "task",
+             "acceptance": {"given": "g", "when": "w", "then": "measurable then"}}
+        ])
+        data["clarifications"] = [
+            {"qid": "Q1", "question": "which?", "answer": "A", "answered_by": "user",
+             "resolution": "user picked A"}
+        ]
+        warns = validate_requirements_block(data, "full")
+        # The real seam must flag FR-1 (user-stated requirement left un-confirmed).
+        assert any("FR-1" in w and ("confirmed" in w or "status" in w) for w in warns), \
+            f"consistency seam did not fire through real validate_requirements_block: {warns}"
+
+    def test_real_consistent_case_clean(self):
+        """The consistent artifact (user-stated + confirmed) produces no FR-1 WARN
+        through the real path — proves the seam discriminates, not blanket-warns."""
+        from scripts.pipeline_validator import validate_requirements_block
+        data = _reqs_block([
+            {"id": "FR-1", "statement": "the thing the user clarified",
+             "source": {"kind": "user-stated", "ref": "user answered Q1"},
+             "status": "confirmed",
+             "work_class": "task",
+             "acceptance": {"given": "g", "when": "w", "then": "measurable then"}}
+        ])
+        data["clarifications"] = [
+            {"qid": "Q1", "question": "which?", "answer": "A", "answered_by": "user",
+             "resolution": "user picked A"}
+        ]
+        warns = validate_requirements_block(data, "full")
+        assert not any("FR-1" in w and ("confirmed" in w or "status" in w) for w in warns), warns
+
+    def test_clarification_warn_threads_through_real_validate(self, workspace):
+        """Meta-review MED: the unit tests call _check_clarifications /
+        validate_requirements_block directly; the only validate()-level E2E fixtures
+        use clarifications: []. This proves the FULL wiring
+        validate() -> validate_requirements_block -> _check_clarifications -> warnings[]
+        fires on a POPULATED clarifications[] through the real CLI entry point — so a
+        future refactor of the schema_version gate / wiring block that silently kills
+        the clarification layer goes RED here (not just in isolation). Mutation-proven."""
+        project_dir = workspace / "Projects" / "TestProject"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        (project_dir / "PRODUCT.md").write_text("# Test\n\n## Non-Goals\n\n- **Not X** -- skip.\n")
+        (project_dir / "TECH.md").write_text("# Test\n\n## Architecture\n\nDesktop app.\n")
+        (project_dir / "IMPROVEMENT.md").write_text(
+            "# Test\n\n## What Worked\n\n- OK\n\n## What Failed\n\n- **Retry too aggressive** -- cascading failures\n"
+        )
+        (project_dir / "PROJECT.md").write_text("# Test\n")
+
+        artifacts_dir = project_dir / ".artifacts"
+        runs_dir = artifacts_dir / "runs" / "run_test1"
+        # A schema_version-gated evaluate artifact with a POPULATED clarifications[]:
+        # a user-answered MCQ whose requirement was left un-confirmed (the inconsistency).
+        _make_artifact(artifacts_dir, "run_test1", "art_eval", "evaluation", {
+            "recommendation": "GO", "scope": "standard",
+            "acceptance_criteria": ["a"], "scores": {"s": 5},
+            "schema_version": REQ_SCHEMA_VERSION,
+            "stage_sealed": ["evaluate"],
+            "requirements": [
+                {"id": "FR-1", "statement": "the thing the user clarified",
+                 "source": {"kind": "user-stated", "ref": "user answered Q1"},
+                 "status": "assumed", "work_class": "task",
+                 "acceptance": {"given": "g", "when": "w", "then": "measurable then"}}
+            ],
+            "clarifications": [
+                {"qid": "Q1", "question": "which?",
+                 "options": ["A. x", "B. y", "X. Other"],
+                 "answer": "A. x", "answered_by": "user"}
+            ],
+        })
+        _make_run(runs_dir, stages=[_stage_record("evaluate", artifact_id="art_eval")])
+
+        result = validate("TestProject", "run_test1", "evaluate")
+        # WARN-only: the artifact still VALIDATES (no publish-gate error).
+        assert result["valid"] is True, result["errors"]
+        # The clarification-layer WARN must thread all the way through validate().
+        assert any("FR-1" in w and ("confirmed" in w or "status" in w)
+                   for w in result["warnings"]), \
+            f"clarification WARN did not thread through real validate(): {result['warnings']}"

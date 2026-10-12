@@ -947,6 +947,25 @@ below). Two structurally different escalation locations, routed differently:
 > `evaluate.md` Exit Routing + Rule #11 (DEFER/REJECT → pipeline ends; ESCALATE →
 > checkpoint). "Continue the same run/stage" is meaningless for a verdict that
 > decided to stop. Do NOT in-band a DEFER.
+>
+> **CLARIFICATION-ESCALATE at EVALUATE *IS* routed here (Phase 2 — the exception to the line
+> above, do NOT conflate).** This is the OTHER EVALUATE escalation: the requirement is worth
+> doing, it just has an unanswered ambiguity (≥2 un-self-answerable, or a blocking unknown like a
+> `work_class` that can't be derived). Unlike the terminal verdict, it is a genuine
+> continue-the-same-run handoff — EVALUATE publishes its artifact with the ambiguous requirement at
+> `status: needs-clarification` + a pending `clarifications[]` entry, and the ambiguity is a
+> **STAGE-BOUNDARY L2** (the artifact IS published; nothing mid-stage is half-written). So it flows
+> through the SAME decision tree below: `channel=direct` → in-band MCQ (`AskUserQuestion`, forced
+> `X. Other`) → on answer, write back `clarifications[]` (`answered_by: user`) + upgrade the
+> requirement's `source.kind`→`user-stated` + `status`→`confirmed`, then **continue the SAME run at
+> EVALUATE** (LIVE: `AskUserQuestion` gate + `continue_with_answer`, interactive session only);
+> `channel≠direct`/headless → checkpoint (free-text reason) + paused-run item, NO timeout (STEERING
+> #2 — a clarification wait is not a hang), **user re-engages an interactive session to answer, then
+> resumes** (a true headless serialize-and-resume carrier — `awaiting-input` state — is Phase-3
+> TO-BUILD, not yet wired). The discriminator from the
+> terminal verdict is purely: *is the requirement worth doing (clarification-escalate) or not
+> (DEFER/REJECT/terminal-ESCALATE)?* — never in-band the latter, always route the former. (Governed
+> by `evaluate.md` § Exit conditions + Exit Routing.)
 
 ### Decision tree (STAGE-BOUNDARY escalations only)
 
@@ -1145,6 +1164,25 @@ PHASE C: DELIVERY    ⑧⑨⑩     — shared quality gate + knowledge loop
 → <key result in one line>
   <optional: DDD insight or Gate verdict>
 ```
+
+**Real-time requirement emit (Phase 2 — ONLY after ① EVALUATE, when it produced a structured
+`requirements[]`).** Immediately after the ① EVALUATE landmark, emit a compact structured block
+rendered from the EVALUATE artifact's `requirements[]`/`clarifications[]` — so the user sees "what
+the AI understood + where it decided for me" in real time, not buried in the run-end REPORT (design
+§4.6.4). This is a desktop/direct emit; in a background/headless run it goes to the checkpoint +
+Pipeline card instead (never lost, just a different surface).
+```
+📋 需求理解(EVALUATE 产出 · 实时)
+  FR-1 [👤 user-stated]   <statement>          ✅ confirmed
+  FR-2 [🧠 self-answered] <statement>(依据…)   ⚠️ assumed    ← 我替你拍的板,看一眼
+  ❓ 待你确认(若有 clarification-escalate):Q1 …(A/B/X.Other)
+  ⚠️ 承重假设:FR-2 若错则 BUILD 返工 → 建议现在确认
+```
+Rules: answerer-distinguished (`👤 user` vs `🧠 self-answered` MUST be visually distinct — the
+self-answered rows are what the user most needs to audit); load-bearing assumptions carry the
+`← 建议现在确认` flag; render from the artifact (no hand-copy — same source as the run-end REPORT
+§4.6.1, so the preview and the archive cannot drift). Skip entirely when EVALUATE produced no
+structured `requirements[]` (old-shape run) — the free-text landmark alone is sufficient.
 
 **Gate verdicts** — output with visual prominence when gates fire:
 ```

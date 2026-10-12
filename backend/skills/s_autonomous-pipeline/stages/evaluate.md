@@ -27,13 +27,45 @@ the pipeline builds something that technically passes but misses the real need.
 **Exit conditions:**
 - 0 ambiguities, 0 conflicts → proceed to scoring
 - 1 ambiguity, derivable from context → resolve inline, note assumption in artifact
-- ≥2 unresolvable ambiguities → **ESCALATE** (not GO with assumptions)
-- Any constraint conflict → **ESCALATE** with explicit conflict description
+- ≥2 unresolvable ambiguities → **CLARIFICATION-ESCALATE** (resumable MCQ — see below, NOT a terminal verdict)
+- Any constraint conflict → **CLARIFICATION-ESCALATE** with explicit conflict description
+
+> **⚠️ CLARIFICATION-ESCALATE ≠ terminal ESCALATE (the Phase-2 distinction — do NOT conflate).**
+> There are TWO escalations in EVALUATE and they route differently:
+> - **CLARIFICATION-ESCALATE** (THIS exit) — the requirement is WORTH doing, it just has an
+>   unanswered ambiguity. The run is NOT dead: publish the EVALUATE artifact with the ambiguous
+>   requirement at `status: needs-clarification` + a pending entry in `clarifications[]`, then route
+>   through INSTRUCTIONS.md § Escalation Routing Protocol's **in-band MCQ** path (reuse the live
+>   `AskUserQuestion` substrate — each question carries A–E options + a forced `X. Other (please
+>   specify)`). On answer → write the answer back into `clarifications[]` (`answered_by: user`),
+>   upgrade the resolved requirement's `source.kind` → `user-stated` + `status` → `confirmed`, and
+>   **continue the SAME run at the SAME stage** (no new run, no checkpoint-and-die). This is the
+>   "能自答就自答,自答不了才问" closed loop — self-answer stays the default (recorded with
+>   `answered_by: self`), the MCQ only fires on the genuinely-unanswerable residue.
+> - **TERMINAL ESCALATE / DEFER / REJECT** (§ Exit Routing + Rule #11) — a scoring verdict that the
+>   requirement should NOT proceed at all. That path ends the run (checkpoint for human review). It
+>   is UNCHANGED by Phase 2 and is NOT routed in-band (INSTRUCTIONS.md:945 "DEFER/REJECT/ESCALATE at
+>   EVALUATE is a terminal verdict"). **Never** convert a terminal verdict into an MCQ, and never
+>   convert a clarification gap into a terminal checkpoint when a desktop session could just ask.
+>
+> **background / scheduled (no interactive channel) — CURRENT behavior vs Phase-3 build:**
+> the in-band MCQ substrate (`AskUserQuestion` gate + `continue_with_answer`) is **live only for an
+> interactive session** — `continue_with_answer` requires a live client in `WAITING_INPUT` state, so a
+> torn-down headless run CANNOT be resumed-with-an-answer today. **Current behavior:** a headless
+> clarification-escalate CHECKPOINTS (free-text reason) and surfaces as a paused-run attention item;
+> the user re-engages an **interactive** session to answer, then resumes. It NEVER self-guesses to
+> keep going, and NEVER adds a timeout that truncates the wait (STEERING #2: a clarification wait is
+> not a hang). **TO-BUILD (Phase 3):** a true headless serialize-the-MCQ-into-the-checkpoint +
+> answer-on-resume carrier (there is no `awaiting-input` checkpoint state yet — do NOT claim one).
+> See § Exit Routing + INSTRUCTIONS.md § Escalation Routing.
 
 **Why this exists:** spec-kit's `clarify` pattern — AI proactively finding spec
 gaps is higher-yield than human review. Without this step, EVALUATE scores a
 vague requirement as GO, acceptance criteria are under-specified, and BUILD
-delivers something technically correct but wrong.
+delivers something technically correct but wrong. **Phase 2 upgrade:** the ≥2-ambiguity exit
+used to be a terminal dead-end (ESCALATE → checkpoint → user re-opens a new run); it is now a
+resumable MCQ loop that keeps the run alive, so the common "能自答" path is untouched and only the
+genuinely-unanswerable residue reaches the user.
 
 #### Self-Socratic Ambiguity Re-Scan (after filling the clarification output)
 
@@ -725,6 +757,65 @@ required, never false-blocked. Distinct `Working-Backwards:` error tag (no overl
 with the Understanding / Ambiguity / REPRO gates). Fail-open on a missing/typo'd
 work_type — this is a framing-quality lens, not a safety gate.
 
+### Structured Requirements (`requirements[]`) + Real-time Visibility (Phase 2) `[GUIDE]`
+
+> Design §4.1/§4.4/§4.6.4. WARN-only (schema_version-gated) — produce it, don't fear a BLOCK.
+> Autonomy-first: this is a RECORD of what you already decided, it adds NO default prompting.
+
+**Produce a structured `requirements[]` array** in the evaluation artifact alongside the free-text
+`acceptance_criteria` (both coexist — strangler). Each requirement:
+
+```json
+"schema_version": 1,
+"requirements": [
+  {"id": "FR-1", "statement": "<what>", "work_class": "user-story|enabler-story|task|spike|bug",
+   "source": {"kind": "user-stated|ddd-derived|assumption", "ref": "<the why / origin>"},
+   "status": "confirmed|assumed|needs-clarification",
+   "acceptance": {"given": "...", "when": "...", "then": "<measurable>"}}
+],
+"clarifications": [
+  {"qid": "Q1", "question": "...", "options": ["A. ...","B. ...","X. Other"],
+   "answer": "A. ...", "answered_by": "user|self", "resolution": "<self-answer evidence — only for answered_by:self>"}
+]
+```
+
+- **Canonical fields (SSOT §4.1 + §4.6.1 audit render = 问题/选项/回答/答者):** `qid`, `question`,
+  `options?`, `answer`, `answered_by`. **`answer` is the AUDIT ANCHOR** — what was actually picked;
+  it is REQUIRED (the §4.6.1 "回答" column). `resolution` is the OPTIONAL self-answer *evidence*
+  (the basis a `self` answer rests on) — expected only when `answered_by: self`, never the anchor.
+  `qid` must be UNIQUE within the array (a duplicate corrupts the audit trail — watch the resume
+  re-append path). The validator (`_check_clarifications`) WARNs on each of these.
+- **`source.kind` is SOUL P1 at the requirement layer** — every requirement cites where it came from.
+- **self-answered ambiguities go in `clarifications[]` too** (`answered_by: self`), recorded identically
+  to user answers and distinguished ONLY by the answerer field — so the §4.6 audit trail shows who
+  decided what. This is "能自答就自答" made legible, not extra prompting.
+- A requirement upgraded by a user MCQ answer: `source.kind`→`user-stated` AND `status`→`confirmed`
+  — set BOTH. The validator WARNs on the half-upgrade (kind set, status forgotten/absent) and on any
+  user-stated-but-not-confirmed requirement — `_check_clarifications`.
+
+**Real-time inline emit (§4.6.4) — show the user what you decided, immediately, don't wait for REPORT.**
+After you produce `requirements[]` and finish the self-answer round (and any MCQ), **emit a compact
+structured block into the chat stream NOW** (right after the EVALUATE landmark — this is the ①
+EVALUATE output carrying its requirement content), rendered from the same artifact (no hand-copy):
+
+```
+📋 需求理解(EVALUATE 产出 · 实时)
+  FR-1 [👤 user-stated]   <statement>            ✅ confirmed
+  FR-2 [🧠 self-answered] <statement>(依据…)     ⚠️ assumed    ← 我替你拍的板,看一眼
+  NFR-1 [🧠 ddd-derived]  <statement>            ✅ confirmed
+  ❓ 待你确认(若有 clarification-escalate):Q1 …(A/B/X.Other)
+  ⚠️ 承重假设:FR-2 若错则 BUILD 返工 → 建议现在确认
+```
+
+Rules: (1) **answerer-distinguished** — `👤 user` vs `🧠 self-answered` MUST be visually distinct;
+the self-answered ones are what the user most needs to see ("where did the AI decide for me"). (2)
+**load-bearing assumptions** (`assumption_weight: load-bearing`, if present) carry the `← 建议现在确认`
+flag. (3) **background/headless has no chat stream** → the block goes to the checkpoint (free-text) +
+Pipeline card, never lost, just a different surface (there is no `awaiting-input` checkpoint state
+today — the Pipeline-card carrier is the current surface). (4) The run-end REPORT still
+carries the full §4.6.1 audit block — the inline emit is an incremental PREVIEW, the REPORT is the
+complete archive; both render from the same `requirements[]`/`clarifications[]` so they cannot drift.
+
 ### Artifact Publish
 
 ```bash
@@ -753,8 +844,22 @@ python backend/scripts/artifact_cli.py advance --project <PROJECT> --state think
 
 ### Exit Routing
 
-- **DEFER or REJECT** -- pipeline ends. Log reason and exit.
-- **ESCALATE** -- L2 BLOCK -- checkpoint. Human review required before pipeline can continue.
+- **DEFER or REJECT** -- pipeline ends. Log reason and exit. (Terminal scoring verdict — the
+  requirement should not proceed. NOT a clarification gap; never routed in-band.)
+- **TERMINAL ESCALATE** -- L2 BLOCK -- checkpoint. Human review required before pipeline can
+  continue. (A scoring verdict that the requirement is too risky/ambiguous-at-the-value-level to
+  proceed — distinct from a clarification gap below.)
+- **CLARIFICATION-ESCALATE** (Phase 2 — the ≥2-ambiguity / constraint-conflict exit from § Exit
+  conditions) -- **NOT terminal.** Publish the EVALUATE artifact with the ambiguous requirement at
+  `status: needs-clarification` + a pending `clarifications[]` entry, then route through
+  **INSTRUCTIONS.md § Escalation Routing Protocol → clarification-escalate**: desktop/direct → in-band
+  MCQ (`AskUserQuestion`, forced `X. Other`) → write back `clarifications[]` (`answered_by: user`) +
+  upgrade `source.kind`→`user-stated` + `status`→`confirmed` → **continue the SAME run at EVALUATE**
+  (this half is LIVE: `AskUserQuestion` gate + `continue_with_answer` on the interactive session);
+  background/headless → checkpoint (free-text reason) + paused-run attention item, pause (NO timeout —
+  STEERING #2), **user re-engages an interactive session to answer, then resumes**. The run stays
+  alive; only the unanswerable residue reaches the user. (A true headless serialize-MCQ-and-resume-on-
+  answer carrier — the `awaiting-input` checkpoint state — does NOT exist yet; it is Phase-3 TO-BUILD.)
 
 ---
 
