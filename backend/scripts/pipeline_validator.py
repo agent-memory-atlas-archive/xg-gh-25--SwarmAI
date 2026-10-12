@@ -472,6 +472,13 @@ _NO_STORY_SCOPES = ("docs-only", "docs", "research-only", "research")
 STAGE_SCHEMAS: dict[str, dict[str, list[str]]] = {
     "evaluate": {
         "required": ["recommendation", "scope"],
+        # requirements/schema_version are deliberately NOT recommended here: a strict-profile
+        # SRS block is produced only on strict evaluates, but _check_schema's "missing
+        # recommended field" nudge is NOT profile-gated — listing them would emit advisory
+        # noise on every trivial/bugfix/docs evaluate that legitimately produces no SRS block.
+        # The publish-command example (evaluate.md Artifact Publish) teaches the fields; the
+        # validator lights up from their PRESENCE (validate_requirements_block), not a schema
+        # nudge. (finding #1 fix — fix(a) only; cosmetic fix(b) dropped as net-negative.)
         "recommended": ["acceptance_criteria", "scores", "clarifications"],
     },
     "think": {

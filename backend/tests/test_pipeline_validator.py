@@ -5042,3 +5042,98 @@ class TestProducerInstruction:
             ("§Structured Requirements must state the requirements[]+schema_version:1 "
              "PAIRING in prose (not just the JSON example) — found none of: "
              f"{pairing_phrases}")
+
+    def _publish_example_data(self) -> str:
+        """Extract the --data JSON payload string from evaluate.md's Artifact Publish
+        command. The payload keeps illustrative `...`/`{...}`/`[...]` placeholders for
+        FREE-TEXT fields, so we never json.loads the whole string — we regex just the
+        structured SRS fields this run adds (requirements/schema_version/clarifications),
+        which MUST be concrete+parseable so a copy-pasting agent emits the block
+        (finding #1: the empty example was the real break that left the glass box dark)."""
+        import pathlib
+        md = (pathlib.Path(__file__).resolve().parent.parent
+              / "skills" / "s_autonomous-pipeline" / "stages" / "evaluate.md").read_text()
+        anchor = "### Artifact Publish"
+        assert anchor in md, "Artifact Publish section missing from evaluate.md"
+        block = md[md.index(anchor):]
+        import re
+        m = re.search(r"--data '(\{.*?\})'\n", block, re.DOTALL)
+        assert m, "could not locate --data payload in Artifact Publish command"
+        return m.group(1)
+
+    @staticmethod
+    def _balanced_array(payload: str, key: str) -> str:
+        """Extract the bracket-balanced [...] value of `key` from a JSON-ish payload
+        that CANNOT be json.loads'd whole (it carries illustrative ... placeholders).
+        A naive non-greedy regex breaks on nested objects (source/acceptance), so we
+        balance brackets instead."""
+        marker = f'"{key}":'
+        assert marker in payload, f"payload missing {key!r}"
+        i = payload.index(marker) + len(marker)
+        while payload[i] != '[':
+            i += 1
+        depth, start = 0, i
+        while i < len(payload):
+            if payload[i] == '[':
+                depth += 1
+            elif payload[i] == ']':
+                depth -= 1
+                if depth == 0:
+                    return payload[start:i + 1]
+            i += 1
+        raise AssertionError(f"unbalanced array for {key!r}")
+
+    def test_publish_example_carries_structured_fields(self):
+        """#1 ROOT FIX: the publish command example must TEACH the three structured
+        fields with concrete, parseable JSON — an agent copy-pasting the command must
+        produce requirements[]+schema_version:1+clarifications[], else validator skips
+        and the audit renders dark. A tag/prose change alone does NOT fix this (the
+        agent copies the COMMAND, not the prose)."""
+        import json, re
+        payload = self._publish_example_data()
+        assert re.search(r'"schema_version"\s*:\s*1', payload), \
+            "publish example --data must carry concrete schema_version:1"
+        reqs = json.loads(self._balanced_array(payload, "requirements"))
+        assert isinstance(reqs, list) and len(reqs) >= 1, "requirements[] must have >=1 entry"
+        r0 = reqs[0]
+        for field in ("id", "statement", "work_class", "source", "status", "acceptance"):
+            assert field in r0, f"example requirement missing required field {field!r}"
+        assert "kind" in r0["source"], "example requirement.source must carry kind"
+        assert re.search(r'"clarifications"\s*:\s*\[', payload), \
+            "publish example --data must carry a clarifications[] array"
+        assert not re.search(r"migrat(e|es|ing|ion)", payload.lower()), \
+            "publish example must avoid the migrat* root (false-trips migration-class gate)"
+
+    def test_example_structured_block_enters_real_validation(self):
+        """#1 TEETH (end-to-end, non-vacuous): a payload mirroring the example's
+        structured fields must ENTER validate_requirements_block's real checks, not the
+        requirements-missing / schema_version-missing early-exit (return []). Mutation:
+        drop requirements/schema_version -> early-exit -> the probe WARN disappears."""
+        import json
+        payload = self._publish_example_data()
+        reqs = json.loads(self._balanced_array(payload, "requirements"))
+        good = {"schema_version": 1, "requirements": reqs, "scope": "standard"}
+        probe = json.loads(json.dumps(good))
+        probe["requirements"][0]["source"] = {"kind": "", "ref": "x"}
+        warns_probe = validate_requirements_block(probe, "standard")
+        assert any("source" in w.lower() for w in warns_probe), \
+            "a blank source.kind must raise a provenance WARN (proves real validation entered)"
+        mut_no_reqs = {k: v for k, v in good.items() if k != "requirements"}
+        assert validate_requirements_block(mut_no_reqs, "standard") == [], \
+            "missing requirements must early-exit to [] (the pre-fix dark state)"
+        mut_no_ver = {k: v for k, v in good.items() if k != "schema_version"}
+        assert validate_requirements_block(mut_no_ver, "standard") == [], \
+            "missing schema_version must early-exit to []"
+
+    def test_evaluate_schema_does_not_nudge_srs_on_every_evaluate(self):
+        """#1 fix(b) DROPPED (net-negative): requirements/schema_version must NOT be in
+        evaluate's `recommended`, because _check_schema's missing-recommended nudge is
+        not profile-gated and would emit advisory noise on every non-strict evaluate that
+        legitimately produces no SRS block. The glass box lights from field PRESENCE
+        (validate_requirements_block), not a schema nudge. (Gate-0: fix(b) was cosmetic.)"""
+        from scripts.pipeline_validator import STAGE_SCHEMAS
+        rec = STAGE_SCHEMAS["evaluate"]["recommended"]
+        assert "requirements" not in rec, \
+            "requirements must NOT be recommended (would noise every non-SRS evaluate)"
+        assert "schema_version" not in rec, \
+            "schema_version must NOT be recommended (would noise every non-SRS evaluate)"
