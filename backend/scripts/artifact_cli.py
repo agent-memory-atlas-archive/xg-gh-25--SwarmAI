@@ -4565,6 +4565,20 @@ def cmd_run_report(args, reg: ArtifactRegistry) -> str:
     sections.append(f"""## 1. Requirement
 {requirement}""")
 
+    # 1.5 Requirement Provenance Audit (Run 3a 块1, design §4.6.1-4.6.3) — the
+    # "glass box": what the AI understood + where it decided for the user. Rendered
+    # mechanically from this run's evaluation artifact (same source as the real-time
+    # inline emit). Only shown when the run produced a STRUCTURED requirements[] —
+    # a legacy / free-text run skips it (render_audit_trail_md degrades, but we don't
+    # even call it unless there's structured data, to keep old reports unchanged).
+    _eval_art = art_data.get("evaluate", {}) if isinstance(art_data.get("evaluate"), dict) else {}
+    if _eval_art.get("requirements"):
+        try:
+            from pipeline_validator import render_audit_trail_md
+            sections.append(render_audit_trail_md(requirement, _eval_art))
+        except Exception as _audit_err:  # never let the audit block break the whole report
+            sections.append(f"## 需求溯源审计\n_(audit render skipped: {type(_audit_err).__name__})_")
+
     # 2. Evaluation
     eval_section = "## 2. Evaluation\n"
     if eval_table_lines:

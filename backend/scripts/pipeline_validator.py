@@ -983,6 +983,33 @@ def _check_clarifications(data: dict) -> list[str]:
                 f"status='{shown}' — a user-answered requirement should be status='confirmed' "
                 f"(O1 clause d: the MCQ answer upgraded its source, status should follow)."
             )
+    # RECONCILE (a) — Run 3a 块2 (RT3, whole-block, EXISTING fields only; NO per-FR
+    # `resolves` linkage — that + direction (b) are deferred to a producer-touching
+    # follow-up run). The audit trail answers "who decided what": if the USER answered
+    # at least one clarification but NO requirement is source.kind='user-stated', the
+    # user's decision was not recorded as a requirement → the link is broken. This is
+    # ADVISORY wording (not an assertion): a user may legitimately answer a non-
+    # requirement-shaping MCQ (priority / tie-break), so it is a soft WARN, never BLOCK
+    # (Gate-1 re-gate NEW-ISSUE: tolerate the false-positive, flag for tuning). Keys on
+    # answered_by=user ONLY — self-answers never demand a user-stated requirement
+    # (autonomy-first). schema_version-gated upstream by validate_requirements_block.
+    reqs = _iter_requirements(data)
+    any_user_answer = any(
+        isinstance(c, dict) and str(c.get("answered_by") or "").strip() == "user"
+        for c in clarifications
+    )
+    any_user_stated = any(
+        str(_safe_dict(r.get("source")).get("kind") or "").strip() == "user-stated"
+        for r in reqs
+    )
+    if any_user_answer and not any_user_stated:
+        warns.append(
+            "SRS clarification: a user answered ≥1 clarification but NO requirement is "
+            "source.kind='user-stated' — the audit trail cannot show which requirement "
+            "the user's decision shaped (advisory: a non-requirement-shaping MCQ answer "
+            "may legitimately leave no user-stated requirement; verify the user's answer "
+            "was recorded on the requirement it decided)."
+        )
     return warns
 
 
@@ -1153,6 +1180,169 @@ def render_requirements_md(data: dict) -> str:
         ac_glyph = "●" if _acceptance_is_present(r.get("acceptance")) else "○"
         ac_text = _render_acceptance(r.get("acceptance"))
         lines.append(f"| {rid} | {wc} | {src_s} | {status} | {ac_glyph} | {ac_text} |")
+    return "\n".join(lines)
+
+
+_ANSWERER_GLYPH = {"user": "👤 user", "self": "🧠 self"}
+
+
+def _neutralize_requirements_for_audit(reqs: list) -> dict:
+    """Build a defensively-escaped `{"requirements": [...]}` copy for the audit
+    derivation table (Gate-2 Red-Team HIGH). render_requirements_md interpolates
+    id / work_class / source.kind|ref / status / acceptance RAW; we map each through
+    _md_cell on a COPY so a newline/pipe in any LLM-authored field cannot inject
+    structure into the glass-box audit block — WITHOUT mutating the shared renderer
+    (which has other consumers + own output-contract tests). Non-dict entries are
+    dropped (matches _iter_requirements). acceptance items (str or GWT dict) are
+    escaped element-wise so _render_acceptance can no longer carry a raw newline."""
+    out: list[dict] = []
+    for r in reqs:
+        if not isinstance(r, dict):
+            continue
+        src = _safe_dict(r.get("source"))
+        safe_src = dict(src)
+        if "kind" in src:
+            safe_src["kind"] = _md_cell(src.get("kind"))
+        if "ref" in src:
+            safe_src["ref"] = _md_cell(src.get("ref"))
+        safe_acc = []
+        for item in (r.get("acceptance") if isinstance(r.get("acceptance"), (list, tuple)) else []):
+            if isinstance(item, str):
+                safe_acc.append(_md_cell(item))
+            elif isinstance(item, dict):
+                safe_acc.append({k: _md_cell(v) for k, v in item.items()})
+            else:
+                safe_acc.append(item)
+        safe = dict(r)
+        safe["id"] = _md_cell(r.get("id", ""))
+        safe["work_class"] = _md_cell(r.get("work_class", ""))
+        safe["status"] = _md_cell(r.get("status", ""))
+        safe["source"] = safe_src
+        safe["acceptance"] = safe_acc
+        out.append(safe)
+    return {"requirements": out}
+
+
+def _md_cell(value) -> str:
+    """Neutralize LLM-authored artifact text before it is interpolated into the
+    audit markdown (Gate-2 MED): fold newlines to a visible marker (so a crafted
+    `statement`/`answer`/`resolution` cannot terminate a list item and inject a
+    fake `## heading` / bullet into the report) and escape `|` (table-column
+    injection). The audit block is the 'glass box' — its own integrity must not be
+    breakable by the very data it renders. ONE rule for EVERY interpolated field, so
+    the per-field escaping drift the Q&A table had cannot recur.
+
+    Whitespace/newline-ONLY input returns "" (not a visible ⏎): an empty-in-substance
+    value must stay empty-in-substance, else a blank acceptance would fold to a
+    non-empty ' ⏎ ' and flip a downstream presence check (○→● false-green). Content
+    with real text keeps its folded newline markers."""
+    raw = str(value if value is not None else "")
+    if not raw.strip():
+        return ""
+    return raw.replace("\\", "\\\\").replace("\n", " ⏎ ").replace("\r", "").replace("|", "\\|")
+
+
+def render_audit_trail_md(requirement: str, data: dict) -> str:
+    """Run 3a 块1 (design §4.6.1-4.6.3): render the requirement-provenance AUDIT
+    block for the run-end REPORT — the "glass box" view of what the AI understood
+    and where it decided for the user. Four parts, ALL mechanically rendered from
+    the run's own evaluation artifact (same source as the real-time inline emit, so
+    preview and archive cannot drift):
+
+      1. Original intent — the run's requirement text, verbatim (audit anchor:
+         "what was originally asked").
+      2. Requirements derivation table — reuses render_requirements_md (id /
+         work_class / source / status / GWT).
+      3. Clarification Q&A — each clarification with a VISUALLY DISTINCT answerer
+         marker (👤 user vs 🧠 self), so an auditor sees who decided what.
+      4. ⚠️ Leftover / unclosed — requirements the AI "decided for you" or left
+         open: source.kind='assumption', status∈{assumed,needs-clarification}, and
+         self-answered clarifications. Triggers key on REAL schema fields only;
+         `assumption_weight='load-bearing'` is an OPTIONAL extra mark (if present),
+         never a trigger. Empty → explicit "✅ none", never a blank.
+
+    PURE function — no gate wiring, no I/O. Graceful degrade: a non-dict/empty data
+    or an absent/empty requirements[] (old-shape, non-structured run) returns an
+    explicit note, never a crash and never a blank block (AC2)."""
+    if not isinstance(data, dict):
+        data = {}
+    reqs = _iter_requirements(data)
+    clarifications = _safe_list(data.get("clarifications"))
+    lines: list[str] = ["## 需求溯源审计 (Requirement Provenance Audit)", ""]
+
+    # 1. Original intent — the requirement text is LLM/user-authored, so it is
+    # neutralized like every other audit field (Gate-2 Red-Team: a newline in the
+    # intent injected a fake heading into the glass-box block). `_md_cell` preserves
+    # content (folds newline to ⏎, escapes |) — the intent is still readable verbatim.
+    lines.append("### 原始意图 (Original Intent)")
+    lines.append(f"> {_md_cell(requirement).strip() or '_(no requirement text)_'}")
+    lines.append("")
+
+    if not reqs:
+        # AC2: graceful degrade — explicit, never blank.
+        lines.append(
+            "_(无结构化需求数据 / no structured requirements[] — this run predates the "
+            "SRS schema or produced only free-text acceptance_criteria; provenance audit "
+            "is unavailable.)_"
+        )
+        return "\n".join(lines)
+
+    # 2. Requirements derivation table — reuse the existing renderer, but feed it a
+    # DEFENSIVELY-NEUTRALIZED copy. render_requirements_md interpolates LLM-authored
+    # fields (id / work_class / source.kind|ref / status / acceptance) raw; under the
+    # glass-box banner a newline in any of them injects a fake heading (Gate-2 Red-Team
+    # HIGH). We neutralize at the CALLER — mapping each field through _md_cell on a copy
+    # — rather than mutating render_requirements_md (shared, has other consumers + own
+    # tests whose output contract we must not change here; the shared-renderer escaping
+    # fix is the separate deferred item). This keeps the audit block injection-proof
+    # (its own AC) without a cross-consumer contract migration.
+    lines.append("### 需求推导 (Derivation)")
+    lines.append(render_requirements_md(_neutralize_requirements_for_audit(reqs)))
+    lines.append("")
+
+    # 3. Clarification Q&A — answerer-distinguished.
+    lines.append("### 澄清问答 (Clarifications — who decided what)")
+    if clarifications:
+        lines.append("| Q | 问题 (question) | 回答 (answer) | 答者 (answered_by) |")
+        lines.append("|---|------------------|---------------|---------------------|")
+        for c in clarifications:
+            if not isinstance(c, dict):
+                continue
+            qid = _md_cell(c.get("qid") or "?")
+            q = _md_cell(c.get("question") or "")
+            a = _md_cell(c.get("answer") or "")
+            answerer = str(c.get("answered_by") or "").strip()
+            # Known answerer → trusted glyph constant (safe); any off-vocab value is
+            # cell-escaped like every other field (Gate-2 LOW: glyph fallback was raw).
+            glyph = _ANSWERER_GLYPH.get(answerer) or (_md_cell(answerer) if answerer else "_(unspecified)_")
+            lines.append(f"| {qid} | {q} | {a} | {glyph} |")
+    else:
+        lines.append("_(无澄清记录 / no clarifications)_")
+    lines.append("")
+
+    # 4. ⚠️ Leftover / unclosed — what the AI decided for you or left open.
+    lines.append("### ⚠️ 遗留 / 未闭合 (Leftover — what the AI decided for you)")
+    leftover: list[str] = []
+    for r in reqs:
+        rid = _md_cell(r.get("id", "?"))
+        src = _safe_dict(r.get("source"))
+        kind = str(src.get("kind") or "").strip()
+        status = str(r.get("status") or "").strip()
+        mark = " ← 建议现在确认" if str(src.get("assumption_weight") or "").strip() == "load-bearing" else ""
+        stmt = _md_cell(r.get("statement") or "")
+        if kind == "assumption":
+            leftover.append(f"- [ASSUMPTION] {rid}: {stmt}{mark}")
+        elif status in ("assumed", "needs-clarification"):
+            leftover.append(f"- [{status.upper()}] {rid}: {stmt}{mark}")
+    for c in clarifications:
+        if isinstance(c, dict) and str(c.get("answered_by") or "").strip() == "self":
+            qid = _md_cell(c.get("qid") or "?")
+            leftover.append(f"- [SELF-ANSWERED] {qid}: {_md_cell(c.get('answer') or '')} "
+                            f"(🧠 AI 替你拍的板 — resolution: {_md_cell(c.get('resolution') or '')})")
+    if leftover:
+        lines.extend(leftover)
+    else:
+        lines.append("✅ 无未闭合问题 (no leftover — all requirements closed, no AI assumptions)")
     return "\n".join(lines)
 
 

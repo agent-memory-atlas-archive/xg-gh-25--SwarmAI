@@ -47,6 +47,9 @@ from scripts.pipeline_validator import (
 from scripts.artifact_cli import (
     _extract_run_metrics,
     _record_validation_event,
+    cmd_run_report,
+    ArtifactRegistry,
+    _get_workspace,
 )
 from core.pipeline_profiles import get_profile_stages, PIPELINE_PROFILES
 
@@ -4264,6 +4267,245 @@ class TestRenderRequirementsMd:
             "Testable must use a neutral glyph (U+25CB/25CF), not a checkmark (false-green)"
 
 
+class TestRenderAuditTrail:
+    """Run 3a 块1: render_audit_trail_md — the §4.6.1 requirement-provenance audit
+    block for the run-end REPORT. Four parts: original intent verbatim + requirements
+    table (reuses render_requirements_md) + clarification Q&A table (answerer-
+    distinguished) + ⚠️leftover section (triggers = REAL schema fields only)."""
+
+    def _data(self):
+        return {
+            "requirements": [
+                _fr(id="FR-1", kind="user-stated", status="confirmed",
+                    statement="user wants A"),
+                # FR-2 triggers the leftover section ONLY via the assumption-KIND
+                # branch (status=confirmed, so the status branch cannot also catch it
+                # — pins the kind branch independently so a mutation of it goes RED).
+                _fr(id="FR-2", kind="assumption", status="confirmed",
+                    statement="assumed B", work_class="task"),
+                # NFR-1 triggers ONLY via the needs-clarification STATUS branch
+                # (kind=ddd-derived, not assumption — pins the status branch).
+                _fr(id="NFR-1", kind="ddd-derived", status="needs-clarification",
+                    statement="p99<200ms", work_class="task"),
+            ],
+            "clarifications": [
+                {"qid": "Q1", "question": "A or B?", "options": ["A", "B", "X. Other"],
+                 "answer": "A", "answered_by": "user"},
+                {"qid": "Q2", "question": "threshold?", "answer": "200ms",
+                 "answered_by": "self", "resolution": "DDD default TECH.md:L120"},
+            ],
+            "schema_version": REQ_SCHEMA_VERSION,
+        }
+
+    def test_contains_original_intent_verbatim(self):
+        """AC1(a): the run's original requirement text appears verbatim."""
+        from scripts.pipeline_validator import render_audit_trail_md
+        md = render_audit_trail_md("Build the refund flow for orders", self._data())
+        assert "Build the refund flow for orders" in md
+
+    def test_contains_requirements_table(self):
+        """AC1(b): the FR/NFR derivation table (reused render) appears."""
+        from scripts.pipeline_validator import render_audit_trail_md
+        md = render_audit_trail_md("req", self._data())
+        assert "FR-1" in md and "FR-2" in md and "NFR-1" in md
+
+    def test_clarification_qa_answerer_distinguished(self):
+        """AC1(c)/AC3: the Q&A table shows each clarification with a VISUALLY DISTINCT
+        answerer marker (👤 user vs 🧠 self)."""
+        from scripts.pipeline_validator import render_audit_trail_md
+        md = render_audit_trail_md("req", self._data())
+        assert "Q1" in md and "Q2" in md
+        assert "👤" in md and "🧠" in md, "answerer must be visually distinguished"
+
+    def test_leftover_section_lists_real_field_triggers(self):
+        """AC1(d)/AC3: the ⚠️leftover section lists assumption-source requirements,
+        un-closed statuses (assumed / needs-clarification), and self-answered
+        clarifications — all keyed on REAL schema fields."""
+        from scripts.pipeline_validator import render_audit_trail_md
+        md = render_audit_trail_md("req", self._data())
+        # FR-2 (assumption/assumed) and NFR-1 (needs-clarification) must surface as leftover;
+        # FR-1 (user-stated/confirmed) must NOT be a leftover.
+        after = md.split("遗留")[-1] if "遗留" in md else md.split("Leftover")[-1]
+        # FR-2 pins the assumption-KIND branch (it is status=confirmed, so ONLY the
+        # kind branch can surface it) + the ASSUMPTION tag; NFR-1 pins the STATUS
+        # branch. Both must appear — so a mutation of either branch goes RED.
+        assert "FR-2" in after and "ASSUMPTION" in after, \
+            f"assumption-kind leftover branch not surfaced: {after[:400]}"
+        assert "NFR-1" in after and "NEEDS-CLARIFICATION" in after, \
+            f"needs-clarification status leftover branch not surfaced: {after[:400]}"
+        # FR-1 (user-stated/confirmed) must NOT be a leftover. Use a token boundary:
+        # a bare "FR-1" check would false-match inside "NFR-1".
+        import re as _re
+        assert not _re.search(r"\bFR-1\b", after), \
+            f"closed user-stated req wrongly listed as leftover: {after[:400]}"
+
+    def test_no_leftover_states_explicit_clean(self):
+        """AC1(d): with everything closed (all confirmed, user-stated), the leftover
+        section explicitly says there are none (not an empty blank)."""
+        from scripts.pipeline_validator import render_audit_trail_md
+        data = {
+            "requirements": [_fr(id="FR-1", kind="user-stated", status="confirmed")],
+            "clarifications": [{"qid": "Q1", "question": "?", "answer": "A",
+                                "answered_by": "user"}],
+            "schema_version": REQ_SCHEMA_VERSION,
+        }
+        md = render_audit_trail_md("req", data)
+        assert "✅" in md or "无" in md.split("遗留")[-1] or "none" in md.lower(), md
+
+    def test_graceful_degrade_no_structured_requirements(self):
+        """AC2: no structured requirements[] (old-shape / non-structured run) → the
+        function degrades to an explicit note, never crashes, never a blank block."""
+        from scripts.pipeline_validator import render_audit_trail_md
+        md_empty = render_audit_trail_md("req", {})
+        md_noreqs = render_audit_trail_md("req", {"requirements": []})
+        for md in (md_empty, md_noreqs):
+            assert isinstance(md, str) and len(md.strip()) > 0
+            assert "结构化" in md or "structured" in md.lower() or "no requirement" in md.lower()
+
+    def test_audit_fields_neutralize_markdown_injection(self):
+        """Gate-2 MED (both reviewers): the audit block is the 'glass box' — its own
+        integrity cannot be broken by LLM-authored artifact text. EVERY interpolated
+        field (statement / answer / resolution / qid / off-vocab answered_by) must
+        neutralize a `|` (table-column injection) AND a newline (fake-heading / fake-
+        bullet injection), so a crafted field cannot inject structure into the report.
+        The sibling Q&A cells already escaped `|`; this pins the WHOLE function to one
+        rule (no per-field escaping drift)."""
+        from scripts.pipeline_validator import render_audit_trail_md
+        data = {
+            "requirements": [
+                _fr(id="FR-1", kind="assumption", status="confirmed",
+                    statement="assume\n## FAKE HEADER\n- injected bullet | col"),
+            ],
+            "clarifications": [
+                {"qid": "Q|1", "question": "pipe?", "answer": "yes\n## INJECTED",
+                 "answered_by": "a|b|c"},
+                {"qid": "Q2", "question": "t?", "answer": "x\n- fake",
+                 "answered_by": "self", "resolution": "ref\n## RES-HEADER"},
+            ],
+            "schema_version": REQ_SCHEMA_VERSION,
+        }
+        md = render_audit_trail_md("req", data)
+        # No raw newline-introduced markdown heading survives from a field value.
+        assert "\n## FAKE HEADER" not in md, "leftover statement newline injected a heading"
+        assert "\n## INJECTED" not in md, "Q&A answer newline injected a heading"
+        assert "\n## RES-HEADER" not in md, "resolution newline injected a heading"
+        assert "\n- injected bullet" not in md, "leftover statement newline injected a bullet"
+        # The off-vocab answerer value with pipes must be escaped (not raw column break).
+        assert "| a|b|c |" not in md, "off-vocab answered_by injected raw pipes into the Q&A table"
+
+    def test_audit_derivation_table_and_intent_neutralize_injection(self):
+        """Gate-2 Red-Team HIGH: the glass-box guarantee is INCOMPLETE if the part-2
+        derivation table (which reuses render_requirements_md) and the part-1 original-
+        intent blockquote interpolate LLM-authored artifact fields RAW. source.ref /
+        acceptance / id / status / work_class and the requirement text are all
+        LLM-authored — a newline in any of them injects a fake heading/bullet INTO the
+        audit block whose stated AC is injection-proof provenance. The audit renderer
+        must neutralize these at the caller (without mutating the shared
+        render_requirements_md, which has other consumers / own tests)."""
+        from scripts.pipeline_validator import render_audit_trail_md
+        data = {
+            "requirements": [{
+                "id": "FR-1", "work_class": "task", "status": "confirmed",
+                "source": {"kind": "ddd-derived",
+                           "ref": "TECH.md\n## INJECTED VIA SOURCE REF\n- fake bullet"},
+                "acceptance": ["normal AC\n## INJECTED VIA ACCEPTANCE\n- bullet"],
+            }],
+            "clarifications": [],
+            "schema_version": REQ_SCHEMA_VERSION,
+        }
+        md = render_audit_trail_md("req line1\n## INTENT INJECT\n- bullet", data)
+        assert "\n## INJECTED VIA SOURCE REF" not in md, "source.ref newline injected a heading into the derivation table"
+        assert "\n## INJECTED VIA ACCEPTANCE" not in md, "acceptance newline injected a heading into the derivation table"
+        assert "\n## INTENT INJECT" not in md, "original-intent blockquote newline injected a heading"
+        # FR-1 still rendered (escaping neutralizes structure, does not drop content).
+        assert "FR-1" in md
+
+    def test_audit_neutralizer_does_not_flip_presence_glyph(self):
+        """Gate-2 adversarial-verify LOW: the injection neutralizer must NOT make a
+        whitespace-ONLY acceptance look PRESENT. _md_cell folds newline→⏎, which would
+        turn a blank acceptance into a non-empty ' ⏎ ' and flip the AC-present check
+        (○ absent → ● present false-green) in the audit derivation table — defeating
+        the glass box's own 'not misleadable by its data' property. Whitespace-only in
+        → empty out, so presence is judged on real content."""
+        from scripts.pipeline_validator import render_audit_trail_md, render_requirements_md, _neutralize_requirements_for_audit
+        reqs = [{"id": "FR-1", "status": "assumed", "source": {"kind": "assumption"},
+                 "acceptance": [{"given": "\n", "when": "\n", "then": "\n"}]}]
+        neutralized = render_requirements_md(_neutralize_requirements_for_audit(reqs))
+        raw = render_requirements_md({"requirements": reqs})
+        # Both tables must agree the AC is ABSENT (○) — the audit copy must not upgrade it.
+        assert "○" in neutralized, "whitespace-only acceptance flipped to present (●) in the audit table"
+        assert ("○" in raw) == ("○" in neutralized), "audit table disagrees with the real table on AC presence"
+
+    def test_audit_block_threads_through_real_run_report(self, workspace):
+        """Layer 4 (cross_boundary=true): drive the REAL cmd_run_report through the
+        report-generation seam — a structured evaluation artifact must produce the
+        '需求溯源审计' section in REPORT.md on disk. Proves the wiring
+        cmd_run_report -> render_audit_trail_md is live end-to-end. Mutation-proven:
+        remove the sections.append (or its `if _eval_art.get('requirements')` guard)
+        -> RED. A legacy run WITHOUT structured requirements[] must NOT grow it."""
+        import json as _json
+        from types import SimpleNamespace
+        project_dir = workspace / "Projects" / "TestProject"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        for name, body in (
+            ("PRODUCT.md", "# T\n\n## Non-Goals\n\n- **Not X** -- skip.\n"),
+            ("TECH.md", "# T\n\n## Architecture\n\nDesktop.\n"),
+            ("IMPROVEMENT.md", "# T\n\n## What Worked\n\n- OK\n\n## What Failed\n\n- **Retry too aggressive** -- cascades\n"),
+            ("PROJECT.md", "# T\n"),
+        ):
+            (project_dir / name).write_text(body)
+        artifacts_dir = project_dir / ".artifacts"
+        runs_dir = artifacts_dir / "runs" / "run_test1"
+        _make_artifact(artifacts_dir, "run_test1", "art_eval", "evaluation", {
+            "recommendation": "GO", "scope": "standard", "scores": {"s": 5},
+            "schema_version": REQ_SCHEMA_VERSION,
+            "requirements": [
+                _fr(id="FR-1", kind="user-stated", status="confirmed", statement="user wants refund"),
+                _fr(id="FR-2", kind="assumption", status="assumed", statement="assume async", work_class="task"),
+            ],
+            "clarifications": [
+                {"qid": "Q1", "question": "sync or async?", "answer": "async",
+                 "answered_by": "self", "resolution": "TECH.md default"},
+            ],
+        })
+        run = _make_run(runs_dir, stages=[_stage_record("evaluate", artifact_id="art_eval")])
+        run["requirement"] = "Build the order refund flow"
+        (runs_dir / "run.json").write_text(_json.dumps(run))
+
+        cmd_run_report(SimpleNamespace(project="TestProject", run_id="run_test1"),
+                       ArtifactRegistry(_get_workspace()))
+        report = (runs_dir / "REPORT.md").read_text(encoding="utf-8")
+        assert "需求溯源审计" in report, "audit section missing from REPORT.md"
+        assert "Build the order refund flow" in report  # original intent verbatim
+        assert "FR-2" in report and "ASSUMPTION" in report  # leftover surfaced
+        assert "🧠" in report  # self-answered clarification distinguished
+
+    def test_legacy_run_report_has_no_audit_block(self, workspace):
+        """Discriminator: a run whose evaluation artifact has NO structured
+        requirements[] must NOT grow the audit section (old reports unchanged)."""
+        from types import SimpleNamespace
+        project_dir = workspace / "Projects" / "TestProject"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        for name, body in (
+            ("PRODUCT.md", "# T\n\n## Non-Goals\n\n- **Not X** -- skip.\n"),
+            ("TECH.md", "# T\n\n## Architecture\n\nDesktop.\n"),
+            ("IMPROVEMENT.md", "# T\n\n## What Worked\n\n- OK\n\n## What Failed\n\n- **Retry** -- x\n"),
+            ("PROJECT.md", "# T\n"),
+        ):
+            (project_dir / name).write_text(body)
+        artifacts_dir = project_dir / ".artifacts"
+        runs_dir = artifacts_dir / "runs" / "run_test1"
+        _make_artifact(artifacts_dir, "run_test1", "art_eval", "evaluation", {
+            "recommendation": "GO", "scope": "standard", "scores": {"s": 5},
+            "acceptance_criteria": ["free text AC only"],
+        })
+        _make_run(runs_dir, stages=[_stage_record("evaluate", artifact_id="art_eval")])
+        cmd_run_report(SimpleNamespace(project="TestProject", run_id="run_test1"),
+                       ArtifactRegistry(_get_workspace()))
+        report = (runs_dir / "REPORT.md").read_text(encoding="utf-8")
+        assert "需求溯源审计" not in report, "legacy run must not grow the audit section"
+
+
 class TestSRSCrossBoundaryE2E:
     """Layer 4 (cross_boundary=true): drive the REAL schema contract across the
     seam — the AC-ID matcher (BUILD ac_coverage consumer) + the publish-gate
@@ -4552,6 +4794,88 @@ class TestClarifications:
         data["clarifications"] = [self._clar(answered_by="user")]
         warns = validate_requirements_block(data, "full")
         assert any("FR-1" in w and ("confirmed" in w or "status" in w) for w in warns), warns
+
+    # ── Run 3a 块2: reconciliation(a) — audit-trail "who decided what" (whole-block) ──
+    def test_reconcile_a_user_clarification_but_no_user_stated_req_warns(self):
+        """块2 AC4: an answered_by=user clarification exists, but NO requirement is
+        source.kind=user-stated → the audit link is broken (a user decided something,
+        but no requirement records it). WARN (advisory, whole-block, existing fields).
+        Isolated from the consistency WARN by using a ddd-derived requirement (so the
+        user-stated->confirmed check does not fire)."""
+        from scripts.pipeline_validator import _check_clarifications
+        data = {
+            "requirements": [
+                {"id": "FR-1", "statement": "x",
+                 "source": {"kind": "ddd-derived", "ref": "TECH.md"},
+                 "status": "confirmed"}
+            ],
+            "clarifications": [self._clar(answered_by="user")],
+        }
+        warns = _check_clarifications(data)
+        assert any(("user-stated" in w or "审计" in w or "audit" in w.lower())
+                   and ("user" in w.lower()) for w in warns), \
+            f"reconcile(a) did not fire for user-clarification-without-user-stated-req: {warns}"
+
+    def test_reconcile_a_user_clarification_with_user_stated_req_clean(self):
+        """The reconciled case: a user clarification AND a user-stated requirement →
+        no reconcile(a) WARN (discriminates, not blanket). The user-stated req is
+        confirmed so the consistency WARN also stays silent."""
+        from scripts.pipeline_validator import _check_clarifications
+        data = {
+            "requirements": [
+                {"id": "FR-1", "statement": "x",
+                 "source": {"kind": "user-stated", "ref": "user said so"},
+                 "status": "confirmed"}
+            ],
+            "clarifications": [self._clar(answered_by="user")],
+        }
+        warns = _check_clarifications(data)
+        assert not any("audit" in w.lower() or "审计" in w for w in warns), \
+            f"reconcile(a) false-fired on a reconciled case: {warns}"
+
+    def test_reconcile_a_only_self_answers_no_warn(self):
+        """Reconcile(a) keys on answered_by=user. A block with only self-answers (and
+        no user-stated req) must NOT WARN — self-answers do not demand a user-stated
+        requirement (that is autonomy-first, not an audit gap)."""
+        from scripts.pipeline_validator import _check_clarifications
+        data = {
+            "requirements": [
+                {"id": "FR-1", "statement": "x",
+                 "source": {"kind": "ddd-derived", "ref": "TECH.md"},
+                 "status": "confirmed"}
+            ],
+            "clarifications": [self._clar(answered_by="self")],
+        }
+        warns = _check_clarifications(data)
+        assert not any("audit" in w.lower() or "审计" in w for w in warns), \
+            f"reconcile(a) wrongly fired on self-only answers: {warns}"
+
+    def test_reconcile_a_silent_on_legacy_run_through_gate(self):
+        """Meta-review axis-3: the reconcile(a) WARN must NOT fire on a LEGACY run
+        (no schema_version). The 3 reconcile tests above call _check_clarifications
+        directly (bypassing the gate); this pins that the PUBLIC entry
+        validate_requirements_block suppresses the new WARN for an old-shape artifact
+        via the schema_version gate — so Phase 1/2 historical runs are untouched. A
+        would-fire payload (user clarification + no user-stated req) is given WITHOUT
+        schema_version, and the gate must return [] regardless."""
+        from scripts.pipeline_validator import validate_requirements_block
+        would_fire = {
+            "requirements": [
+                {"id": "FR-1", "statement": "x",
+                 "source": {"kind": "ddd-derived", "ref": "TECH.md"},
+                 "status": "confirmed"}
+            ],
+            "clarifications": [self._clar(answered_by="user")],
+            # NO schema_version → legacy / old-shape artifact.
+        }
+        assert validate_requirements_block(would_fire, "full") == [], \
+            "schema_version gate failed to suppress reconcile(a) WARN on a legacy run"
+        # And WITH schema_version the same payload DOES surface the WARN (proves the
+        # gate is the only thing suppressing it — not a dead check).
+        would_fire_versioned = dict(would_fire, schema_version=REQ_SCHEMA_VERSION)
+        warns = validate_requirements_block(would_fire_versioned, "full")
+        assert any(("user-stated" in w or "审计" in w or "audit" in w.lower()) for w in warns), \
+            f"reconcile(a) did not surface through the gated public entry when versioned: {warns}"
 
 
 class TestClarificationsCrossBoundaryE2E:
