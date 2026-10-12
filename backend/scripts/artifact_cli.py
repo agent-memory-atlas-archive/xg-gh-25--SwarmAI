@@ -470,6 +470,17 @@ def cmd_publish(args, reg: ArtifactRegistry) -> None:
                 pass  # Pollinate validator error — non-blocking, skip silently
 
     run_id = getattr(args, "run_id", None)
+    # NOTE: run_id=None here is a DOCUMENTED LEGITIMATE path, not a defect — do
+    # not "harden" it to reject bare publishes. A no-run_id publish is how three
+    # standalone skills emit an artifact OUTSIDE a pipeline run: s_evaluate on
+    # ESCALATE (preserve context for async resolution), s_deliver and s_qa in
+    # standalone mode (their SKILL docs explicitly say "no pipeline run — omit
+    # --run-id"). The resulting bare `{type}-{date}.json` is manifest-tracked and
+    # read ONLY by artifact_id (never reconstructed by date) since the by-date
+    # readers were deleted (#4, commit 5cf66667) — so a bare publish cannot
+    # cross-contaminate a run report. The ONLY run-blind write that WAS a risk
+    # (the HTTP publish endpoint) is fail-closed; a `--stage` publish with no
+    # --run-id also fails closed (below). Bare publishes themselves are benign.
     try:
         artifact_id = reg.publish(
             project=args.project,
@@ -4233,11 +4244,10 @@ def cmd_run_report(args, reg: ArtifactRegistry) -> str:
     requirement = run_state.get("requirement", "")
 
     # ── Load artifact data strictly from this run ──────────────────────
-    # IMPORTANT: Only load artifacts linked by this run's stage artifact_ids
-    # or matching this run's date. Never use "latest" fallback — causes
-    # cross-contamination between runs.
+    # IMPORTANT: Only load artifacts linked by this run's stage artifact_ids.
+    # Never use a "latest" or by-date fallback — both cause cross-contamination
+    # between runs (see the #4 NOTE below).
     art_data: dict[str, dict] = {}  # stage_name -> artifact data
-    run_date = (run_state.get("created_at", "") or "")[:10].replace("-", "")  # YYYYMMDD
 
     for s in stages:
         stage_name = s.get("stage", "?")
