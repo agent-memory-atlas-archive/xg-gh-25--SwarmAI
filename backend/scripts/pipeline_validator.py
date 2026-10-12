@@ -445,6 +445,30 @@ _WB_ECONOMIC_FIELDS = ("current_workaround", "why_better", "must_be_true")
 _WB_FIELD_MIN_CHARS = 12
 
 
+# ---------------------------------------------------------------------------
+# Structured Requirement Spec (SRS) + User Story Gate — Phase 1
+# Design SSOT: Knowledge/Designs/2026-10-12-pipeline-requirement-spec-and-scope-depth-design.md
+#
+# ⚠️ ALL requirements checks below are WARN-ONLY. They are wired into validate()'s
+# advisory warnings[] (the _check_semantic_depth / Check-11 precedent), NEVER into
+# validate_artifact_data (publish-time, errors-only, caller sys.exit(1)s on any
+# entry). Gate-1 of this feature's own pipeline run BLOCKed an earlier design that
+# appended into validate_artifact_data — that path has no WARN channel. (§8, O1.)
+# ---------------------------------------------------------------------------
+REQ_SCHEMA_VERSION = 1
+# User-value classification (per-FR, O2). user-story/enabler-story are the only
+# work_classes the INVEST gate applies to; spike/bug/task are exempt (anti-ceremony).
+REQ_WORK_CLASSES = (
+    "user-story", "enabler-story", "spike", "bug", "task",
+)
+_INVEST_WORK_CLASSES = ("user-story", "enabler-story")
+REQ_SOURCE_KINDS = ("user-stated", "ddd-derived", "assumption")
+REQ_STATUSES = ("confirmed", "assumed", "needs-clarification")
+# Scopes with no TEST/REVIEW stage — a user-perceivable (user-story) requirement
+# under these is a hard-contradiction (O7): docs/research can't deliver one.
+_NO_STORY_SCOPES = ("docs-only", "docs", "research-only", "research")
+
+
 STAGE_SCHEMAS: dict[str, dict[str, list[str]]] = {
     "evaluate": {
         "required": ["recommendation", "scope"],
@@ -803,6 +827,256 @@ def _check_ambiguity_scan(data: dict, profile: str) -> list[str]:
         )
 
     return errs
+
+
+# ---------------------------------------------------------------------------
+# SRS helpers — all WARN-only, routed through validate() warnings[] (NOT the
+# publish-time validate_artifact_data). Pure functions: zero gate wiring except
+# validate_requirements_block, which validate() calls into warnings[].
+# ---------------------------------------------------------------------------
+def _safe_dict(value) -> dict:
+    """Defensive coercion: return value only if it is a dict, else {}. A non-empty
+    non-dict (e.g. a string) is truthy, so `value or {}` would NOT substitute and a
+    later `.get` would raise AttributeError — these functions run inside a _CheckGuard
+    that would then silently swallow the ENTIRE WARN layer for that artifact. Totality
+    matters: malformed input must degrade to a WARN, never crash the check off."""
+    return value if isinstance(value, dict) else {}
+
+
+def _safe_list(value) -> list:
+    """Defensive coercion: a dict/str/None where a list is expected becomes []. A bare
+    string is iterable char-by-char — iterating `depends_on="FR-9"` would emit one bogus
+    dangling-ref WARN per character."""
+    return value if isinstance(value, list) else []
+
+
+def _acceptance_is_present(acceptance) -> bool:
+    """AC4: an acceptance list is 'present' if it has >=1 entry that is EITHER a
+    non-empty free-text string (legacy) OR a COMPLETE GWT object — given AND when
+    AND then all non-empty (the measurable outcome needs its trigger+context, else
+    it is a partial GWT that reads as covered but specifies nothing testable: the
+    §4.5 false-green trap). Empty / None / partial-GWT do NOT count."""
+    if not acceptance or not isinstance(acceptance, (list, tuple)):
+        return False
+    for item in acceptance:
+        if isinstance(item, str):
+            if item.strip():
+                return True
+        elif isinstance(item, dict):
+            # GWT: a complete triplet. A `then` with no `given`/`when` is a partial
+            # spec — it names an outcome with no condition, which is not testable.
+            if (str(item.get("then", "")).strip()
+                    and str(item.get("given", "")).strip()
+                    and str(item.get("when", "")).strip()):
+                return True
+    return False
+
+
+def _iter_requirements(data: dict) -> list[dict]:
+    reqs = data.get("requirements", []) if isinstance(data, dict) else []
+    return [r for r in reqs if isinstance(r, dict)]
+
+
+def _check_source_provenance(requirements: list[dict]) -> list[str]:
+    """AC2: WARN for any requirement lacking a non-empty source.kind (SOUL P1 at
+    the requirement layer — 'no requirement without a source'). WARN-only."""
+    warns: list[str] = []
+    for r in requirements:
+        rid = r.get("id", "<no-id>")
+        kind = str(_safe_dict(r.get("source")).get("kind", "")).strip()
+        if not kind:
+            warns.append(
+                f"SRS source: requirement {rid} has no source.kind — "
+                f"every requirement should cite user-stated | ddd-derived | assumption."
+            )
+        elif kind not in REQ_SOURCE_KINDS:
+            warns.append(
+                f"SRS source: requirement {rid} source.kind='{kind}' is not one of "
+                f"{REQ_SOURCE_KINDS}."
+            )
+    return warns
+
+
+def _check_invest(requirements: list[dict], profile: str) -> list[str]:
+    """AC3/AC10: INVEST self-check — WARN-only, and ONLY for work_class in
+    {user-story, enabler-story}. spike/bug/task are exempt (anti-ceremony). The
+    `goal` profile is carved out entirely (O5: goal has no discrete FR/TEST model).
+
+    Checks: Independent (depends_on has no cycle and no dangling ref), Valuable
+    (source.ref — the Why — non-empty), Testable (acceptance present). Estimable/
+    Small/Negotiable are left to human review (not mechanically checkable here)."""
+    if normalize_profile(profile) == "goal":
+        return []  # AC10 goal carve-out
+    warns: list[str] = []
+    all_ids = {r.get("id") for r in requirements}
+    # Cycle detection is a GRAPH-level property — compute ONCE, not per-requirement
+    # (meta-review LOW: per-requirement call was O(n*(V+E)) + emitted N duplicate WARNs).
+    if _has_dependency_cycle(requirements):
+        warns.append(
+            "SRS INVEST: Independent — the depends_on graph has a cycle "
+            "(requirements are not independently deliverable)."
+        )
+    for r in requirements:
+        if r.get("work_class") not in _INVEST_WORK_CLASSES:
+            continue  # AC3: only story-class requirements get INVEST
+        rid = r.get("id", "<no-id>")
+        # Independent — dangling ref detection (per-requirement).
+        # _safe_list: a string depends_on would iterate char-by-char (bogus WARN/char).
+        deps = _safe_list(r.get("depends_on"))
+        for d in deps:
+            if d not in all_ids:
+                warns.append(
+                    f"SRS INVEST[{rid}]: Independent — depends_on references '{d}' "
+                    f"which is not a requirement in this run (dangling)."
+                )
+        # Valuable — the Why (source.ref) must be non-empty
+        ref = str(_safe_dict(r.get("source")).get("ref", "")).strip()
+        if not ref:
+            warns.append(
+                f"SRS INVEST[{rid}]: Valuable — source.ref (the Why) is empty."
+            )
+        # Testable — acceptance present (AC exists; NOT a coverage claim)
+        if not _acceptance_is_present(r.get("acceptance")):
+            warns.append(
+                f"SRS INVEST[{rid}]: Testable — no acceptance criterion present."
+            )
+    return warns
+
+
+def _has_dependency_cycle(requirements: list[dict]) -> bool:
+    """DFS cycle detection over the depends_on graph (ids only)."""
+    graph = {r.get("id"): list(_safe_list(r.get("depends_on"))) for r in requirements}
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {node: WHITE for node in graph}
+
+    def visit(node: str) -> bool:
+        if color.get(node, WHITE) == GRAY:
+            return True
+        if color.get(node, WHITE) == BLACK:
+            return False
+        color[node] = GRAY
+        for nxt in graph.get(node, []):
+            if nxt in graph and visit(nxt):
+                return True
+        color[node] = BLACK
+        return False
+
+    return any(visit(n) for n in list(graph))
+
+
+def _check_requirements_axis(requirements: list[dict], scope: str) -> list[str]:
+    """AC8/O7: three-axis hard-contradiction — WARN when scope has no delivery
+    stage for user-perceivable value (docs/research) yet a requirement is tagged
+    with a user-perceivable work_class. BOTH user-story AND enabler-story are
+    user-perceivable (they are the INVEST-gated set — an enabler-story unlocks a
+    feature a user can perceive), so both are the contradiction under docs/research.
+    Most axis combinations are legal; only this one WARNs."""
+    warns: list[str] = []
+    if (scope or "").strip() in _NO_STORY_SCOPES:
+        for r in requirements:
+            if r.get("work_class") in _INVEST_WORK_CLASSES:
+                rid = r.get("id", "<no-id>")
+                warns.append(
+                    f"SRS axis: scope='{scope}' has no delivery stage for a "
+                    f"user-perceivable requirement, but {rid} is "
+                    f"work_class={r.get('work_class')} "
+                    f"— likely a misclassification (re-check scope or work_class)."
+                )
+    return warns
+
+
+def validate_requirements_block(data: dict, profile: str) -> list[str]:
+    """Orchestrate the WARN-only SRS checks. GATED on schema_version>=1 present in
+    the requirements block (AC5/R28): absent -> return [] (skip, never block an
+    old-shape artifact). Returns a list of WARN strings (routed by validate() into
+    warnings[], never errors[])."""
+    if not isinstance(data, dict):
+        return []
+    if "requirements" not in data:
+        return []
+    # AC5: schema_version gate — a block without it is a legacy/old-shape artifact.
+    version = data.get("schema_version")
+    if not isinstance(version, int) or version < REQ_SCHEMA_VERSION:
+        return []
+    requirements = _iter_requirements(data)
+    if not requirements:
+        return []
+    warns: list[str] = []
+    warns.extend(_check_source_provenance(requirements))
+    warns.extend(_check_invest(requirements, profile))
+    warns.extend(_check_requirements_axis(requirements, str(data.get("scope", ""))))
+    return warns
+
+
+def validate_fr_immutability(prev: list[dict], new: list[dict]) -> list[str]:
+    """AC6/O1: a confirmed FR's `id` and `statement` are IMMUTABLE downstream.
+    BLOCK-class (returns error strings) if a requirement that was `confirmed` in
+    `prev` has its statement changed OR disappears (renumber/delete) in `new`.
+    ALLOWED downstream writes (NOT flagged): appending a new requirement, upgrading
+    status (assumed->confirmed), filling acceptance, and the source.kind single-
+    direction upgrade (assumption->user-stated, O1 clause d).
+
+    PURE function — not wired into any gate (zero publish/completion blast radius).
+    Callable by Phase-2/3 stages + tests."""
+    errs: list[str] = []
+    new_by_id = {r.get("id"): r for r in new if isinstance(r, dict)}
+    for pr in prev:
+        if not isinstance(pr, dict) or pr.get("status") != "confirmed":
+            continue  # only confirmed FRs are frozen
+        pid = pr.get("id")
+        nr = new_by_id.get(pid)
+        if nr is None:
+            errs.append(
+                f"O1 immutability: confirmed requirement {pid} was removed/renumbered "
+                f"downstream — a minted FR id is a permanent anchor (never reused)."
+            )
+            continue
+        if str(pr.get("statement", "")) != str(nr.get("statement", "")):
+            errs.append(
+                f"O1 immutability: confirmed requirement {pid} statement was rewritten "
+                f"downstream (EVALUATE is the sole author of a confirmed statement)."
+            )
+    return errs
+
+
+def render_requirements_md(data: dict) -> str:
+    """AC7: render the requirements block as human-readable markdown for the
+    Pipeline card / Canvas. Per-FR: id, work_class, source, status, GWT AC.
+
+    ⚠️ Testable is shown with a NEUTRAL 'AC-exists' glyph (○ absent / ● present),
+    NEVER a green check — a checkmark would read as 'coverage verified', which this
+    does not prove (§4.5.2/§4.5.4 false-green guard). PURE function, no gate wiring."""
+    reqs = _iter_requirements(data)
+    lines: list[str] = ["## Requirements", ""]
+    if not reqs:
+        lines.append("_(no structured requirements)_")
+        return "\n".join(lines)
+    lines.append("| ID | work_class | source | status | AC present | Acceptance (GWT) |")
+    lines.append("|----|-----------|--------|--------|:---------:|------------------|")
+    for r in reqs:
+        rid = r.get("id", "")
+        wc = r.get("work_class", "")
+        src = _safe_dict(r.get("source"))
+        src_s = f"{src.get('kind', '')}: {src.get('ref', '')}".strip(": ")
+        status = r.get("status", "")
+        # neutral AC-exists glyph — ● present / ○ absent, NOT a checkmark
+        ac_glyph = "●" if _acceptance_is_present(r.get("acceptance")) else "○"
+        ac_text = _render_acceptance(r.get("acceptance"))
+        lines.append(f"| {rid} | {wc} | {src_s} | {status} | {ac_glyph} | {ac_text} |")
+    return "\n".join(lines)
+
+
+def _render_acceptance(acceptance) -> str:
+    if not acceptance or not isinstance(acceptance, (list, tuple)):
+        return "_(none)_"
+    parts: list[str] = []
+    for item in acceptance:
+        if isinstance(item, str):
+            parts.append(item.replace("|", "\\|"))
+        elif isinstance(item, dict):
+            g, w, t = item.get("given", ""), item.get("when", ""), item.get("then", "")
+            parts.append(f"Given {g}, when {w}, then {t}".replace("|", "\\|"))
+    return "<br>".join(parts) if parts else "_(none)_"
 
 
 def _check_working_backwards(data: dict, profile: str) -> list[str]:
@@ -2921,7 +3195,7 @@ def validate(project: str, run_id: str, stage: str) -> dict[str, Any]:
                                 covered_ac_ids = set()
                                 for entry in ac_coverage:
                                     entry_ac = entry.get("ac", "").strip()
-                                    m = re.match(r"^(AC\d+)", entry_ac)
+                                    m = re.match(r"^(AC\d+|FR-\d+|NFR-\d+)", entry_ac)
                                     if m:
                                         covered_ac_ids.add(m.group(1))
                                 covered_texts = {entry.get("ac", "").strip() for entry in ac_coverage}
@@ -2930,7 +3204,7 @@ def validate(project: str, run_id: str, stage: str) -> dict[str, Any]:
                                 plan_id_counts: dict[str, int] = {}
                                 for p in plan_acs:
                                     p_str = p.strip() if isinstance(p, str) else str(p).strip()
-                                    m = re.match(r"^(AC\d+)", p_str)
+                                    m = re.match(r"^(AC\d+|FR-\d+|NFR-\d+)", p_str)
                                     if m:
                                         plan_id_counts[m.group(1)] = plan_id_counts.get(m.group(1), 0) + 1
                                 # AC IDs that appear exactly once in PLAN (safe for ID-based match)
@@ -2941,7 +3215,7 @@ def validate(project: str, run_id: str, stage: str) -> dict[str, Any]:
 
                                     # Strategy 1: identifier match (AC1, AC2, etc.)
                                     # Extract "ACN:" prefix from plan AC
-                                    ac_id_match = re.match(r"^(AC\d+)", pac_str)
+                                    ac_id_match = re.match(r"^(AC\d+|FR-\d+|NFR-\d+)", pac_str)
                                     ac_id = ac_id_match.group(1) if ac_id_match else None
 
                                     matched = False
@@ -2975,7 +3249,7 @@ def validate(project: str, run_id: str, stage: str) -> dict[str, Any]:
                                 for p in plan_acs:
                                     p_str = p.strip() if isinstance(p, str) else str(p).strip()
                                     plan_ac_texts.add(p_str)
-                                    m = re.match(r"^(AC\d+)", p_str)
+                                    m = re.match(r"^(AC\d+|FR-\d+|NFR-\d+)", p_str)
                                     if m:
                                         plan_ac_ids.add(m.group(1))
 
@@ -2988,7 +3262,7 @@ def validate(project: str, run_id: str, stage: str) -> dict[str, Any]:
                                         reverse_matched = True
                                     # Match by extracted AC ID from BUILD entry text
                                     if not reverse_matched:
-                                        entry_id_match = re.match(r"^(AC\d+)", entry_ac)
+                                        entry_id_match = re.match(r"^(AC\d+|FR-\d+|NFR-\d+)", entry_ac)
                                         if entry_id_match and entry_id_match.group(1) in plan_ac_ids:
                                             reverse_matched = True
                                     # Fallback: bidirectional text matching
@@ -3426,6 +3700,19 @@ def validate(project: str, run_id: str, stage: str) -> dict[str, Any]:
             warnings.extend(sem_warnings)
     # Check 11 has no checks_passed increment (pure WARN, not counted) — so on a
     # crash there is no missed credit; errored_nonblocking would over-count. Skip.
+
+    # --- Check 11b: Structured Requirement Spec (SRS) WARN layer (evaluate) ---
+    # WARN-ONLY by construction: routed into warnings[] exactly like Check 11, NEVER
+    # into validate_artifact_data (publish-time, errors-only). schema_version-gated:
+    # an old-shape evaluation (no requirements block / no schema_version) is skipped.
+    # (Design §4.0/§8; this run's own Gate-1 BLOCK fixed the earlier mis-routing.)
+    with _CheckGuard("srs_requirements", SEVERITY_ADVISORY, errors, warnings, check_results) as _g:
+        _g.passed()
+        if artifact_data and stage == "evaluate":
+            srs_data = dict(artifact_data)
+            srs_data.setdefault("scope", artifact_data.get("scope", ""))
+            srs_warnings = validate_requirements_block(srs_data, profile)
+            warnings.extend(srs_warnings)
 
     # --- Check 12: Anti-rationalization gate (skipped stages) ---
     with _CheckGuard("anti_rationalization", SEVERITY_HARD, errors, warnings, check_results) as _g:

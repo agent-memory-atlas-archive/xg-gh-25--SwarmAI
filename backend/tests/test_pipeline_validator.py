@@ -3629,15 +3629,17 @@ class TestRemainingChecksErrored:
 
     def test_all_checks_wrapped(self):
         """AC5: every check in validate() is wrapped in _CheckGuard — zero
-        fail-direction asymmetry remains. 14 logical checks: 1,2,3,4,5,6,7,8,
-        9,9b,10,11,12,13 (check 8 = the stage-specific quality gate)."""
+        fail-direction asymmetry remains. 15 logical checks: 1,2,3,4,5,6,7,8,
+        9,9b,10,11,11b,12,13 (check 8 = the stage-specific quality gate; 11b =
+        the SRS requirements WARN layer, SEVERITY_ADVISORY)."""
         import pathlib
-        src = pathlib.Path("scripts/pipeline_validator.py").read_text()
+        src = (pathlib.Path(__file__).resolve().parent.parent
+               / "scripts" / "pipeline_validator.py").read_text()
         vstart = src.index("def validate(")
         vend = src.index("\ndef ", vstart + 10)
         vbody = src[vstart:vend]
         count = vbody.count("_CheckGuard(")
-        assert count == 14, f"expected 14 wrapped checks in validate(), found {count}"
+        assert count == 15, f"expected 15 wrapped checks in validate(), found {count}"
 
 
 class TestNinebCreditOnCrash:
@@ -4057,3 +4059,336 @@ class TestSecurityBoundaries:
         res = validate(p, r, "plan")
         assert any("boundar" in e.lower() and "security" in e.lower()
                    for e in res["errors"]), f"prose-only entry should BLOCK, got {res['errors']}"
+
+
+# ===========================================================================
+# Structured Requirement Spec (SRS) + User Story Gate — Phase 1
+# Design SSOT: Knowledge/Designs/2026-10-12-pipeline-requirement-spec-and-scope-depth-design.md
+# All new validator checks are WARN-only (routed through validate() warnings[],
+# NEVER through publish-time validate_artifact_data). Pure helpers (immutability,
+# render) are gate-free utilities.
+# ===========================================================================
+
+from scripts.pipeline_validator import (  # noqa: E402
+    REQ_SCHEMA_VERSION,
+    REQ_WORK_CLASSES,
+    REQ_SOURCE_KINDS,
+    REQ_STATUSES,
+    _acceptance_is_present,
+    validate_requirements_block,
+    _check_source_provenance,
+    _check_invest,
+    _check_requirements_axis,
+    validate_fr_immutability,
+    render_requirements_md,
+)
+
+
+def _fr(id="FR-1", work_class="user-story", kind="user-stated", ref="user said X",
+        depends_on=None, acceptance=None, status="confirmed", statement="Do X",
+        added_by="evaluate"):
+    """Build a conforming requirement dict (override any field)."""
+    return {
+        "id": id, "statement": statement, "work_class": work_class,
+        "source": {"kind": kind, "ref": ref},
+        "depends_on": depends_on if depends_on is not None else [],
+        "acceptance": acceptance if acceptance is not None
+        else [{"given": "g", "when": "w", "then": "then measurable"}],
+        "status": status, "added_by": added_by,
+    }
+
+
+def _reqs_block(requirements, schema_version=REQ_SCHEMA_VERSION):
+    d = {"requirements": requirements, "clarifications": []}
+    if schema_version is not None:
+        d["schema_version"] = schema_version
+        d["stage_sealed"] = ["evaluate"]
+    return d
+
+
+class TestSRSSchemaConstants:
+    def test_constants_exist(self):
+        """AC1: schema version + enum sets are defined."""
+        assert REQ_SCHEMA_VERSION == 1
+        assert "user-story" in REQ_WORK_CLASSES and "enabler-story" in REQ_WORK_CLASSES
+        assert {"spike", "bug", "task"} <= set(REQ_WORK_CLASSES)
+        assert {"user-stated", "ddd-derived", "assumption"} <= set(REQ_SOURCE_KINDS)
+        assert {"confirmed", "assumed", "needs-clarification"} <= set(REQ_STATUSES)
+
+
+class TestSRSConformingBlock:
+    def test_conforming_block_zero_warn(self):
+        """AC1: a fully conforming requirements block yields no WARN."""
+        data = _reqs_block([_fr()])
+        warns = validate_requirements_block(data, "full")
+        assert warns == [], f"conforming block should be clean, got {warns}"
+
+
+class TestAcceptancePresence:
+    def test_free_text_string_present(self):
+        """AC4: legacy free-text acceptance string counts as present."""
+        assert _acceptance_is_present(["AC1: returns 200"]) is True
+
+    def test_gwt_object_present(self):
+        """AC4: GWT object acceptance counts as present."""
+        assert _acceptance_is_present([{"given": "g", "when": "w", "then": "t"}]) is True
+
+    def test_mixed_shapes_present(self):
+        """AC4: a mix of str + GWT dict is accepted (backward-compat strangler)."""
+        assert _acceptance_is_present(["AC1: x", {"given": "g", "when": "w", "then": "t"}]) is True
+
+    def test_empty_absent(self):
+        """AC4: empty acceptance is NOT present."""
+        assert _acceptance_is_present([]) is False
+        assert _acceptance_is_present(None) is False
+
+    def test_empty_gwt_then_absent(self):
+        """AC4: a GWT object with an empty 'then' is NOT present (no measurable outcome)."""
+        assert _acceptance_is_present([{"given": "g", "when": "w", "then": ""}]) is False
+
+
+class TestSourceProvenance:
+    def test_empty_source_kind_warns(self):
+        """AC2: a requirement with empty source.kind -> WARN (string returned)."""
+        fr = _fr(kind="")
+        warns = _check_source_provenance([fr])
+        assert any("FR-1" in w and "source" in w.lower() for w in warns), warns
+
+    def test_present_source_no_warn(self):
+        """AC2: a requirement with a valid source.kind -> no WARN."""
+        assert _check_source_provenance([_fr()]) == []
+
+
+class TestINVEST:
+    def test_invest_runs_for_user_story(self):
+        """AC3: INVEST runs for user-story; a cyclic depends_on -> WARN."""
+        a = _fr(id="FR-1", depends_on=["FR-2"])
+        b = _fr(id="FR-2", depends_on=["FR-1"])
+        warns = _check_invest([a, b], "full")
+        assert any("independent" in w.lower() or "cycl" in w.lower() for w in warns), warns
+
+    def test_invest_dangling_depends_on_warns(self):
+        """AC3: Independent — a depends_on referencing a non-existent FR -> WARN."""
+        warns = _check_invest([_fr(id="FR-1", depends_on=["FR-99"])], "full")
+        assert any("independent" in w.lower() or "dangl" in w.lower() or "FR-99" in w
+                   for w in warns), warns
+
+    def test_invest_valuable_empty_why_warns(self):
+        """AC3: Valuable — empty source.ref (the Why) -> WARN."""
+        warns = _check_invest([_fr(ref="")], "full")
+        assert any("valuable" in w.lower() or "why" in w.lower() for w in warns), warns
+
+    def test_invest_testable_empty_acceptance_warns(self):
+        """AC3: Testable — empty acceptance -> WARN."""
+        warns = _check_invest([_fr(acceptance=[])], "full")
+        assert any("testable" in w.lower() or "acceptance" in w.lower() for w in warns), warns
+
+    def test_invest_skips_task(self):
+        """AC3: INVEST does NOT run for task/bug/spike -> [] even with bad fields."""
+        bad = _fr(work_class="task", ref="", acceptance=[], depends_on=["FR-99"])
+        assert _check_invest([bad], "full") == []
+
+    def test_invest_skips_goal_profile(self):
+        """AC10: goal carve-out — INVEST returns [] for a user-story FR when profile==goal."""
+        bad = _fr(work_class="user-story", ref="", acceptance=[])
+        assert _check_invest([bad], "goal") == []
+
+
+class TestRequirementsAxis:
+    def test_docs_scope_with_user_story_warns(self):
+        """AC8: scope in {docs,research} + a user-story FR -> WARN (hard-contradiction)."""
+        warns = _check_requirements_axis([_fr(work_class="user-story")], scope="docs-only")
+        assert any("user-story" in w or "scope" in w.lower() for w in warns), warns
+
+    def test_standard_scope_user_story_no_warn(self):
+        """AC8: a normal scope + user-story FR -> no axis WARN."""
+        assert _check_requirements_axis([_fr(work_class="user-story")], scope="standard") == []
+
+
+class TestSchemaVersionGate:
+    def test_no_schema_version_skips(self):
+        """AC5 (R28): a requirements block with NO schema_version is SKIPPED -> []."""
+        data = _reqs_block([_fr(kind="")], schema_version=None)  # bad source, would warn IF run
+        assert validate_requirements_block(data, "full") == [], \
+            "no schema_version must skip all checks, not warn/block"
+
+    def test_schema_version_present_runs_checks(self):
+        """AC5 (non-vacuous): WITH schema_version, the same bad block DOES warn —
+        proves the skip branch is load-bearing, not a vacuous always-pass."""
+        data = _reqs_block([_fr(kind="")], schema_version=1)
+        warns = validate_requirements_block(data, "full")
+        assert warns, "with schema_version present, a sourceless FR must warn (gate is non-vacuous)"
+
+
+class TestFRImmutability:
+    def test_rewriting_confirmed_statement_blocks(self):
+        """AC6 (O1): rewriting a confirmed FR's statement -> BLOCK-class error."""
+        prev = [_fr(id="FR-1", statement="Original", status="confirmed")]
+        new = [_fr(id="FR-1", statement="Rewritten", status="confirmed")]
+        errs = validate_fr_immutability(prev, new)
+        assert errs and any("FR-1" in e for e in errs), errs
+
+    def test_rewriting_confirmed_id_blocks(self):
+        """AC6 (O1): changing a confirmed FR's id (renumber) -> BLOCK."""
+        prev = [_fr(id="FR-1", status="confirmed")]
+        new = [_fr(id="FR-2", status="confirmed", statement="Do X")]  # same stmt, renumbered
+        errs = validate_fr_immutability(prev, new)
+        assert errs, "renumbering a confirmed FR must block"
+
+    def test_appending_new_fr_ok(self):
+        """AC6 (O1): appending a new FR + patching status assumed->confirmed is allowed."""
+        prev = [_fr(id="FR-1", status="assumed")]
+        new = [_fr(id="FR-1", status="confirmed"),  # status upgrade allowed
+               _fr(id="FR-2", status="assumed", statement="New req")]  # append allowed
+        assert validate_fr_immutability(prev, new) == []
+
+    def test_source_kind_upgrade_allowed(self):
+        """AC6 (O1 clause d): assumption->user-stated source.kind upgrade is allowed."""
+        prev = [_fr(id="FR-1", kind="assumption", status="confirmed")]
+        new = [_fr(id="FR-1", kind="user-stated", status="confirmed")]
+        assert validate_fr_immutability(prev, new) == []
+
+
+class TestRenderRequirementsMd:
+    def test_render_contains_workclass_and_source(self):
+        """AC7: render shows work_class + source per FR."""
+        md = render_requirements_md(_reqs_block([_fr()]))
+        assert "user-story" in md and "user-stated" in md
+
+    def test_render_testable_no_checkmark(self):
+        """AC7: the Testable column uses a neutral AC-exists glyph, NOT a green check."""
+        md = render_requirements_md(_reqs_block([_fr()]))
+        # Testable must not be rendered with a check/tick that implies 'covered'
+        assert "✅" not in md and "✓" not in md, \
+            "Testable must use a neutral glyph (U+25CB/25CF), not a checkmark (false-green)"
+
+
+class TestSRSCrossBoundaryE2E:
+    """Layer 4 (cross_boundary=true): drive the REAL schema contract across the
+    seam — the AC-ID matcher (BUILD ac_coverage consumer) + the publish-gate
+    non-leak (the Gate-1-fix invariant). NOT mocked: real validate_artifact_data,
+    real matcher regex. Each test states its mutation-to-RED."""
+
+    def test_ac_matcher_production_source_captures_new_ids(self):
+        """AC9 real-wiring (non-vacuous, partial-revert-proof): the ACTUAL AC-ID
+        matcher literals in the production source must ALL be the extended form.
+        Reads the production string (not a re-typed literal) and counts PER SITE
+        (pre-dedup) so a 1-of-5 revert is caught — a set() would hide it. Also
+        asserts NO bare ^(AC\\d+) remains. MUTATION: revert any site -> RED."""
+        import re
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parent.parent
+               / "scripts" / "pipeline_validator.py").read_text()
+        # every AC-ID matcher literal actually present (pre-dedup — count sites)
+        pats = re.findall(r're\.match\(r"(\^\([^"]*\))"', src)
+        assert len(pats) == 5, (
+            f"expected 5 AC-ID matcher sites in production, found {len(pats)}: {pats}")
+        # NO site may be the un-extended legacy form (partial-revert guard)
+        assert '^(AC\\d+)"' not in src, (
+            "a bare ^(AC\\d+) matcher remains — a site was reverted, FR/NFR ids "
+            "would silently drop out of BUILD ac_coverage")
+        # EVERY site must capture all three id shapes
+        for pat in pats:
+            assert re.match(pat, "AC1: legacy"), f"{pat!r} lost legacy AC capture"
+            assert re.match(pat, "FR-1: new"), f"{pat!r} does not capture FR-ids (reverted?)"
+            assert re.match(pat, "NFR-2: n"), f"{pat!r} does not capture NFR-ids"
+
+
+class TestSRSDefensiveTotality:
+    """Adversarial (Gate-2) findings: the WARN checks run inside a _CheckGuard that
+    swallows exceptions — so a crash silently drops the ENTIRE WARN layer. These
+    assert the checks are DEFENSIVELY TOTAL (never raise) on malformed input."""
+
+    def test_source_as_string_does_not_crash(self):
+        """Gate-2 MED: source as a non-dict string -> must WARN (missing kind),
+        not AttributeError. MUTATION: revert _safe_dict -> AttributeError -> RED."""
+        bad = {"id": "FR-1", "statement": "x", "work_class": "user-story",
+               "source": "notadict", "depends_on": [], "acceptance": [], "status": "assumed"}
+        # neither call may raise
+        warns = _check_source_provenance([bad])
+        assert any("FR-1" in w and "source" in w.lower() for w in warns)
+        iwarns = _check_invest([bad], "full")
+        assert isinstance(iwarns, list)  # did not raise
+
+    def test_depends_on_as_string_no_per_char_warn(self):
+        """Gate-2 LOW: depends_on as a string must NOT iterate char-by-char
+        (one bogus dangling-ref WARN per char). MUTATION: revert _safe_list -> many WARNs."""
+        bad = _fr(id="FR-1", work_class="user-story", depends_on="FR-9")  # string, not list
+        warns = _check_invest([bad], "full")
+        dangling = [w for w in warns if "dangling" in w.lower()]
+        assert len(dangling) <= 1, f"string depends_on iterated char-by-char: {dangling}"
+
+    def test_validate_requirements_block_total_on_garbage(self):
+        """Gate-2: validate_requirements_block never raises on malformed input."""
+        for garbage in [
+            {"schema_version": 1, "requirements": [{"id": "FR-1", "source": "s",
+             "work_class": "user-story", "depends_on": "x", "acceptance": "str"}]},
+            {"schema_version": 1, "requirements": "notalist"},
+            {"schema_version": 1, "requirements": [{"id": "FR-1"}]},  # minimal
+        ]:
+            assert isinstance(validate_requirements_block(garbage, "full"), list)
+
+
+class TestSRSPartialGWT:
+    """Gate-2 red-team MED: a partial GWT (then present, given/when empty) must NOT
+    count as a present acceptance — it reads as covered but specifies no testable
+    condition (the §4.5 false-green trap)."""
+
+    def test_partial_gwt_then_only_absent(self):
+        assert _acceptance_is_present([{"then": "x"}]) is False
+        assert _acceptance_is_present([{"then": "x", "given": "g"}]) is False  # no when
+
+    def test_complete_gwt_present(self):
+        assert _acceptance_is_present([{"given": "g", "when": "w", "then": "t"}]) is True
+
+    def test_partial_gwt_fails_invest_testable(self):
+        """A user-story FR with only a partial GWT must get a Testable WARN."""
+        fr = _fr(work_class="user-story", acceptance=[{"then": "x"}])
+        warns = _check_invest([fr], "full")
+        assert any("testable" in w.lower() for w in warns)
+
+
+class TestSRSEnablerStoryAxis:
+    """Gate-2 red-team MED: O7 three-axis contradiction applies to BOTH user-story
+    AND enabler-story (both user-perceivable) under docs/research scope."""
+
+    def test_enabler_story_under_docs_warns(self):
+        warns = _check_requirements_axis([_fr(work_class="enabler-story")], scope="docs-only")
+        assert any("enabler-story" in w or "scope" in w.lower() for w in warns), warns
+
+    def test_task_under_docs_no_warn(self):
+        """A task (not user-perceivable) under docs is fine — no axis WARN."""
+        assert _check_requirements_axis([_fr(work_class="task")], scope="docs-only") == []
+
+    def test_srs_warns_never_leak_into_publish_gate(self):
+        """AC2 real-wiring (Gate-1-fix invariant): a requirements block with
+        multiple WARN-worthy requirements, fed to the REAL publish-time
+        validate_artifact_data, must add ZERO entries to its errors list.
+        MUTATION: wire validate_requirements_block into validate_artifact_data's
+        errors path -> this returns non-empty -> RED (and publish would sys.exit)."""
+        from scripts.pipeline_validator import validate_artifact_data
+        data = {
+            "recommendation": "GO", "scope": "docs-only",
+            "understanding": {
+                "work_type": "existing-feature",
+                "claim": "x is present in the current system",
+                "evidence": "Understanding gate: code-trace foo.py:1 confirmed",
+                "evidence_kind": "code-trace", "skeptic_verdict": "SUPPORTED",
+                "alternative_considered": "none fits",
+            },
+            "ambiguity_scan": {
+                "scanned_fields": ["who"], "terms_checked": ["standard"],
+                "hits": [], "hit_count": 0, "all_resolved": True,
+            },
+            "schema_version": 1, "stage_sealed": ["evaluate"],
+            "requirements": [
+                # sourceless + user-story under docs scope + empty acceptance:
+                # would trigger source/INVEST/axis WARNs IF they were on the error path
+                {"id": "FR-1", "statement": "x", "work_class": "user-story",
+                 "source": {"kind": "", "ref": ""}, "depends_on": ["FR-99"],
+                 "acceptance": [], "status": "assumed"},
+            ],
+        }
+        errs = validate_artifact_data("evaluate", data, profile="full")
+        assert errs == [], \
+            f"SRS WARNs leaked into publish-gate errors (Gate-1 regression): {errs}"
