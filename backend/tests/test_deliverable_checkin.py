@@ -37,12 +37,37 @@ def workspace(tmp_path):
 
 
 def _write_run_with_report(workspace, run_id, files_touched, *, report="# Report\n## Intent → Requirement 溯源\nFR-1\n",
-                           eval_artifact=None):
+                           eval_artifact=None, requirements="default"):
+    """Write a run with a terminal REPORT.md on disk (ledger A). Since B's content
+    契约 is now the EVALUATE requirements[] (NOT the REPORT.md), B generation needs a
+    RESOLVABLE evaluate artifact — so by default this also lands a real evaluate
+    artifact file + manifest entry (so cmd_run_commit's _load_artifact_for_metrics
+    resolves it). Pass requirements=None to omit it (the 'no requirements → no B' case)."""
     run_dir = workspace / "Projects" / "TestProject" / ".artifacts" / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    reqs = ([{"id": "FR-1", "statement": "ship a thing", "work_class": "task",
+              "source": {"kind": "user-stated", "ref": "test"}, "status": "confirmed",
+              "acceptance": [{"given": "g", "when": "w", "then": "t"}]}]
+            if requirements == "default" else requirements)
     stages = [{"stage": "deliver", "status": "completed", "push_ready": True}]
-    if eval_artifact is not None:
+    if reqs or eval_artifact is not None:
         stages.insert(0, {"stage": "evaluate", "status": "completed", "artifact_id": "art_eval1"})
+        # Land a REAL evaluate artifact file + manifest entry so the cmd_run_commit
+        # path's _load_artifact_for_metrics(project, "art_eval1") resolves requirements.
+        art_dir = workspace / "Projects" / "TestProject" / ".artifacts"
+        art_file = art_dir / f"evaluation-20261012-art_eval1.json"
+        art_file.write_text(json.dumps({"schema_version": 1, "requirements": reqs or [],
+                                         "clarifications": []}), encoding="utf-8")
+        manifest_file = art_dir / "manifest.json"
+        manifest = {"artifacts": []}
+        if manifest_file.exists():
+            try:
+                manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                manifest = {"artifacts": []}
+        manifest.setdefault("artifacts", []).append(
+            {"id": "art_eval1", "file": art_file.name, "type": "evaluation"})
+        manifest_file.write_text(json.dumps(manifest), encoding="utf-8")
     data = {
         "id": run_id, "project": "TestProject", "requirement": "Phase3 thing",
         "profile": "goal", "status": "running", "stages": stages,
@@ -69,6 +94,40 @@ def _src_repo(tmp_path, name, gitignore=None):
     return repo
 
 
+def _write_run_with_requirements(workspace, run_id, files_touched, *, write_report=False,
+                                 requirements=None, clarifications=None):
+    """AC3 契约迁移 fixture: a run whose B-generation substance is the EVALUATE
+    `requirements[]` (NOT a terminal REPORT.md). By default write_report=False —
+    this reproduces the REAL DELIVER-time sequence where run-commit runs BEFORE
+    REFLECT writes REPORT.md. B must still generate from requirements."""
+    run_dir = workspace / "Projects" / "TestProject" / ".artifacts" / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    stages = [
+        {"stage": "evaluate", "status": "completed", "artifact_id": "art_eval1"},
+        {"stage": "deliver", "status": "completed", "push_ready": True},
+    ]
+    data = {
+        "id": run_id, "project": "TestProject",
+        "requirement": "把 depth 轴加到 pipeline(需求溯源快照内容来源)",
+        "profile": "full", "status": "running", "stages": stages,
+        "created_at": "2026-10-12T00:00:00+00:00", "updated_at": "2026-10-12T00:00:00+00:00",
+        "files_touched": files_touched,
+    }
+    (run_dir / "run.json").write_text(json.dumps(data), encoding="utf-8")
+    if write_report:
+        (run_dir / "REPORT.md").write_text("# Report\n## 9. Lessons\n- learned X\n")
+    reqs = requirements if requirements is not None else [
+        {"id": "FR-1", "statement": "加 depth 正交轴", "work_class": "task",
+         "source": {"kind": "user-stated", "ref": "XG 要求"}, "status": "confirmed",
+         "acceptance": [{"given": "a run", "when": "set depth", "then": "rigor adjusts"}]},
+    ]
+    eval_art = {
+        "schema_version": 1, "requirements": reqs,
+        "clarifications": clarifications if clarifications is not None else [],
+    }
+    return run_dir, eval_art
+
+
 def _run_commit(workspace, run_id, force=False):
     from scripts.artifact_cli import cmd_run_commit
     from unittest.mock import patch
@@ -80,6 +139,77 @@ def _run_commit(workspace, run_id, force=False):
         except SystemExit as e:
             captured["exit"] = e.code
     return captured
+
+
+class TestContentContractFromRequirements:
+    """AC1-AC4 系统化修订: B's audit content is a REQUIREMENTS.md rendered from the
+    EVALUATE requirements[], NOT a copy of A's terminal REPORT.md. The generation
+    threshold is 'run has sealed requirements', NOT 'A has REPORT.md on disk'. This
+    reproduces the REAL DELIVER-time sequence (run-commit at DELIVER, BEFORE REFLECT
+    writes REPORT.md) under which the OLD report-gate made B never generate."""
+
+    def test_B_generates_from_requirements_without_report(self, workspace, tmp_path):
+        """AC3 (tracer): no REPORT.md on disk (true DELIVER timing) + sealed
+        requirements present → B generates REQUIREMENTS.md. Under the OLD report-gate
+        this returned [] (B never generated) — the bug this run fixes."""
+        from scripts.artifact_cli import _generate_review_deliverable, LoadResult
+        from unittest.mock import patch
+        repo = _src_repo(tmp_path, "reqrepo")
+        _run_dir, eval_art = _write_run_with_requirements(
+            workspace, "run_req", [str(repo / "f.py")], write_report=False)
+
+        with patch("scripts.artifact_cli._get_workspace", return_value=workspace), \
+             patch("scripts.artifact_cli._load_artifact_for_metrics",
+                   return_value=LoadResult("available", eval_art)):
+            created, warnings = _generate_review_deliverable("TestProject", "run_req", str(repo))
+
+        # B WAS generated despite no REPORT.md (the whole point of the fix).
+        assert created, f"B must generate from requirements with no REPORT.md; got {warnings}"
+        # The audit file is REQUIREMENTS.md (name matches content — the §4.6 provenance),
+        # NOT REPORT.md (which would imply a full terminal report).
+        names = {Path(c).name for c in created}
+        assert "REQUIREMENTS.md" in names, f"B must carry REQUIREMENTS.md, got {names}"
+        assert "REPORT.md" not in names, f"B must NOT carry a terminal REPORT.md, got {names}"
+
+    def test_REQUIREMENTS_md_has_provenance_not_lessons(self, workspace, tmp_path):
+        """AC2+AC4: REQUIREMENTS.md carries the §4.6 provenance (intent + derivation),
+        and does NOT carry REFLECT-stage process sections (§9 Lessons / §2 Evaluation)
+        which the design canon assigns to ledger A only."""
+        from scripts.artifact_cli import _generate_review_deliverable, LoadResult
+        from unittest.mock import patch
+        repo = _src_repo(tmp_path, "provrepo")
+        # write_report=True puts a '## 9. Lessons' in A's REPORT — proving B does NOT
+        # copy it (B renders from requirements, independent of A's terminal report).
+        _run_dir, eval_art = _write_run_with_requirements(
+            workspace, "run_prov", [str(repo / "f.py")], write_report=True)
+
+        with patch("scripts.artifact_cli._get_workspace", return_value=workspace), \
+             patch("scripts.artifact_cli._load_artifact_for_metrics",
+                   return_value=LoadResult("available", eval_art)):
+            created, _ = _generate_review_deliverable("TestProject", "run_prov", str(repo))
+
+        req_md = next((c for c in created if Path(c).name == "REQUIREMENTS.md"), None)
+        assert req_md, f"REQUIREMENTS.md must exist, got {created}"
+        body = Path(req_md).read_text(encoding="utf-8")
+        # provenance present (rendered from requirements)
+        assert "FR-1" in body, "REQUIREMENTS.md must render the requirements derivation"
+        # REFLECT process noise absent (lives in ledger A only)
+        assert "9. Lessons" not in body and "learned X" not in body, \
+            "B must NOT carry REFLECT lessons (ledger A only — §4.9 双存储)"
+
+    def test_no_requirements_no_B(self, workspace, tmp_path):
+        """AC1: when NO sealed requirements can be resolved, B is not generated
+        (nothing to deliver) — the new threshold's negative case."""
+        from scripts.artifact_cli import _generate_review_deliverable, LoadResult
+        from unittest.mock import patch
+        repo = _src_repo(tmp_path, "norepo")
+        _write_run_with_requirements(workspace, "run_noreq", [str(repo / "f.py")])
+        # Artifact does not resolve (not_run / unavailable) → .data is None → no B.
+        with patch("scripts.artifact_cli._get_workspace", return_value=workspace), \
+             patch("scripts.artifact_cli._load_artifact_for_metrics",
+                   return_value=LoadResult("not_run", None)):
+            created, _ = _generate_review_deliverable("TestProject", "run_noreq", str(repo))
+        assert created == [], f"no sealed requirements → no B; got {created}"
 
 
 class TestBoundary1GitignoreConflict:
@@ -150,7 +280,7 @@ class TestBoundary3SealedOnly:
         got = sorted(p.name for p in bdir.iterdir()) if bdir.exists() else []
         # ONLY the sealed trio (requirements.json present only if an eval artifact
         # existed — this run has none, so just REPORT.md + run-ref.txt).
-        assert set(got) <= {"REPORT.md", "requirements.json", "run-ref.txt"}, \
+        assert set(got) <= {"REQUIREMENTS.md", "requirements.json", "run-ref.txt"}, \
             f"B must contain ONLY sealed files, got {got}"
         assert "checkpoint-plan.json" not in got
         assert "METRICS.json" not in got
@@ -189,16 +319,20 @@ class TestContentSafetyScan:
         from scripts.artifact_cli import _generate_review_deliverable
         from unittest.mock import patch
         repo = _src_repo(tmp_path, "sensrepo")
-        # A's REPORT.md carries a secret (verbatim user intent could contain one).
-        _write_run_with_report(
-            workspace, "run_sens", [str(repo / "f.py")],
-            report='# Report\n## Intent 溯源\n用户说: token = "hunter2secret"\n',
-        )
+        # B's content is now the §4.6 provenance rendered from requirements — the
+        # VERBATIM original intent (run.requirement) is rendered PLAINTEXT into
+        # REQUIREMENTS.md's "原始意图" section, so a secret in the intent reaches B.
+        _write_run_with_report(workspace, "run_sens", [str(repo / "f.py")])
+        # Inject a secret into the run's requirement (the verbatim intent B renders).
+        rf = workspace / "Projects/TestProject/.artifacts/runs/run_sens/run.json"
+        rd = json.loads(rf.read_text())
+        rd["requirement"] = 'add retry; user pasted token = "hunter2secret" by mistake'
+        rf.write_text(json.dumps(rd))
         with patch("scripts.artifact_cli._get_workspace", return_value=workspace):
             created, warnings = _generate_review_deliverable("TestProject", "run_sens", str(repo))
 
         # B was still generated (we never block the LOCAL commit)...
-        assert any("REPORT.md" in c for c in created)
+        assert any("REQUIREMENTS.md" in c for c in created)
         # ...but a LOUD content-safety warning fired naming the sensitive finding.
         joined = " ".join(warnings)
         assert "CONTENT-SAFETY" in joined, f"must warn on sensitive content, got {warnings}"
@@ -210,11 +344,10 @@ class TestContentSafetyScan:
         repo = _src_repo(tmp_path, "cleanrepo")
         _write_run_with_report(
             workspace, "run_clean", [str(repo / "f.py")],
-            report="# Report\n## Intent 溯源\n用户要加一个 depth 轴到 pipeline。\n",
         )
         with patch("scripts.artifact_cli._get_workspace", return_value=workspace):
             created, warnings = _generate_review_deliverable("TestProject", "run_clean", str(repo))
 
-        assert any("REPORT.md" in c for c in created)
+        assert any("REQUIREMENTS.md" in c for c in created)
         assert not any("CONTENT-SAFETY" in w for w in warnings), \
             f"clean content must not trigger a false content-safety warning, got {warnings}"

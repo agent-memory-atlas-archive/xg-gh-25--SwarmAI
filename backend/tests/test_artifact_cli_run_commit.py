@@ -685,37 +685,94 @@ class TestReviewDeliverableCheckin:
         (repo / "f.py").write_text("v2\n")
         return repo
 
+    def _land_eval_artifact(self, workspace, with_type=True):
+        """B's content契约 is the EVALUATE requirements[] — land a resolvable
+        evaluate artifact + manifest so cmd_run_commit's _load_artifact_for_metrics
+        resolves it (the gate for B generation under the new contract).
+
+        with_type=False drops the manifest entry's `type` field — reproduces a
+        PRE-SCHEMA manifest entry (written before `type` was mandatory). B must
+        STILL generate (the gate calls _load_artifact_for_metrics with
+        expected_type=None, so run+id ownership alone resolves the artifact)."""
+        art_dir = workspace / "Projects" / "TestProject" / ".artifacts"
+        art_file = art_dir / "evaluation-20260704-art_evalB.json"
+        art_file.write_text(json.dumps({
+            "schema_version": 1,
+            "requirements": [{"id": "FR-1", "statement": "ship the thing",
+                              "work_class": "task", "source": {"kind": "user-stated", "ref": "req"},
+                              "status": "confirmed",
+                              "acceptance": [{"given": "g", "when": "w", "then": "t"}]}],
+            "clarifications": [],
+        }), encoding="utf-8")
+        mf = art_dir / "manifest.json"
+        manifest = {"artifacts": []}
+        if mf.exists():
+            try:
+                manifest = json.loads(mf.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                manifest = {"artifacts": []}
+        entry = {"id": "art_evalB", "file": art_file.name}
+        if with_type:
+            entry["type"] = "evaluation"
+        manifest.setdefault("artifacts", []).append(entry)
+        mf.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def test_B_generates_for_pre_schema_manifest_entry_without_type(self, workspace, tmp_path, capsys):
+        """Meta-review HIGH regression: a manifest entry predating the mandatory
+        `type` field (type absent) must STILL resolve the requirements artifact and
+        generate B. The B gate passes expected_type=None, so a missing type does NOT
+        silently reject (which would make B never generate for pre-schema runs)."""
+        repo = self._repo_with_change(tmp_path, "preschemarepo")
+        run_id = "run_pre"
+        self._land_eval_artifact(workspace, with_type=False)  # NO type field
+        _write_run(
+            workspace, run_id,
+            stages=[{"stage": "evaluate", "status": "completed", "artifact_id": "art_evalB"},
+                    {"stage": "deliver", "status": "completed", "push_ready": True}],
+            files_touched=[str(repo / "f.py")],
+        )
+        _run_commit(workspace, run_id)
+        capsys.readouterr()
+        bdir = repo / ".aidlc" / "deliverables" / run_id
+        assert (bdir / "REQUIREMENTS.md").is_file(), \
+            "B must generate even when the manifest entry lacks a `type` field (expected_type=None)"
+
     def test_deliverable_B_created_and_staged_in_same_commit(self, workspace, tmp_path, capsys):
         repo = self._repo_with_change(tmp_path, "srcrepo")
         run_id = "run_delivB"
-        # Ledger A: write a REPORT.md into the workspace run dir (what B copies).
+        self._land_eval_artifact(workspace)
+        # B no longer copies A's terminal REPORT.md — it renders REQUIREMENTS.md from
+        # the sealed requirements[] (available at DELIVER, before REFLECT writes REPORT).
         run_file = _write_run(
             workspace, run_id,
-            stages=[{"stage": "deliver", "status": "completed", "push_ready": True}],
+            stages=[{"stage": "evaluate", "status": "completed", "artifact_id": "art_evalB"},
+                    {"stage": "deliver", "status": "completed", "push_ready": True}],
             files_touched=[str(repo / "f.py")],
         )
         run_dir = run_file.parent
-        (run_dir / "REPORT.md").write_text("# Report\n## Intent → Requirement 溯源\nFR-1 ...\n")
 
         _run_commit(workspace, run_id)
         capsys.readouterr()
 
-        # B exists in the REAL repo under .aidlc/deliverables/<run_id>/
+        # B exists in the REAL repo under .aidlc/deliverables/<run_id>/ — audit file
+        # is REQUIREMENTS.md (the §4.6 provenance rendered from requirements).
         bdir = repo / ".aidlc" / "deliverables" / run_id
-        assert (bdir / "REPORT.md").is_file(), "B REPORT.md must be checked into the real repo"
+        assert (bdir / "REQUIREMENTS.md").is_file(), "B REQUIREMENTS.md must be checked into the real repo"
         assert (bdir / "run-ref.txt").is_file(), "B run-ref.txt (back-pointer to A) must exist"
-        assert "## Intent → Requirement 溯源" in (bdir / "REPORT.md").read_text(), \
-            "B REPORT.md must carry A's §4.6 audit content (verbatim copy)"
+        req_body = (bdir / "REQUIREMENTS.md").read_text()
+        assert "溯源" in req_body and "FR-1" in req_body, \
+            "B REQUIREMENTS.md must carry the §4.6 provenance rendered from requirements"
+        assert "REPORT.md" not in {p.name for p in bdir.iterdir()}, \
+            "B must NOT carry a terminal REPORT.md (that stays in ledger A)"
 
         # B is in the SAME commit as the code (HEAD commit touched BOTH f.py and B).
         head_files = self._git(repo, "show", "--name-only", "--format=", "HEAD").stdout
         assert "f.py" in head_files, "code file must be in the commit"
-        assert f".aidlc/deliverables/{run_id}/REPORT.md" in head_files, \
+        assert f".aidlc/deliverables/{run_id}/REQUIREMENTS.md" in head_files, \
             "B must be in the SAME commit as the code (§4.9 same-screen review)"
 
         # Ledger A (workspace .artifacts/) is UNTOUCHED — A→B one-way, A durable.
-        assert (run_dir / "REPORT.md").is_file(), "ledger A REPORT.md must remain"
-        assert (run_dir / "REPORT.md").read_text().startswith("# Report"), "A untouched"
+        assert run_dir.is_dir(), "ledger A run dir must remain"
 
     def test_workspace_only_run_skips_B_no_404(self, workspace, tmp_path, capsys):
         """§4.9 边界②: if the only resolved root IS the daemon workspace (non-git /

@@ -159,12 +159,12 @@ def format_pr_body(run_data: dict, report_text: str) -> str:
 - {regression_check} Full test suite passes ({tdd_info})
 - {adversarial_check} Adversarial review clean
 
-Full report: `.aidlc/deliverables/{run_id}/REPORT.md`
+Full report: `.aidlc/deliverables/{run_id}/REQUIREMENTS.md`
 
 Generated with [SwarmAI Autonomous Pipeline](https://github.com/xg-gh-25/SwarmAI)
 """
     if len(body) > MAX_BODY_LENGTH:
-        body = body[:MAX_BODY_LENGTH - 50] + "\n\n...(truncated, see REPORT.md)"
+        body = body[:MAX_BODY_LENGTH - 50] + "\n\n...(truncated, see REQUIREMENTS.md)"
 
     return body
 
