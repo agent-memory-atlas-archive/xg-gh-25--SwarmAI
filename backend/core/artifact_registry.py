@@ -84,6 +84,10 @@ class Artifact:
     summary: str
     data: dict = field(default_factory=dict)
     superseded_by: str | None = None
+    # Action B (Kiro #14): the owning pipeline run. None for the ~2169 legacy
+    # entries written before the write side recorded run_id; discover(run_id=...)
+    # filters on it so a run-scoped query cannot leak another run's artifact.
+    run_id: str | None = None
 
     @property
     def is_active(self) -> bool:
@@ -201,11 +205,17 @@ class ArtifactRegistry:
     # ── Discovery ─────────────────────────────────────────────────────
 
     def discover(
-        self, project: str | None, *types: str
+        self, project: str | None, *types: str, run_id: str | None = None
     ) -> list[Artifact]:
         """Find active (non-superseded) artifacts of the given types.
 
         L0-safe: returns ``[]`` when *project* is None or has no artifacts.
+
+        Action B (Kiro #14): ``run_id`` is a keyword-only filter (added AFTER
+        ``*types`` so every existing positional-types caller is untouched). When
+        set, only entries whose ``run_id`` equals it are returned — a legacy entry
+        WITHOUT a run_id is excluded from a run-scoped query (it is not leaked),
+        matching the loader's run-scoped read contract.
         """
         if not project or not types:
             return []
@@ -218,6 +228,8 @@ class ArtifactRegistry:
         results = []
         for entry in manifest.get("artifacts", []):
             if entry.get("type") in type_set and entry.get("superseded_by") is None:
+                if run_id is not None and entry.get("run_id") != run_id:
+                    continue  # run-scoped query — exclude other runs + legacy (run_id-less)
                 artifact = self._entry_to_artifact(entry, project)
                 if artifact is not None:
                     results.append(artifact)
@@ -714,6 +726,7 @@ class ArtifactRegistry:
                 summary=entry.get("summary", ""),
                 data=data,
                 superseded_by=entry.get("superseded_by"),
+                run_id=entry.get("run_id"),  # Action B #14 — None for legacy entries
             )
         except KeyError as exc:
             logger.warning("Malformed artifact entry (missing %s): %s", exc, entry)

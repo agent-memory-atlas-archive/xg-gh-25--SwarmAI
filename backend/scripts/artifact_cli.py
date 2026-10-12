@@ -2035,10 +2035,12 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
                  if s.get("stage", s.get("name")) == "evaluate" and s.get("artifact_id")),
                 None,
             )
-            _eval_data = (
-                _load_artifact_for_metrics(args.project, _eval_rec["artifact_id"])
+            _eval_res = (
+                _load_artifact_for_metrics(args.project, args.run_id,
+                                           _eval_rec["artifact_id"], "evaluation")
                 if _eval_rec else None
             )
+            _eval_data = _eval_res.data if _eval_res else None
             _cb = _eval_data.get("cross_boundary") if isinstance(_eval_data, dict) else None
             if isinstance(_cb, dict) and _cb.get("value") is True:
                 # Symmetric to the deliver auto-aggregate: promote a test stage's INLINE
@@ -2057,7 +2059,10 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
                     _aid = _s.get("artifact_id")
                     if not _aid:
                         continue
-                    _adata = _load_artifact_for_metrics(args.project, _aid)
+                    # expected_type=None: this scan walks ALL stages for the e2e
+                    # marker, so it does not constrain type; ownership still applies.
+                    _ares = _load_artifact_for_metrics(args.project, args.run_id, _aid, None)
+                    _adata = _ares.data
                     if not isinstance(_adata, dict):
                         continue
                     _e2e = _adata.get("cross_boundary_e2e")
@@ -3031,10 +3036,20 @@ def _generate_review_deliverable(
     DELIVER-time PROJECTION of A, a lossless subset, never a second writer. B =
     the SEALED definition only (not every per-stage snapshot — §4.9 边界③):
 
-      - ``REPORT.md``        — the §4.6 Intent→Requirement audit (copied from A)
+      - ``REQUIREMENTS.md``  — the §4.6 Intent→Requirement provenance, mechanically
+                               RENDERED from the sealed ``requirements[]`` (via
+                               render_audit_trail_md, the SAME renderer the terminal
+                               REPORT's audit section uses). NOT a copy of A's
+                               terminal REPORT.md — that is written only at REFLECT,
+                               AFTER run-commit, and carries lessons/metrics that
+                               belong to ledger A, not to a code-reviewer's context.
       - ``requirements.json``— the sealed evaluation ``requirements[]`` block
       - ``run-ref.txt``      — a back-pointer to A's run_id (double-pointer: A's
                                run.json gets ``published_to`` written by the caller)
+
+    GATE: B generates iff the run has sealed ``requirements[]`` (available at
+    DELIVER). The old gate keyed on A's terminal REPORT.md existing — which
+    run-commit never satisfies (DELIVER precedes REFLECT) — so B never generated.
 
     Returns ``(created_paths, warnings)``. ``created_paths`` are ABSOLUTE paths the
     caller appends to ``files_touched`` so the EXISTING per-repo pathspec ``git add
@@ -3055,13 +3070,36 @@ def _generate_review_deliverable(
 
     run_dir = run_file.parent  # A's run dir (workspace .artifacts/runs/<run_id>/)
 
-    # B is the REVIEW DELIVERABLE — its substance is the §4.6 audit REPORT. If A
-    # has no REPORT.md, there is nothing to deliver: generate NOTHING (a bare
-    # run-ref.txt with no report is noise in the diff, and would check an empty
-    # deliverable into every run — the exact over-eager write that broke the
-    # commits[]/already-committed tests). No report → no B, no warning-storm.
-    report_src = run_dir / "REPORT.md"
-    if not report_src.is_file():
+    # B is the REVIEW DELIVERABLE — its substance is the §4.6 Intent→Requirement
+    # provenance, whose source is the EVALUATE `requirements[]` (NOT A's terminal
+    # REPORT.md). That provenance is SEALED at EVALUATE, so it is fully available at
+    # DELIVER-time (when run-commit runs) — unlike the terminal REPORT.md, which is
+    # only written later at REFLECT. The OLD gate keyed on `REPORT.md.is_file()`,
+    # which run-commit NEVER satisfies in a real pipeline (DELIVER precedes REFLECT),
+    # so B never generated. New gate: resolve the sealed requirements; if there are
+    # none, there is nothing to deliver → generate NOTHING (no warning-storm). The
+    # terminal REPORT.md stays in ledger A only (§4.9 双存储: A=全保真审计 incl.
+    # lessons/metrics, B=就地评审上下文 = the §4.6 provenance a code-reviewer needs).
+    sealed_reqs = None
+    for s in run_state.get("stages", []):
+        if s.get("stage") == "evaluate" and s.get("artifact_id"):
+            # expected_type=None (not "evaluation") ON PURPOSE: we already located
+            # the UNIQUE evaluate-stage artifact by (run_id, artifact_id), so the
+            # artifact IS the evaluation — a redundant type-check here would SILENTLY
+            # reject a legitimately-present requirements artifact whose manifest entry
+            # predates the mandatory `type` field (entry.get("type")=None != "evaluation"
+            # → unavailable → B never generates). Omitting it keeps B generating for
+            # pre-schema runs while run+id ownership still guarantees the right artifact.
+            _res = _load_artifact_for_metrics(project, run_id, s["artifact_id"], None)
+            art = _res.data
+            if isinstance(art, dict) and art.get("requirements"):
+                sealed_reqs = {
+                    "schema_version": art.get("schema_version"),
+                    "requirements": art.get("requirements"),
+                    "clarifications": art.get("clarifications", []),
+                }
+            break
+    if not sealed_reqs:
         return [], []
 
     dest = Path(target_repo_root) / ".aidlc" / "deliverables" / run_id
@@ -3072,7 +3110,7 @@ def _generate_review_deliverable(
     # user's .gitignore (P4: it's their file). Instead: WARN loudly + skip B, so
     # the deliverable's absence is a visible, explained decision, not a silent gap.
     import subprocess as _sp
-    rel_probe = f".aidlc/deliverables/{run_id}/REPORT.md"
+    rel_probe = f".aidlc/deliverables/{run_id}/REQUIREMENTS.md"
     try:
         ci = _sp.run(
             ["git", "-C", target_repo_root, "check-ignore", "-q", rel_probe],
@@ -3094,28 +3132,26 @@ def _generate_review_deliverable(
 
     created: list[str] = []
 
-    # (1) REPORT.md — copy A's report verbatim (the §4.6 audit block lives in it).
+    # (1) REQUIREMENTS.md — the §4.6 Intent→Requirement provenance, MECHANICALLY
+    #     RENDERED from the sealed requirements (NOT copied from A's terminal
+    #     REPORT.md). render_audit_trail_md is the SAME pure renderer cmd_run_report
+    #     uses for the REPORT's "需求溯源审计" section (artifact_cli.py:4770), so B's
+    #     provenance and A's audit block cannot drift — they share one source + one
+    #     function. Available at DELIVER-time because requirements are sealed at
+    #     EVALUATE. A code-reviewer opens this to see what was asked + where the AI
+    #     decided — the §4.6 four parts (intent / derivation / clarifications /
+    #     leftover), NOT the REFLECT lessons/metrics (those stay in ledger A).
+    requirement = (run_state.get("requirement") or "pipeline changes")
     try:
-        (dest / "REPORT.md").write_text(
-            report_src.read_text(encoding="utf-8"), encoding="utf-8"
-        )
-        created.append(str(dest / "REPORT.md"))
-    except OSError as e:
-        warnings.append(f"deliverable B: REPORT.md copy failed ({e})")
+        from pipeline_validator import render_audit_trail_md
+        req_md = render_audit_trail_md(requirement, sealed_reqs)
+        (dest / "REQUIREMENTS.md").write_text(req_md, encoding="utf-8")
+        created.append(str(dest / "REQUIREMENTS.md"))
+    except Exception as e:
+        warnings.append(f"deliverable B: REQUIREMENTS.md render failed ({type(e).__name__}: {e})")
 
-    # (2) requirements.json — the SEALED evaluation requirements[] block (the SRS).
-    #     Pulled from the evaluate stage's published artifact via the manifest.
-    sealed_reqs = None
-    for s in run_state.get("stages", []):
-        if s.get("stage") == "evaluate" and s.get("artifact_id"):
-            art = _load_artifact_for_metrics(project, s["artifact_id"])
-            if isinstance(art, dict) and art.get("requirements"):
-                sealed_reqs = {
-                    "schema_version": art.get("schema_version"),
-                    "requirements": art.get("requirements"),
-                    "clarifications": art.get("clarifications", []),
-                }
-            break
+    # (2) requirements.json — the SEALED evaluation requirements[] block (the SRS,
+    #     machine-readable). Resolved above (the B-generation gate); write it now.
     if sealed_reqs:
         try:
             (dest / "requirements.json").write_text(
@@ -4488,9 +4524,14 @@ def cmd_run_report(args, reg: ArtifactRegistry) -> str:
         stage_name = s.get("stage", "?")
         art_id = s.get("artifact_id")
         if art_id:
-            loaded = _load_artifact_for_metrics(args.project, art_id)
+            # Read contract (Action B): own-run + type enforced. expected_type from
+            # the stage→type map; a stage not in the map passes type unchecked (None).
+            loaded = _load_artifact_for_metrics(
+                args.project, args.run_id, art_id,
+                _STAGE_ARTIFACT_TYPE.get(stage_name),
+            )
             if loaded:
-                art_data[stage_name] = loaded
+                art_data[stage_name] = loaded.data
 
     # NOTE (#4): the old date-scoped fallback that reloaded each stage from a bare
     # top-level {type}-{date}.json was DELETED. It overwrote this run's artifact (loaded
@@ -4503,7 +4544,7 @@ def cmd_run_report(args, reg: ArtifactRegistry) -> str:
 
     # ── Determine skipped stages ──────────────────────────────────────
     ALL_STAGES = ["evaluate", "think", "plan", "build", "review", "test", "deliver", "reflect"]
-    present_stages = {s.get("stage", s.get("name", "?")) for s in stages}
+    present_stages = {s.get("stage", "?") for s in stages}  # Action B: legacy `name` fallback removed (0 live data)
     skipped_stages: dict[str, str] = {}  # stage -> reason
     for stg in ALL_STAGES:
         if stg not in present_stages:
@@ -4533,7 +4574,7 @@ def cmd_run_report(args, reg: ArtifactRegistry) -> str:
             if not isinstance(d, dict):
                 d = {"description": str(d)}
             all_decisions.append({
-                "stage": s.get("stage", s.get("name", "?")),
+                "stage": s.get("stage", "?"),
                 **d,
             })
 
@@ -4542,7 +4583,7 @@ def cmd_run_report(args, reg: ArtifactRegistry) -> str:
     judgment = sum(1 for d in all_decisions if d.get("classification") == "judgment")
 
     # ── Stage map (needed by all sections for stage-json PRIMARY reads) ──
-    _stage_map = {s.get("stage", s.get("name", "?")): s for s in stages}
+    _stage_map = {s.get("stage", "?"): s for s in stages}  # Action B: legacy `name` fallback removed
 
     # ── Section 1: TL;DR ──────────────────────────────────────────────
     delivery = art_data.get("deliver", {})
@@ -4590,7 +4631,7 @@ def cmd_run_report(args, reg: ArtifactRegistry) -> str:
     # ── Section 4: Pipeline Execution ─────────────────────────────────
     # Show ALL 8 standard stages — executed ones with data, skipped with reason
     stage_lines = []
-    stage_data_map = {s.get("stage", s.get("name", "?")): s for s in stages}
+    stage_data_map = {s.get("stage", "?"): s for s in stages}  # Action B: legacy `name` fallback removed
     for stg in ALL_STAGES:
         if stg in stage_data_map:
             s = stage_data_map[stg]
@@ -4606,8 +4647,12 @@ def cmd_run_report(args, reg: ArtifactRegistry) -> str:
     # These supplement artifact data with per-stage metrics that may not be in published artifacts
     # (_stage_map already defined above for Section 2-3 reads)
 
+    # Changeset stage is profile-aware (Kiro #6): build for full/bugfix, goal_cycle
+    # for goal. Both the stage RECORD and the artifact DATA are read from it.
+    _changeset_stage = _changeset_stage_for_profile(profile)
+
     # Gate 1 verdict (from build stage-json)
-    _build_rec = _stage_map.get("build", {})
+    _build_rec = _stage_map.get(_changeset_stage, {})
     gate1_verdict = _build_rec.get("gate1_verdict", "N/A")
     gate1_checks = _build_rec.get("gate1_checks", {})
     gate1_override = _build_rec.get("gate1_override", False)
@@ -4636,7 +4681,11 @@ def cmd_run_report(args, reg: ArtifactRegistry) -> str:
     test_new = test_data.get("new_tests", stage_tdd.get("new_tests", 0))
     test_duration = test_data.get("duration_s", 0)
 
-    changeset = art_data.get("build", {})
+    # Profile-aware changeset (Kiro #6): a goal run's changeset lives under
+    # goal_cycle with its OWN schema (cycles/tests_total/regressions/mutations_red),
+    # NOT build's files_changed/lines_added — reading "build" off a goal artifact
+    # silently renders 0. Section 8 below maps the fields per changeset stage.
+    changeset = art_data.get(_changeset_stage, {})
     tests_added = changeset.get("tests_added", test_new)
 
     # ── Section 6: Decision Log ───────────────────────────────────────
@@ -4667,12 +4716,28 @@ def cmd_run_report(args, reg: ArtifactRegistry) -> str:
         confidence_score = confidence_score.get("score", 0)
 
     # ── Section 8: Files Changed ──────────────────────────────────────
-    # Prefer stage-json files_changed (always populated per Rule 22), fallback to artifact
+    # Prefer stage-json files_changed (always populated per Rule 22), fallback to artifact.
+    # Profile-aware (Kiro #6): a goal_cycle changeset has NO files_changed/lines_added —
+    # its schema is cycles/tests_total/regressions/mutations_red/dod_met. Reading build's
+    # field names off a goal artifact renders a misleading 0; map goal's OWN fields instead.
     _fc = stage_files_changed if stage_files_changed else changeset.get("files_changed", [])
     files_changed = _fc if isinstance(_fc, list) else []
     files_changed_count = len(files_changed) if isinstance(_fc, list) else (_fc if isinstance(_fc, int) else 0)
     lines_added = changeset.get("lines_added", 0)
     lines_removed = changeset.get("lines_removed", 0)
+    # Goal-cycle files/lines fallback (Kiro #6 + REVIEW code-quality MED): a goal
+    # run's changeset lives under goal_cycle, which is in _ARTIFACTLESS_STAGES
+    # ("commits incrementally") so it MAY record no artifact_id → art_data['goal_cycle']
+    # empty. Source files_changed from the goal_cycle STAGE RECORD (_build_rec is
+    # _stage_map[_changeset_stage]) when the artifact is absent, so the report header's
+    # `Files:` count reflects a goal run's real effort instead of the hard-0 the old
+    # build-only read produced. (We render through the existing header field — no new
+    # section — to avoid a dead-variable summary that renders nowhere.)
+    if _changeset_stage == "goal_cycle" and not files_changed:
+        _gc_files = _build_rec.get("files_changed", [])
+        if isinstance(_gc_files, list) and _gc_files:
+            files_changed = _gc_files
+            files_changed_count = len(_gc_files)
 
     # ── Duration & timestamps ─────────────────────────────────────────
     created = run_state.get("created_at", "")
@@ -5302,11 +5367,13 @@ def _extract_run_metrics(project: str, run_id: str, run_state: dict) -> dict:
         if not art_id:
             continue
 
-        data = _load_artifact_for_metrics(project, art_id)
+        stage_name = s.get("stage", "?")
+        _res = _load_artifact_for_metrics(
+            project, run_id, art_id, _STAGE_ARTIFACT_TYPE.get(stage_name)
+        )
+        data = _res.data
         if not data:
             continue
-
-        stage_name = s.get("stage", "?")
 
         if stage_name == "review":
             fc = data.get("findings_count")
@@ -5649,41 +5716,121 @@ def _stage_publish_times(
     return rows, {"resolved": len(resolved_rows), "total": total}
 
 
-def _load_artifact_for_metrics(project: str, artifact_id: str) -> dict | None:
-    """Load artifact data by ID from manifest (metrics-safe: returns None on failure)."""
+class LoadResult:
+    """3-state result of a read-contract artifact load (Action B, Kiro #7).
+
+    Distinguishes the three outcomes the old `dict | None` return CONFLATED, so a
+    REPORT can render "unavailable" instead of a misleading real-looking 0:
+      - ``available``   — artifact found, owned by this run, right type, parsed.
+      - ``unavailable`` — a stage DID record an artifact_id, but it does not
+        resolve (missing / corrupt / wrong-run / wrong-type / path-escape).
+      - ``not_run``     — the stage recorded NO artifact_id at all (art_id None/empty).
+
+    ``__bool__`` is True ONLY for ``available`` — so every legacy ``if loaded:`` /
+    ``if isinstance(art, dict)`` caller keeps working unchanged while gaining the
+    3-state distinction when it reads ``.state``.
+    """
+
+    __slots__ = ("state", "data")
+
+    def __init__(self, state: str, data: dict | None = None):
+        self.state = state
+        self.data = data
+
+    def __bool__(self) -> bool:
+        return self.state == "available"
+
+
+def _load_artifact_for_metrics(
+    project: str, run_id: str | None, artifact_id: str | None,
+    expected_type: str | None = None,
+) -> LoadResult:
+    """Load artifact data by ID with the Action B read contract.
+
+    Enforces, in order:
+      - ``not_run`` when ``artifact_id`` is falsy (no artifact recorded).
+      - run OWNERSHIP (Kiro #4) — CONDITIONAL: a manifest entry carrying a
+        ``run_id`` must match the passed ``run_id``; a legacy entry WITHOUT a
+        run_id (~2169 pre-date the write side) passes (rejecting it would lose
+        real data). A mismatch → ``unavailable``.
+      - artifact TYPE (Kiro #4) — when ``expected_type`` is given, ``entry.type``
+        must match; mismatch → ``unavailable``. ``expected_type=None`` skips it.
+      - the existing path-containment TRUST BOUNDARY (run_44a06138) — a
+        ``..``-escaping ``entry.file`` is refused loudly → ``unavailable``.
+    Any missing/corrupt file or manifest → ``unavailable`` (never a silent 0).
+    """
+    if not artifact_id:
+        return LoadResult("not_run")
     ws = _get_workspace()
     manifest_file = ws / "Projects" / project / ".artifacts" / "manifest.json"
     if not manifest_file.exists():
-        return None
+        return LoadResult("unavailable")
     try:
         manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return None
+        return LoadResult("unavailable")
     artifacts_dir = ws / "Projects" / project / ".artifacts"
     for entry in manifest.get("artifacts", []):
-        if entry.get("id") == artifact_id:
-            data_file = artifacts_dir / entry.get("file", "")
-            # TRUST BOUNDARY (run_44a06138): read-side twin of
-            # ArtifactRegistry._entry_to_artifact. The manifest `file` is
-            # caller-influenced; a tampered `../../../secret.json` must NOT be
-            # read. Both legit shapes (bare + runs/<id>/) resolve INSIDE
-            # .artifacts/; only a ..-escape fails. Surface loudly, drop to None.
+        if entry.get("id") != artifact_id:
+            continue
+        # OWNERSHIP (#4) — conditional: enforce only when the entry HAS a run_id.
+        # A legacy run_id-less entry passes (the ~2169-entry back-compat case);
+        # a present-but-mismatched run_id is a cross-run reference → refuse.
+        entry_run_id = entry.get("run_id")
+        if entry_run_id is not None and run_id is not None and entry_run_id != run_id:
+            return LoadResult("unavailable")
+        # TYPE (#4) — enforce only when caller declares an expected_type.
+        if expected_type is not None and entry.get("type") != expected_type:
+            return LoadResult("unavailable")
+        data_file = artifacts_dir / entry.get("file", "")
+        # TRUST BOUNDARY (run_44a06138): read-side twin of
+        # ArtifactRegistry._entry_to_artifact. The manifest `file` is
+        # caller-influenced; a tampered `../../../secret.json` must NOT be
+        # read. Both legit shapes (bare + runs/<id>/) resolve INSIDE
+        # .artifacts/; only a ..-escape fails. Surface loudly, drop.
+        try:
+            if not data_file.resolve().is_relative_to(artifacts_dir.resolve()):
+                print(json.dumps({"security": (
+                    f"metrics load for artifact {artifact_id!r} in project "
+                    f"{project!r} has an out-of-bounds file path "
+                    f"{entry.get('file')!r} — refusing to read (manifest tampering?)."
+                )}), file=sys.stderr)
+                return LoadResult("unavailable")
+        except (OSError, ValueError):
+            return LoadResult("unavailable")  # un-resolvable path → fail closed
+        if data_file.exists():
             try:
-                if not data_file.resolve().is_relative_to(artifacts_dir.resolve()):
-                    print(json.dumps({"security": (
-                        f"metrics load for artifact {artifact_id!r} in project "
-                        f"{project!r} has an out-of-bounds file path "
-                        f"{entry.get('file')!r} — refusing to read (manifest tampering?)."
-                    )}), file=sys.stderr)
-                    return None
-            except (OSError, ValueError):
-                return None  # un-resolvable path → fail closed
-            if data_file.exists():
-                try:
-                    return json.loads(data_file.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, OSError):
-                    return None
-    return None
+                return LoadResult("available", json.loads(data_file.read_text(encoding="utf-8")))
+            except (json.JSONDecodeError, OSError):
+                return LoadResult("unavailable")
+        return LoadResult("unavailable")  # entry matched but data file gone
+    return LoadResult("unavailable")  # no entry with this id
+
+
+# Stage → expected artifact type (the read-contract #4 type check). Mirrors the
+# STAGE_ROUTING "Must Produce" column: evaluate→evaluation, think→research,
+# plan→design_doc, build→changeset, review→review, test→test_report,
+# deliver→delivery, goal_cycle→changeset (goal's build-equivalent).
+_STAGE_ARTIFACT_TYPE = {
+    "evaluate": "evaluation",
+    "think": "research",
+    "plan": "design_doc",
+    "build": "changeset",
+    "goal_cycle": "changeset",
+    "review": "review",
+    "test": "test_report",
+    "deliver": "delivery",
+}
+
+
+def _changeset_stage_for_profile(profile: str | None) -> str:
+    """The stage whose artifact holds the changeset, by profile (Kiro #6).
+
+    full/bugfix (and the default) build via the BUILD stage; a goal run builds
+    inside GOAL_CYCLE, whose changeset artifact has a DIFFERENT schema
+    (cycles/tests_total/regressions/mutations_red, NOT files_changed/lines_added).
+    """
+    return "goal_cycle" if normalize_profile(profile) == "goal" else "build"
 
 
 def cmd_run_metrics(args, reg: ArtifactRegistry) -> None:

@@ -56,10 +56,18 @@ def _seed(workspace, project, run_id, *, profile, cross_boundary, e2e_in_stage,
 
     manifest = {"artifacts": []}
 
+    # Action B read-contract: the completion gate now reads the evaluation
+    # artifact with expected_type="evaluation", so manifest entries must carry
+    # their REAL type (the old blanket "x" was unrealistic — real entries are typed).
+    _AID_TYPE = {"art_eval": "evaluation", "art_plan": "design_doc",
+                 "art_cyc": "changeset", "art_build": "changeset",
+                 "art_rev": "review", "art_test": "test_report", "art_del": "delivery"}
+
     def _art(aid, data):
         rel = f"{aid}.json"
         (art_dir / rel).write_text(json.dumps(data), encoding="utf-8")
-        manifest["artifacts"].append({"id": aid, "file": rel, "type": "x"})
+        manifest["artifacts"].append({"id": aid, "file": rel,
+                                      "type": _AID_TYPE.get(aid, "x")})
 
     stages = []
     # evaluate

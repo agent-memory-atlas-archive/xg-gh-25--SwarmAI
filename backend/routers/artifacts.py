@@ -678,6 +678,7 @@ class PipelineArtifactResponse(BaseModel):
     file: str
     summary: str
     superseded_by: Optional[str]
+    run_id: Optional[str] = None  # Action B #14 — owning run (None for legacy entries)
 
 
 class PublishRequest(BaseModel):
@@ -754,7 +755,7 @@ async def discover_pipeline_artifacts(
         PipelineArtifactResponse(
             id=a.id, type=a.type, producer=a.producer,
             created=a.created, file=a.file, summary=a.summary,
-            superseded_by=a.superseded_by,
+            superseded_by=a.superseded_by, run_id=a.run_id,
         )
         for a in artifacts
     ]

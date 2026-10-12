@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "requirements": [
+    {
+      "id": "FR-1",
+      "statement": "Loader enforces run_id ownership + type on every artifact load",
+      "work_class": "enabler-story",
+      "source": {
+        "kind": "user-stated",
+        "ref": "Kiro #4 — cross-run contamination via blind manifest-id trust"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "a run A stage whose artifact_id points at run B's artifact",
+          "when": "cmd_run_report loads it",
+          "then": "load returns not-found (ownership mismatch), foreign artifact NOT rendered"
+        }
+      ]
+    },
+    {
+      "id": "FR-2",
+      "statement": "Loader returns 3-state (available/unavailable/not_run) instead of None->0",
+      "work_class": "enabler-story",
+      "source": {
+        "kind": "user-stated",
+        "ref": "Kiro #7 — missing artifact rendered as 0 findings"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "a stage artifact_id that does not resolve",
+          "when": "REPORT renders that section",
+          "then": "it shows 'unavailable', distinct from a real 0"
+        }
+      ]
+    },
+    {
+      "id": "FR-3",
+      "statement": "Changeset read is profile-aware (build vs goal_cycle schema)",
+      "work_class": "enabler-story",
+      "source": {
+        "kind": "user-stated",
+        "ref": "Kiro #6 — goal_cycle changeset not read"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "a goal-profile run",
+          "when": "REPORT Section 8 renders the changeset",
+          "then": "it reads goal_cycle's own fields, not build's absent names"
+        }
+      ]
+    },
+    {
+      "id": "FR-4",
+      "statement": "Artifact carries run_id end-to-end; discover() filters by run",
+      "work_class": "enabler-story",
+      "source": {
+        "kind": "user-stated",
+        "ref": "Kiro #14 — discover cannot filter by run"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "two runs with artifacts in one project",
+          "when": "discover(run_id=X) is called",
+          "then": "only run X's artifacts return"
+        }
+      ]
+    }
+  ],
+  "clarifications": []
+}
