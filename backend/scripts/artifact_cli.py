@@ -723,12 +723,8 @@ def _next_stage_continuation(
     if run_id:
         try:
             run_dir = _run_dir(project, run_id)
-            candidates = (
-                run_dir / "run.json",
-                _pipeline_runs_dir(project).parent / f"pipeline-run-{run_id}.json",  # legacy
-            )
-            run_file = next((p for p in candidates if p.is_file()), None)
-            if run_file is not None:
+            run_file = run_dir / "run.json"
+            if run_file.is_file():
                 run_state = json.loads(run_file.read_text(encoding="utf-8"))
                 if isinstance(run_state, dict):
                     stages = _get_profile_stages(run_state.get("profile", "full"))
@@ -878,7 +874,7 @@ def _auto_validate_before_advance(
     for s in reversed(stages):
         status = s.get("status", "")
         if status in ("done", "completed"):
-            current_stage = s.get("stage", s.get("name"))
+            current_stage = s.get("stage", "?")
             current_record = s
             break
 
@@ -1077,16 +1073,10 @@ def _ensure_project_dir(project: str) -> Path:
 
 
 def _resolve_run_file(project: str, run_id: str) -> Path:
-    """Find the run.json file, checking new path (runs/<id>/run.json) then legacy (pipeline-run-<id>.json)."""
-    # New path: .artifacts/runs/<run_id>/run.json
+    """Find the run.json file at the new path (runs/<id>/run.json)."""
     new_path = _run_dir(project, run_id) / "run.json"
     if new_path.exists():
         return new_path
-
-    # Legacy path: .artifacts/pipeline-run-<run_id>.json
-    legacy_path = _get_workspace() / "Projects" / project / ".artifacts" / f"pipeline-run-{run_id}.json"
-    if legacy_path.exists():
-        return legacy_path
 
     print(json.dumps({"error": f"Pipeline run {run_id} not found"}), file=sys.stderr)
     sys.exit(1)
@@ -1634,7 +1624,7 @@ def cmd_purge_garbage(args, reg: ArtifactRegistry) -> None:
 def _load_completed_runs(project: str, limit: int = 10) -> list[dict]:
     """Load completed pipeline runs for historical calibration.
 
-    Scans both new path (runs/*/run.json) and legacy (pipeline-run-*.json).
+    Scans the run path (runs/*/run.json).
     """
     artifacts_dir = _get_workspace() / "Projects" / project / ".artifacts"
     runs = []
@@ -1660,22 +1650,6 @@ def _load_completed_runs(project: str, limit: int = 10) -> list[dict]:
                             return runs
                 except (json.JSONDecodeError, KeyError):
                     continue
-
-    # Legacy path: .artifacts/pipeline-run-*.json
-    if artifacts_dir.exists():
-        seen_ids = {r["id"] for r in runs}
-        for f in sorted(artifacts_dir.glob("pipeline-run-*.json"), reverse=True):
-            try:
-                state = json.loads(f.read_text(encoding="utf-8"))
-                if state["id"] in seen_ids:
-                    continue
-                # D8: same analytics-status normalization on the legacy path.
-                if _effective_analytics_status(state) == "completed" and state.get("stages"):
-                    runs.append(state)
-                    if len(runs) >= limit:
-                        return runs
-            except (json.JSONDecodeError, KeyError):
-                continue
 
     return runs
 
@@ -1794,7 +1768,7 @@ def _maybe_autoaggregate_test_artifact(run_state, profile, reg, project, run_id)
         return None
     test_rec = next(
         (s for s in run_state.get("stages", [])
-         if s.get("stage", s.get("name", "")) == "test"
+         if s.get("stage", "") == "test"
          and s.get("status") in ("completed", "done")),
         None,
     )
@@ -1950,7 +1924,7 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
 
             stage_status_map: dict[str, str] = {}
             for s in run_state.get("stages", []):
-                name = s.get("stage", s.get("name", "?"))
+                name = s.get("stage", "?")
                 stage_status_map[name] = s.get("status", "unknown")
 
             # ── Non-skippable stages per profile (BLOCKING) ──
@@ -1978,7 +1952,7 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
                     # Other stages: skipped is allowed ONLY with an explicit reason
                     record = next(
                         (s for s in run_state.get("stages", [])
-                         if s.get("stage", s.get("name")) == stg),
+                         if s.get("stage", "?") == stg),
                         {},
                     )
                     reason = record.get("skip_reason") or record.get("notes") or ""
@@ -2032,7 +2006,7 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
             _stages = run_state.get("stages", [])
             _eval_rec = next(
                 (s for s in _stages
-                 if s.get("stage", s.get("name")) == "evaluate" and s.get("artifact_id")),
+                 if s.get("stage", "?") == "evaluate" and s.get("artifact_id")),
                 None,
             )
             _eval_res = (
@@ -2091,7 +2065,7 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
             if "reflect" in profile_stages:
                 reflect_record = next(
                     (s for s in run_state.get("stages", [])
-                     if s.get("stage", s.get("name")) == "reflect"
+                     if s.get("stage", "?") == "reflect"
                      and s.get("status") in ("completed", "done")),
                     None,
                 )
@@ -2122,7 +2096,7 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
             if profile in ("full", "bugfix"):
                 stages_without_metrics = []
                 for s in run_state.get("stages", []):
-                    name = s.get("stage", s.get("name", "?"))
+                    name = s.get("stage", "?")
                     status = s.get("status")
                     if status in ("completed", "done") and name != "reflect":
                         tc = s.get("token_cost", 0)
@@ -2146,7 +2120,7 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
             if profile in ("full", "bugfix"):
                 deliver_stage_rec = next(
                     (s for s in run_state.get("stages", [])
-                     if s.get("stage", s.get("name", "")) == "deliver"
+                     if s.get("stage", "") == "deliver"
                      and s.get("status") in ("completed", "done")),
                     None,
                 )
@@ -2251,7 +2225,7 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
                 # = BLOCK (unless profile is trivial/research/docs).
                 deliver_rec = next(
                     (s for s in run_state.get("stages", [])
-                     if s.get("stage", s.get("name", "")) == "deliver"
+                     if s.get("stage", "") == "deliver"
                      and s.get("status") in ("completed", "done")),
                     None,
                 )
@@ -2368,7 +2342,7 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
                     _profile = run_state.get("profile", "full")
                     _cur_profile_stages = _get_profile_stages(_profile)
                     for _s in run_state.get("stages", []):
-                        _name = _s.get("stage", _s.get("name", ""))
+                        _name = _s.get("stage", "")
                         # deliver already re-validated above; skip artifactless stages.
                         if _name in ("deliver", "reflect") or _s.get("status") not in ("completed", "done"):
                             continue
@@ -2444,7 +2418,7 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
             if _goal_profile == "goal":
                 goal_cycle_rec = next(
                     (s for s in run_state.get("stages", [])
-                     if s.get("stage", s.get("name", "")) == "goal_cycle"
+                     if s.get("stage", "") == "goal_cycle"
                      and s.get("status") in ("completed", "done")),
                     None,
                 )
@@ -2516,7 +2490,7 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
                 return bool(d and (d.get("outputs_surfaced") or d.get("local_pr_surfaced")))
             _deliver = next(
                 (s for s in run_state.get("stages", [])
-                 if s.get("stage", s.get("name", "")) == "deliver"
+                 if s.get("stage", "") == "deliver"
                  and s.get("status") in ("completed", "done")),
                 None,
             )
@@ -2649,7 +2623,7 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
         # Replace existing stage record or append
         existing_idx = next(
             (i for i, s in enumerate(run_state["stages"])
-             if s.get("stage", s.get("name")) == stage_record["stage"]),
+             if s.get("stage", "?") == stage_record["stage"]),
             None,
         )
         if existing_idx is not None:
@@ -2711,7 +2685,7 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
         # Check if any stage beyond evaluate is completed
         post_evaluate_stages = [
             s for s in run_state.get("stages", [])
-            if s.get("stage", s.get("name", "")) != "evaluate"
+            if s.get("stage", "") != "evaluate"
             and s.get("status") in ("completed", "done")
         ]
 
@@ -3036,20 +3010,23 @@ def _generate_review_deliverable(
     DELIVER-time PROJECTION of A, a lossless subset, never a second writer. B =
     the SEALED definition only (not every per-stage snapshot — §4.9 边界③):
 
-      - ``REQUIREMENTS.md``  — the §4.6 Intent→Requirement provenance, mechanically
-                               RENDERED from the sealed ``requirements[]`` (via
-                               render_audit_trail_md, the SAME renderer the terminal
-                               REPORT's audit section uses). NOT a copy of A's
-                               terminal REPORT.md — that is written only at REFLECT,
-                               AFTER run-commit, and carries lessons/metrics that
-                               belong to ledger A, not to a code-reviewer's context.
-      - ``requirements.json``— the sealed evaluation ``requirements[]`` block
+      - ``REPORT.md``        — a VERBATIM COPY of A's terminal REPORT.md. That report
+                               ALREADY carries the §4.6 需求溯源审计 (Intent→Requirement)
+                               section — cmd_run_report renders it into the report via
+                               render_audit_trail_md — so copying the report gives a
+                               reviewer the whole provenance (original intent → derivation
+                               → clarifications → leftover) in a SINGLE file, no separate
+                               REQUIREMENTS.md. The copy and A's report cannot drift: B IS
+                               A's report. (run_44a06138 is the known-good proof.)
+      - ``requirements.json``— the sealed evaluation ``requirements[]`` block (machine-readable SRS)
       - ``run-ref.txt``      — a back-pointer to A's run_id (double-pointer: A's
                                run.json gets ``published_to`` written by the caller)
 
-    GATE: B generates iff the run has sealed ``requirements[]`` (available at
-    DELIVER). The old gate keyed on A's terminal REPORT.md existing — which
-    run-commit never satisfies (DELIVER precedes REFLECT) — so B never generated.
+    GATE: B generates iff A has a terminal ``REPORT.md`` on disk — which IS satisfied
+    at run-commit time, because deliver.md generates REPORT.md (its "Pipeline Report"
+    step) BEFORE run-commit runs. No REPORT.md → nothing to copy → generate nothing
+    (defensive no-op). (The lessons/metrics the report also carries are fine in B — B
+    is the terminal report, the reviewer's full context; ledger A remains the audit root.)
 
     Returns ``(created_paths, warnings)``. ``created_paths`` are ABSOLUTE paths the
     caller appends to ``files_touched`` so the EXISTING per-repo pathspec ``git add
@@ -3070,26 +3047,39 @@ def _generate_review_deliverable(
 
     run_dir = run_file.parent  # A's run dir (workspace .artifacts/runs/<run_id>/)
 
-    # B is the REVIEW DELIVERABLE — its substance is the §4.6 Intent→Requirement
-    # provenance, whose source is the EVALUATE `requirements[]` (NOT A's terminal
-    # REPORT.md). That provenance is SEALED at EVALUATE, so it is fully available at
-    # DELIVER-time (when run-commit runs) — unlike the terminal REPORT.md, which is
-    # only written later at REFLECT. The OLD gate keyed on `REPORT.md.is_file()`,
-    # which run-commit NEVER satisfies in a real pipeline (DELIVER precedes REFLECT),
-    # so B never generated. New gate: resolve the sealed requirements; if there are
-    # none, there is nothing to deliver → generate NOTHING (no warning-storm). The
-    # terminal REPORT.md stays in ledger A only (§4.9 双存储: A=全保真审计 incl.
-    # lessons/metrics, B=就地评审上下文 = the §4.6 provenance a code-reviewer needs).
+    # GATE: B is a verbatim COPY of ledger A's terminal REPORT.md — so A must HAVE a
+    # REPORT.md on disk. This IS satisfied at run-commit time: deliver.md generates
+    # REPORT.md (its "Pipeline Report" step) BEFORE run-commit runs, so the terminal
+    # report exists when this function is called. (run_44a06138 is the known-good
+    # proof: its B is a verbatim copy of A's terminal REPORT.md, incl. §9 Lessons.)
+    # No REPORT.md → nothing to copy → generate NOTHING, but WARN LOUDLY (not a
+    # silent no-op). The ordering that makes this gate pass — deliver.md's "Pipeline
+    # Report" step generating REPORT.md BEFORE run-commit — is agent-discipline prose,
+    # not a programmatic precondition; if a future run ever commits before the report
+    # exists, B would silently never generate (the exact "B never generates" bug this
+    # revert exists to prevent). A loud warning makes that ordering violation VISIBLE
+    # in run-commit's WARN channel instead of invisible. The §4.6 需求溯源审计 section a
+    # reviewer needs is ALREADY baked INTO that terminal REPORT.md by cmd_run_report —
+    # so copying the report carries the provenance in a SINGLE file (no separate
+    # REQUIREMENTS.md).
+    report_src = run_dir / "REPORT.md"
+    if not report_src.is_file():
+        return [], [
+            f"deliverable B skipped: ledger A has no terminal REPORT.md at {report_src} — "
+            f"nothing to copy. DELIVER's 'Pipeline Report' step must generate REPORT.md "
+            f"BEFORE run-commit; if it ran after, B was silently lost. Generate the report "
+            f"then re-run run-commit to produce the review deliverable."
+        ]
+
+    # Resolve the sealed requirements[] too — NOT as the gate (the REPORT.md above is
+    # the gate), but as the source for the machine-readable requirements.json (3). Uses
+    # the HEAD _load_artifact_for_metrics 4-arg/LoadResult signature (a parallel session
+    # refactored it — R29, do NOT revert the signature). expected_type=None ON PURPOSE:
+    # run+id already locate the UNIQUE evaluate artifact, so a redundant type-check would
+    # SILENTLY reject a pre-schema manifest entry (entry.get("type")=None != "evaluation").
     sealed_reqs = None
     for s in run_state.get("stages", []):
         if s.get("stage") == "evaluate" and s.get("artifact_id"):
-            # expected_type=None (not "evaluation") ON PURPOSE: we already located
-            # the UNIQUE evaluate-stage artifact by (run_id, artifact_id), so the
-            # artifact IS the evaluation — a redundant type-check here would SILENTLY
-            # reject a legitimately-present requirements artifact whose manifest entry
-            # predates the mandatory `type` field (entry.get("type")=None != "evaluation"
-            # → unavailable → B never generates). Omitting it keeps B generating for
-            # pre-schema runs while run+id ownership still guarantees the right artifact.
             _res = _load_artifact_for_metrics(project, run_id, s["artifact_id"], None)
             art = _res.data
             if isinstance(art, dict) and art.get("requirements"):
@@ -3099,8 +3089,6 @@ def _generate_review_deliverable(
                     "clarifications": art.get("clarifications", []),
                 }
             break
-    if not sealed_reqs:
-        return [], []
 
     dest = Path(target_repo_root) / ".aidlc" / "deliverables" / run_id
 
@@ -3110,7 +3098,7 @@ def _generate_review_deliverable(
     # user's .gitignore (P4: it's their file). Instead: WARN loudly + skip B, so
     # the deliverable's absence is a visible, explained decision, not a silent gap.
     import subprocess as _sp
-    rel_probe = f".aidlc/deliverables/{run_id}/REQUIREMENTS.md"
+    rel_probe = f".aidlc/deliverables/{run_id}/REPORT.md"
     try:
         ci = _sp.run(
             ["git", "-C", target_repo_root, "check-ignore", "-q", rel_probe],
@@ -3132,23 +3120,21 @@ def _generate_review_deliverable(
 
     created: list[str] = []
 
-    # (1) REQUIREMENTS.md — the §4.6 Intent→Requirement provenance, MECHANICALLY
-    #     RENDERED from the sealed requirements (NOT copied from A's terminal
-    #     REPORT.md). render_audit_trail_md is the SAME pure renderer cmd_run_report
-    #     uses for the REPORT's "需求溯源审计" section (artifact_cli.py:4770), so B's
-    #     provenance and A's audit block cannot drift — they share one source + one
-    #     function. Available at DELIVER-time because requirements are sealed at
-    #     EVALUATE. A code-reviewer opens this to see what was asked + where the AI
-    #     decided — the §4.6 four parts (intent / derivation / clarifications /
-    #     leftover), NOT the REFLECT lessons/metrics (those stay in ledger A).
-    requirement = (run_state.get("requirement") or "pipeline changes")
+    # (1) REPORT.md — a VERBATIM COPY of A's terminal REPORT.md. The §4.6 需求溯源审计
+    #     (Intent→Requirement) section a reviewer needs is ALREADY inside it (baked in
+    #     by cmd_run_report via render_audit_trail_md), so the copy carries the full
+    #     provenance — original intent → derivation → clarifications → leftover — PLUS
+    #     the TL;DR / files-changed / etc. a code-reviewer wants, in a SINGLE file. B IS
+    #     A's terminal report, so the two cannot drift (no separate renderer to diverge).
     try:
-        from pipeline_validator import render_audit_trail_md
-        req_md = render_audit_trail_md(requirement, sealed_reqs)
-        (dest / "REQUIREMENTS.md").write_text(req_md, encoding="utf-8")
-        created.append(str(dest / "REQUIREMENTS.md"))
-    except Exception as e:
-        warnings.append(f"deliverable B: REQUIREMENTS.md render failed ({type(e).__name__}: {e})")
+        (dest / "REPORT.md").write_text(
+            report_src.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        created.append(str(dest / "REPORT.md"))
+    except (OSError, UnicodeDecodeError) as e:
+        # B is best-effort (ledger A is the durable truth) — a read/write/decode
+        # failure on the terminal report warns + skips, never crashes run-commit.
+        warnings.append(f"deliverable B: REPORT.md copy failed ({type(e).__name__}: {e})")
 
     # (2) requirements.json — the SEALED evaluation requirements[] block (the SRS,
     #     machine-readable). Resolved above (the B-generation gate); write it now.
@@ -3229,7 +3215,7 @@ def cmd_run_commit(args, reg: ArtifactRegistry) -> None:
     # ── Gate 1: PUSH-READY must have passed ──────────────────────────────────
     deliver_rec = next(
         (s for s in run_state.get("stages", [])
-         if s.get("stage", s.get("name", "")) == "deliver"
+         if s.get("stage", "") == "deliver"
          and s.get("status") in ("completed", "done")),
         None,
     )
@@ -3780,18 +3766,6 @@ def cmd_run_get(args, reg: ArtifactRegistry) -> None:
                 except (json.JSONDecodeError, KeyError):
                     continue
 
-    # Legacy path: .artifacts/pipeline-run-*.json
-    if artifacts_dir.exists():
-        for f in sorted(artifacts_dir.glob("pipeline-run-*.json"), reverse=True):
-            try:
-                state = json.loads(f.read_text(encoding="utf-8"))
-                # Skip if already found via new path
-                if any(r["id"] == state["id"] for r in runs):
-                    continue
-                runs.append(_run_summary(state))
-            except (json.JSONDecodeError, KeyError):
-                continue
-
     print(json.dumps({"runs": runs, "count": len(runs)}, indent=2))
 
 
@@ -4030,7 +4004,7 @@ def _compute_should_checkpoint(run_state: dict, project: str) -> dict:
     remaining = budget["session_total"] - consumed
     usable = remaining - budget["checkpoint_reserve"]
 
-    completed_stages = {s.get("stage", s.get("name", "unknown")) for s in run_state.get("stages", []) if s.get("status") == "completed"}
+    completed_stages = {s.get("stage", "unknown") for s in run_state.get("stages", []) if s.get("status") == "completed"}
     profile_stages = _get_profile_stages(run_state.get("profile", "full"))
     next_stage = next((s for s in profile_stages if s not in completed_stages), None)
     next_stage_estimate = budget.get("stage_estimates", DEFAULT_STAGE_BUDGETS).get(next_stage, 30_000) if next_stage else 0
@@ -4118,7 +4092,7 @@ def cmd_run_checkpoint(args, reg: ArtifactRegistry) -> None:
     run_state["updated_at"] = now
 
     # Store checkpoint metadata in the run state
-    completed_stages = [s.get("stage", s.get("name", "unknown")) for s in run_state["stages"] if s.get("status") == "completed"]
+    completed_stages = [s.get("stage", "unknown") for s in run_state["stages"] if s.get("status") == "completed"]
     checkpoint_meta = {
         "reason": args.reason,
         "stage": args.stage,
@@ -4152,7 +4126,7 @@ def cmd_run_checkpoint(args, reg: ArtifactRegistry) -> None:
         "requirement": run_state["requirement"],
         "completed_stages": [
             {
-                "stage": s.get("stage", s.get("name", "unknown")),
+                "stage": s.get("stage", "unknown"),
                 "artifact_id": s.get("artifact_id"),
                 "notes": s.get("notes"),
             }
@@ -4349,7 +4323,6 @@ def cmd_run_status(args, reg: ArtifactRegistry) -> None:
             continue
 
         project_name = project_dir.name
-        seen_ids: set[str] = set()
 
         # New path: runs/*/run.json
         runs_dir = artifacts_dir / "runs"
@@ -4360,20 +4333,9 @@ def cmd_run_status(args, reg: ArtifactRegistry) -> None:
                     try:
                         state = json.loads(rf.read_text(encoding="utf-8"))
                         state["_project"] = project_name
-                        seen_ids.add(state["id"])
                         all_pipelines.append(_status_entry(state, project_name))
                     except (json.JSONDecodeError, OSError, KeyError):
                         continue
-
-        # Legacy path: pipeline-run-*.json
-        for run_file in sorted(artifacts_dir.glob("pipeline-run-*.json"), reverse=True):
-            try:
-                state = json.loads(run_file.read_text(encoding="utf-8"))
-                if state.get("id") in seen_ids:
-                    continue
-                all_pipelines.append(_status_entry(state, project_name))
-            except (json.JSONDecodeError, OSError, KeyError):
-                continue
 
     # Sort: running first, then paused, then completed. Within each group, newest first.
     # ISO timestamps sort lexicographically, so negate by prepending complement for descending.
@@ -4486,9 +4448,9 @@ def cmd_run_resume(args, reg: ArtifactRegistry) -> None:
         "pipeline_id": args.run_id,
         "status": "running",
         "resumed_from": next_stage,
-        "completed_stages": [s.get("stage", s.get("name", "unknown")) for s in run_state["stages"] if s.get("status") == "completed"],
+        "completed_stages": [s.get("stage", "unknown") for s in run_state["stages"] if s.get("status") == "completed"],
         "budget": budget,
-        "blocked_stages": [s.get("stage", s.get("name", "unknown")) for s in blocked_stages],
+        "blocked_stages": [s.get("stage", "unknown") for s in blocked_stages],
     }, indent=2))
 
 
@@ -5658,7 +5620,7 @@ def _stage_publish_times(
     resolved_rows: list[dict] = []
     unresolved_rows: list[dict] = []
     for rec in stages:
-        name = rec.get("stage") or rec.get("name") or "?"
+        name = rec.get("stage") or "?"
         row = {"stage": name, "at": None, "elapsed_min": None,
                "resolved": False, "cycles": _cycles(rec)}
         # `isinstance(_aid, str)`: artifact_id indexes a dict, so a list/dict

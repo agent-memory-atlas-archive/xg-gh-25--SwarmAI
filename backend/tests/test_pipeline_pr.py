@@ -152,7 +152,7 @@ class TestBodyFormatting:
         assert "Pipeline Delivery" in body or "Confidence" in body
         assert "run_test123" in body
         assert "9/12" in body or "9" in body
-        assert "REQUIREMENTS.md" in body
+        assert "REPORT.md" in body
 
     def test_body_under_65k(self, run_dir):
         run_json = json.loads((run_dir / "run.json").read_text())
@@ -162,19 +162,20 @@ class TestBodyFormatting:
 
     def test_report_ref_points_at_checked_in_deliverable_not_dangling_workspace(self, run_dir):
         """AC5 (§4.9): the deliverable reference MUST point at the real-repo-relative
-        path `.aidlc/deliverables/<run_id>/REQUIREMENTS.md` (where derivative B — the
-        §4.6 requirement-provenance snapshot — is checked in alongside the code
-        commit), NOT the dangling `.artifacts/runs/<run_id>/...` — that path lives in
-        the daemon workspace, is NOT in the commit, and 404s for any reviewer in the
-        source repo. This is the whole point of §4.9: reviewer sees code + context
-        same-screen. (B's audit file is now REQUIREMENTS.md, not a terminal REPORT.md.)
+        path `.aidlc/deliverables/<run_id>/REPORT.md` (where derivative B — a verbatim
+        copy of A's terminal report, whose §4.6 需求溯源审计 section carries the
+        Intent→Requirement provenance — is checked in alongside the code commit), NOT
+        the dangling `.artifacts/runs/<run_id>/...` — that path lives in the daemon
+        workspace, is NOT in the commit, and 404s for any reviewer in the source repo.
+        This is the whole point of §4.9: reviewer sees code + context same-screen.
+        (B's audit file is REPORT.md — the provenance section lives inside it.)
         """
         run_json = json.loads((run_dir / "run.json").read_text())
         report_text = (run_dir / "REPORT.md").read_text()
         body = format_pr_body(run_json, report_text)
 
-        # The reference must be the checked-in deliverable path (B = REQUIREMENTS.md).
-        assert ".aidlc/deliverables/run_test123/REQUIREMENTS.md" in body, (
+        # The reference must be the checked-in deliverable path (B = REPORT.md).
+        assert ".aidlc/deliverables/run_test123/REPORT.md" in body, (
             "PR body must reference the real-repo deliverable path (§4.9)"
         )
         # The dangling workspace path must be GONE (it's the 404 bug being fixed).

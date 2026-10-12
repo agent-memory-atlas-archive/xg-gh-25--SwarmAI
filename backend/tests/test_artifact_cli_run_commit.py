@@ -719,30 +719,37 @@ class TestReviewDeliverableCheckin:
 
     def test_B_generates_for_pre_schema_manifest_entry_without_type(self, workspace, tmp_path, capsys):
         """Meta-review HIGH regression: a manifest entry predating the mandatory
-        `type` field (type absent) must STILL resolve the requirements artifact and
-        generate B. The B gate passes expected_type=None, so a missing type does NOT
-        silently reject (which would make B never generate for pre-schema runs)."""
+        `type` field (type absent) must STILL resolve the requirements artifact so
+        requirements.json is written into B. The requirements lookup passes
+        expected_type=None, so a missing type does NOT silently reject it. (B itself
+        is gated on A's terminal REPORT.md existing — written here to satisfy the gate.)"""
         repo = self._repo_with_change(tmp_path, "preschemarepo")
         run_id = "run_pre"
         self._land_eval_artifact(workspace, with_type=False)  # NO type field
-        _write_run(
+        run_file = _write_run(
             workspace, run_id,
             stages=[{"stage": "evaluate", "status": "completed", "artifact_id": "art_evalB"},
                     {"stage": "deliver", "status": "completed", "push_ready": True}],
             files_touched=[str(repo / "f.py")],
         )
+        # deliver.md generates REPORT.md before run-commit → land one for the copy-gate.
+        (run_file.parent / "REPORT.md").write_text("# Report\n## 需求溯源审计\nFR-1\n")
         _run_commit(workspace, run_id)
         capsys.readouterr()
         bdir = repo / ".aidlc" / "deliverables" / run_id
-        assert (bdir / "REQUIREMENTS.md").is_file(), \
-            "B must generate even when the manifest entry lacks a `type` field (expected_type=None)"
+        # B copied the terminal REPORT.md, AND requirements.json was resolved from the
+        # type-less manifest entry (expected_type=None).
+        assert (bdir / "REPORT.md").is_file(), "B must generate when A has a terminal REPORT.md"
+        assert (bdir / "requirements.json").is_file(), \
+            "requirements.json must resolve even when the manifest entry lacks a `type` field (expected_type=None)"
 
     def test_deliverable_B_created_and_staged_in_same_commit(self, workspace, tmp_path, capsys):
         repo = self._repo_with_change(tmp_path, "srcrepo")
         run_id = "run_delivB"
         self._land_eval_artifact(workspace)
-        # B no longer copies A's terminal REPORT.md — it renders REQUIREMENTS.md from
-        # the sealed requirements[] (available at DELIVER, before REFLECT writes REPORT).
+        # B is a verbatim COPY of A's terminal REPORT.md — which carries the §4.6
+        # 需求溯源审计 (Intent→Requirement) section. deliver.md generates REPORT.md
+        # (Pipeline Report step) BEFORE run-commit, so land one here for the copy-gate.
         run_file = _write_run(
             workspace, run_id,
             stages=[{"stage": "evaluate", "status": "completed", "artifact_id": "art_evalB"},
@@ -750,25 +757,28 @@ class TestReviewDeliverableCheckin:
             files_touched=[str(repo / "f.py")],
         )
         run_dir = run_file.parent
+        (run_dir / "REPORT.md").write_text(
+            "# Report\n## 需求溯源审计\n### 原始意图\n> ship the thing\nFR-1\n## 9. Lessons\n- x\n")
 
         _run_commit(workspace, run_id)
         capsys.readouterr()
 
-        # B exists in the REAL repo under .aidlc/deliverables/<run_id>/ — audit file
-        # is REQUIREMENTS.md (the §4.6 provenance rendered from requirements).
+        # B exists in the REAL repo under .aidlc/deliverables/<run_id>/ — audit file is
+        # REPORT.md (a verbatim copy of A's terminal report; the §4.6 provenance section
+        # lives inside it), NOT a separate REQUIREMENTS.md.
         bdir = repo / ".aidlc" / "deliverables" / run_id
-        assert (bdir / "REQUIREMENTS.md").is_file(), "B REQUIREMENTS.md must be checked into the real repo"
+        assert (bdir / "REPORT.md").is_file(), "B REPORT.md must be checked into the real repo"
         assert (bdir / "run-ref.txt").is_file(), "B run-ref.txt (back-pointer to A) must exist"
-        req_body = (bdir / "REQUIREMENTS.md").read_text()
-        assert "溯源" in req_body and "FR-1" in req_body, \
-            "B REQUIREMENTS.md must carry the §4.6 provenance rendered from requirements"
-        assert "REPORT.md" not in {p.name for p in bdir.iterdir()}, \
-            "B must NOT carry a terminal REPORT.md (that stays in ledger A)"
+        rep_body = (bdir / "REPORT.md").read_text()
+        assert "需求溯源审计" in rep_body and "FR-1" in rep_body, \
+            "B REPORT.md must carry the §4.6 provenance section (copied from A's terminal report)"
+        assert "REQUIREMENTS.md" not in {p.name for p in bdir.iterdir()}, \
+            "B must NOT carry a separate REQUIREMENTS.md (the provenance is inside REPORT.md)"
 
         # B is in the SAME commit as the code (HEAD commit touched BOTH f.py and B).
         head_files = self._git(repo, "show", "--name-only", "--format=", "HEAD").stdout
         assert "f.py" in head_files, "code file must be in the commit"
-        assert f".aidlc/deliverables/{run_id}/REQUIREMENTS.md" in head_files, \
+        assert f".aidlc/deliverables/{run_id}/REPORT.md" in head_files, \
             "B must be in the SAME commit as the code (§4.9 same-screen review)"
 
         # Ledger A (workspace .artifacts/) is UNTOUCHED — A→B one-way, A durable.

@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "requirements": [
+    {
+      "id": "FR-1",
+      "statement": "派生物 B 的文件名与内容 = copy 底账 A 的终版 REPORT.md(含溯源 section),非独立 REQUIREMENTS.md",
+      "work_class": "bug",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG: 我要的是跟Commit一起提交的是REPORT.md 里面有个section 是REQUIREMENTS 从原始intent到requirement 的整个过程"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "一个 push-ready run 且底账 A 已有终版 REPORT.md(DELIVER REPORT.md gate 保证其存在)",
+          "when": "cmd_run_commit 调 _generate_review_deliverable",
+          "then": "B/REPORT.md 被生成,内容=A 的终版 REPORT.md(含 §需求溯源审计 section)"
+        }
+      ]
+    },
+    {
+      "id": "FR-2",
+      "statement": "render_audit_trail_md 函数保留;只删 B 生成器里对它的调用,改回 copy REPORT.md",
+      "work_class": "task",
+      "source": {
+        "kind": "ddd-derived",
+        "ref": "cmd_run_report:4840 的终版 REPORT 溯源 section 仍调它,删函数会破坏终版 REPORT"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "回退后",
+          "when": "grep render_audit_trail_md 的非测试消费方",
+          "then": "cmd_run_report 仍调用它,B 生成器不再调用它"
+        }
+      ]
+    },
+    {
+      "id": "FR-3",
+      "statement": "正典 §4.9/§4.6.1 措辞改回 B=copy 终版 REPORT.md(撤销 run_08fbe0ab 的 REQUIREMENTS.md 措辞修订)",
+      "work_class": "task",
+      "source": {
+        "kind": "user-stated",
+        "ref": "R7 doc-code 一致 + XG 要求回退"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "代码改回",
+          "when": "读正典 §4.9 B 内容定义 + §4.6.1",
+          "then": "措辞描述 B=copy 终版 REPORT.md,与回退后代码一致,无悬空 REQUIREMENTS.md 契约"
+        }
+      ]
+    }
+  ],
+  "clarifications": [
+    {
+      "qid": "Q1",
+      "question": "两个已 commit 的历史 REQUIREMENTS.md 要回填成 REPORT.md 吗?",
+      "options": [
+        "A. 回填统一",
+        "B. 留历史不动",
+        "X. Other"
+      ],
+      "answer": "B. 留历史不动",
+      "answered_by": "user",
+      "resolution": "XG 明确:已 commit 的两个历史 REQUIREMENTS.md 保留不动"
+    },
+    {
+      "qid": "Q2",
+      "question": "run_08fbe0ab 的'时序错配'根因对吗?",
+      "options": [
+        "A. 对",
+        "B. 错——REPORT.md 在 DELIVER 时已存在",
+        "X. Other"
+      ],
+      "answer": "B. 错——REPORT.md 在 DELIVER 时已存在",
+      "answered_by": "self",
+      "resolution": "code-trace: artifact_cli.py:903-918 DELIVER 有强制 REPORT.md gate(advance deliver 前 REPORT.md 必须存在);run_44a06138 旧契约 B(12165B)=底账 A 终版 REPORT.md(12146B)逐字相同(仅时间戳差)。证明 run-commit 时 REPORT.md 存在,'时序错配'根因是错的,run_08fbe0ab 整个方向错误"
+    }
+  ]
+}
