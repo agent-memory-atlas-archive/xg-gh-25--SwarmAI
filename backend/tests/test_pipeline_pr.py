@@ -160,6 +160,27 @@ class TestBodyFormatting:
         body = format_pr_body(run_json, report_text)
         assert len(body) < 65000
 
+    def test_report_ref_points_at_checked_in_deliverable_not_dangling_workspace(self, run_dir):
+        """AC1 (§4.9): the report reference MUST point at the real-repo-relative
+        deliverable path `.aidlc/deliverables/<run_id>/REPORT.md` (where derivative
+        B is checked in alongside the code commit), NOT the dangling
+        `.artifacts/runs/<run_id>/REPORT.md` — that path lives in the daemon
+        workspace, is NOT in the commit, and 404s for any reviewer in the source
+        repo. This is the whole point of §4.9: reviewer sees code + context same-screen.
+        """
+        run_json = json.loads((run_dir / "run.json").read_text())
+        report_text = (run_dir / "REPORT.md").read_text()
+        body = format_pr_body(run_json, report_text)
+
+        # The reference must be the checked-in deliverable path.
+        assert ".aidlc/deliverables/run_test123/REPORT.md" in body, (
+            "PR body must reference the real-repo deliverable path (§4.9)"
+        )
+        # The dangling workspace path must be GONE (it's the 404 bug being fixed).
+        assert ".artifacts/runs/run_test123/REPORT.md" not in body, (
+            "PR body must NOT reference the dangling workspace .artifacts path (404 for reviewer)"
+        )
+
 
 class TestGracefulFailure:
     """AC6: gh auth failure = non-blocking warning."""

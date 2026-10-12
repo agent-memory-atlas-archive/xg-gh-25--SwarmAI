@@ -159,7 +159,7 @@ def format_pr_body(run_data: dict, report_text: str) -> str:
 - {regression_check} Full test suite passes ({tdd_info})
 - {adversarial_check} Adversarial review clean
 
-Full report: `.artifacts/runs/{run_id}/REPORT.md`
+Full report: `.aidlc/deliverables/{run_id}/REPORT.md`
 
 Generated with [SwarmAI Autonomous Pipeline](https://github.com/xg-gh-25/SwarmAI)
 """

@@ -55,7 +55,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.artifact_registry import ArtifactRegistry
-from core.pipeline_profiles import get_profile_stages, normalize_profile
+from core.pipeline_profiles import get_profile_stages, normalize_profile, resolve_depth
 
 # Sibling module in backend/scripts/ — pure completion commit+surface gate logic.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -481,6 +481,55 @@ def cmd_publish(args, reg: ArtifactRegistry) -> None:
     # cross-contaminate a run report. The ONLY run-blind write that WAS a risk
     # (the HTTP publish endpoint) is fail-closed; a `--stage` publish with no
     # --run-id also fails closed (below). Bare publishes themselves are benign.
+
+    # ── TRUST BOUNDARY (run_44a06138): FAIL-CLOSED ORDER (Kiro #2). ──
+    # Validate project + run_id BEFORE reg.publish() writes anything. The old
+    # order published first and refused after, so a rejected publish had already
+    # created an artifact file + manifest entry. reg.publish() ALSO validates
+    # internally (defense-in-depth), but doing it here first guarantees the CLI
+    # writes ZERO bytes on a bad identifier and emits a clean error.
+    try:
+        reg._validate_path_identifiers(args.project, run_id)
+    except ValueError as _ve:
+        _err = {"error": f"unsafe path identifier (rejected before write): {_ve}"}
+        if getattr(args, "quiet", False):
+            print(json.dumps(_err), file=sys.stderr)
+        else:
+            print(json.dumps(_err, indent=2), file=sys.stderr)
+        sys.exit(3)
+
+    # ── PHANTOM-RUN existence check (run_44a06138, Kiro #3). ──
+    # A --stage publish names a target run; that run MUST already exist and own
+    # this project/id. Without this, publishing to a never-created run_id mints a
+    # phantom runs/<id>/ dir and a dangling artifact. (A bare publish — no run_id,
+    # standalone skills — legitimately has no run and skips this.)
+    if stage and run_id:
+        _run_json = (
+            Path(reg.workspace_root) / "Projects" / args.project
+            / ".artifacts" / "runs" / run_id / "run.json"
+        )
+        _phantom = None
+        if not _run_json.is_file():
+            _phantom = f"run '{run_id}' does not exist (no runs/{run_id}/run.json)"
+        else:
+            try:
+                _rj = json.loads(_run_json.read_text(encoding="utf-8"))
+                _rj_proj = _rj.get("project")
+                _rj_id = _rj.get("id") or _rj.get("pipeline_id") or _rj.get("run_id")
+                if _rj_proj not in (None, args.project):
+                    _phantom = f"run '{run_id}' belongs to project {_rj_proj!r}, not {args.project!r}"
+                elif _rj_id not in (None, run_id):
+                    _phantom = f"run.json id {_rj_id!r} does not match run_id {run_id!r}"
+            except (json.JSONDecodeError, OSError) as _e:
+                _phantom = f"run '{run_id}' run.json unreadable: {_e}"
+        if _phantom:
+            _err = {"error": f"stage publish to a non-existent/foreign run (rejected before write): {_phantom}"}
+            if getattr(args, "quiet", False):
+                print(json.dumps(_err), file=sys.stderr)
+            else:
+                print(json.dumps(_err, indent=2), file=sys.stderr)
+            sys.exit(3)
+
     try:
         artifact_id = reg.publish(
             project=args.project,
@@ -1013,18 +1062,15 @@ def _ensure_project_dir(project: str) -> Path:
     from core.swarm_workspace_manager import ensure_project_metadata
     # Containment guard (adversarial-review HIGH): `project` is a CLI arg that upstream
     # tooling may fill from requirement/LLM text — an unvalidated segment like
-    # "../../.ssh" would let mkdir(parents=True) escape the workspace. Reject any
-    # separator/parent/absolute segment, and assert the resolved path stays under
-    # Projects/ before creating anything.
+    # "../../.ssh" would let mkdir(parents=True) escape the workspace.
+    # SSOT (run_44a06138, Gate-1 amendment A): delegate the project-name
+    # containment to ArtifactRegistry._validate_path_identifiers — the ONE place
+    # that owns "is this caller-supplied identifier safe to build a path from?"
+    # Do NOT re-derive the resolve()/relative_to idiom here (a 2nd copy drifts).
+    from core.artifact_registry import ArtifactRegistry
     projects_root = _get_workspace() / "Projects"
-    if (not project or project in (".", "..") or "/" in project or "\\" in project
-            or "\x00" in project or Path(project).is_absolute()):
-        raise ValueError(f"unsafe project name (path traversal): {project!r}")
+    ArtifactRegistry(_get_workspace())._validate_path_identifiers(project)
     pdir = projects_root / project
-    try:
-        pdir.resolve().relative_to(projects_root.resolve())
-    except ValueError:
-        raise ValueError(f"project dir escapes Projects/: {project!r}")
     pdir.mkdir(parents=True, exist_ok=True)
     ensure_project_metadata(pdir, project)
     return pdir
@@ -1681,6 +1727,14 @@ def cmd_run_create(args, reg: ArtifactRegistry) -> None:
         # C3: store canonical profile if given; None stays None (profile is classified
         # after EVALUATE — "not yet set" is meaningful and must not become "full").
         "profile": normalize_profile(args.profile) if args.profile else None,
+        # SRS §5.2 depth axis — resolve_depth(profile, override): a valid --depth wins,
+        # else the profile's default (unknown profile → standard, never silently light).
+        # Stored at birth so the Pipeline-card matrix badge + any depth-aware rigor can
+        # read it; orthogonal to profile (never changes the stage list).
+        "depth": resolve_depth(
+            normalize_profile(args.profile) if args.profile else None,
+            getattr(args, "depth", None),
+        ),
         "status": "running",
         "stages": [],
         "taste_decisions": [],
@@ -2965,6 +3019,154 @@ def _lookup_already_committed(
     return out
 
 
+def _generate_review_deliverable(
+    project: str, run_id: str, target_repo_root: str
+) -> tuple[list[str], list[str]]:
+    """Generate derivative "B" — the review deliverable — into the real repo's
+    ``.aidlc/deliverables/<run_id>/`` so a reviewer sees code + context in the SAME
+    commit (SRS design §4.9).
+
+    DUAL-STORE, ONE-WAY (A→B): the master ledger "A" (the daemon workspace
+    ``.artifacts/runs/<run_id>/``) is NEVER touched here — B is a frozen,
+    DELIVER-time PROJECTION of A, a lossless subset, never a second writer. B =
+    the SEALED definition only (not every per-stage snapshot — §4.9 边界③):
+
+      - ``REPORT.md``        — the §4.6 Intent→Requirement audit (copied from A)
+      - ``requirements.json``— the sealed evaluation ``requirements[]`` block
+      - ``run-ref.txt``      — a back-pointer to A's run_id (double-pointer: A's
+                               run.json gets ``published_to`` written by the caller)
+
+    Returns ``(created_paths, warnings)``. ``created_paths`` are ABSOLUTE paths the
+    caller appends to ``files_touched`` so the EXISTING per-repo pathspec ``git add
+    -- <path>`` loop stages them — NEVER ``git add -A`` (Gate-1 guardrail). On any
+    failure, returns ``([], [warning])`` — B is best-effort; a missing B never
+    blocks the code commit (the ledger A is the durable truth).
+
+    404-防线 (§4.9 边界④): the caller MUST have resolved ``target_repo_root`` to a
+    REAL source repo (the git root of files_touched) and asserted it is NOT the
+    daemon workspace — B in the workspace would be the exact 404 this fixes.
+    """
+    warnings: list[str] = []
+    try:
+        run_file = _resolve_run_file(project, run_id)
+        run_state = json.loads(run_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        return [], [f"deliverable B skipped: cannot read run.json ({e})"]
+
+    run_dir = run_file.parent  # A's run dir (workspace .artifacts/runs/<run_id>/)
+
+    # B is the REVIEW DELIVERABLE — its substance is the §4.6 audit REPORT. If A
+    # has no REPORT.md, there is nothing to deliver: generate NOTHING (a bare
+    # run-ref.txt with no report is noise in the diff, and would check an empty
+    # deliverable into every run — the exact over-eager write that broke the
+    # commits[]/already-committed tests). No report → no B, no warning-storm.
+    report_src = run_dir / "REPORT.md"
+    if not report_src.is_file():
+        return [], []
+
+    dest = Path(target_repo_root) / ".aidlc" / "deliverables" / run_id
+
+    # §4.9 边界① gitignore conflict: if the target repo's .gitignore would EXCLUDE
+    # .aidlc/deliverables/, B would be written but never checked in (silently
+    # absent from the commit — a different flavor of the 404). We do NOT edit the
+    # user's .gitignore (P4: it's their file). Instead: WARN loudly + skip B, so
+    # the deliverable's absence is a visible, explained decision, not a silent gap.
+    import subprocess as _sp
+    rel_probe = f".aidlc/deliverables/{run_id}/REPORT.md"
+    try:
+        ci = _sp.run(
+            ["git", "-C", target_repo_root, "check-ignore", "-q", rel_probe],
+            capture_output=True, timeout=10,
+        )
+        if ci.returncode == 0:  # 0 = the path IS ignored
+            return [], [
+                f"deliverable B skipped: '.aidlc/deliverables/' is gitignored in "
+                f"{target_repo_root} — B would never reach the commit. NOT editing your "
+                f".gitignore (P4). Un-ignore .aidlc/deliverables/ to enable review check-in."
+            ]
+    except (OSError, _sp.SubprocessError):
+        pass  # check-ignore unavailable → proceed (fail-open; a real git add would surface it)
+
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return [], [f"deliverable B skipped: cannot create {dest} ({e})"]
+
+    created: list[str] = []
+
+    # (1) REPORT.md — copy A's report verbatim (the §4.6 audit block lives in it).
+    try:
+        (dest / "REPORT.md").write_text(
+            report_src.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        created.append(str(dest / "REPORT.md"))
+    except OSError as e:
+        warnings.append(f"deliverable B: REPORT.md copy failed ({e})")
+
+    # (2) requirements.json — the SEALED evaluation requirements[] block (the SRS).
+    #     Pulled from the evaluate stage's published artifact via the manifest.
+    sealed_reqs = None
+    for s in run_state.get("stages", []):
+        if s.get("stage") == "evaluate" and s.get("artifact_id"):
+            art = _load_artifact_for_metrics(project, s["artifact_id"])
+            if isinstance(art, dict) and art.get("requirements"):
+                sealed_reqs = {
+                    "schema_version": art.get("schema_version"),
+                    "requirements": art.get("requirements"),
+                    "clarifications": art.get("clarifications", []),
+                }
+            break
+    if sealed_reqs:
+        try:
+            (dest / "requirements.json").write_text(
+                json.dumps(sealed_reqs, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            created.append(str(dest / "requirements.json"))
+        except OSError as e:
+            warnings.append(f"deliverable B: requirements.json write failed ({e})")
+
+    # (3) run-ref.txt — back-pointer to A (the double-pointer other half).
+    try:
+        (dest / "run-ref.txt").write_text(
+            f"run_id: {run_id}\nproject: {project}\nledger: .artifacts/runs/{run_id}/ (daemon workspace)\n",
+            encoding="utf-8",
+        )
+        created.append(str(dest / "run-ref.txt"))
+    except OSError as e:
+        warnings.append(f"deliverable B: run-ref.txt write failed ({e})")
+
+    # §4.9 边界③ 隐私红线 (FR-4): B carries the user's VERBATIM original intent +
+    # clarification Q&A, and is about to be checked into a repo that MAY be public
+    # (e.g. SwarmAI's own public SwarmAI.git). Reuse the ddd_packager content-safety
+    # scanner (the SAME fail-closed scan s_ddd-distribute runs before shipping a
+    # package) over the emitted B tree. external=True = also flag internal-org
+    # strings (a public repo must carry none). Any finding → a LOUD warning so the
+    # human sees exactly what is sensitive BEFORE the eventual push (cmd_run_commit
+    # is local-only; push is a separate user-initiated step — STEERING #5 — so the
+    # scan surfaces risk at the earliest point a human reviews). We do NOT auto-
+    # redact (never silently mutate the user's audit record) and do NOT block the
+    # LOCAL commit — the warning + the human's push gate is the control.
+    try:
+        from core.ddd_packager import content_safety_scan
+        scan_findings = content_safety_scan(dest, external=True)
+        if scan_findings:
+            detail = "; ".join(
+                f"{f.file}:{f.line} [{f.kind}]" for f in scan_findings[:8]
+            )
+            warnings.append(
+                f"⚠️ CONTENT-SAFETY: deliverable B has {len(scan_findings)} sensitive "
+                f"finding(s) — it carries verbatim intent/clarifications and is checked "
+                f"into a possibly-public repo. REVIEW before pushing (push is a separate "
+                f"user step — not auto-pushed): {detail}"
+            )
+    except Exception as e:
+        # Scanner unavailable / errored → fail-LOUD (never silently ship unscanned).
+        warnings.append(f"⚠️ CONTENT-SAFETY: scan of deliverable B could not run ({e}) — "
+                        f"manually review B for sensitive content before pushing")
+
+    return created, warnings
+
+
 def cmd_run_commit(args, reg: ArtifactRegistry) -> None:
     """Auto local-commit THIS run's files after PUSH-READY (A1, run_76932250).
 
@@ -3028,6 +3230,38 @@ def cmd_run_commit(args, reg: ArtifactRegistry) -> None:
         else:
             unresolved.append(f)
 
+    # ── §4.9 derivative B: check the review deliverable into the SAME commit ──
+    #    B lands in the real repo that holds the MOST of this run's files (§4.9
+    #    边界④: multi-root → the most-modified root; the other roots get nothing,
+    #    avoiding a duplicate B). The ledger A (workspace .artifacts/) is untouched.
+    #    Skip entirely when the only resolved root IS the daemon workspace (non-git
+    #    target or a workspace-only run → §4.9 边界②: deliver via A, no B) — writing
+    #    B there is the 404 this fixes.
+    _b_paths: list[str] = []
+    if by_repo:
+        try:
+            _ws_root = _rev_parse_toplevel(str(_get_workspace()))
+        except Exception:
+            _ws_root = None
+        # Most-modified root = the target repo for B.
+        _target_root = max(by_repo.items(), key=lambda kv: len(kv[1]))[0]
+        if _ws_root is not None and _target_root == _ws_root:
+            # §4.9 边界②: the code itself lives in the workspace (no real source
+            # repo) → no B (deliver via ledger A). Never write B into the 404 dir.
+            warnings_b = ["deliverable B skipped: target is the daemon workspace "
+                          "(§4.9 边界② — deliver via ledger A, no check-in)"]
+            _b_paths = []
+        else:
+            _b_paths, warnings_b = _generate_review_deliverable(
+                args.project, args.run_id, _target_root
+            )
+            if _b_paths:
+                # Append B's files to the target repo's staging list so the EXISTING
+                # pathspec `git add -- <path>` loop stages them — never `git add -A`.
+                by_repo[_target_root].extend(_b_paths)
+    else:
+        warnings_b = []
+
     requirement = run_state.get("requirement", "")[:72] or "pipeline changes"
     # Project identity trailer (AGENTS.md: EVERY commit must end with it). It has to
     # be appended HERE because there is NO other automatic enforcer for a commit this
@@ -3043,6 +3277,7 @@ def cmd_run_commit(args, reg: ArtifactRegistry) -> None:
     )
 
     committed, warnings = [], []
+    warnings.extend(warnings_b)  # §4.9 derivative-B generation notes (set above)
     if unresolved:
         warnings.append(f"{len(unresolved)} file(s) not in any git repo, skipped: {unresolved}")
 
@@ -5428,6 +5663,21 @@ def _load_artifact_for_metrics(project: str, artifact_id: str) -> dict | None:
     for entry in manifest.get("artifacts", []):
         if entry.get("id") == artifact_id:
             data_file = artifacts_dir / entry.get("file", "")
+            # TRUST BOUNDARY (run_44a06138): read-side twin of
+            # ArtifactRegistry._entry_to_artifact. The manifest `file` is
+            # caller-influenced; a tampered `../../../secret.json` must NOT be
+            # read. Both legit shapes (bare + runs/<id>/) resolve INSIDE
+            # .artifacts/; only a ..-escape fails. Surface loudly, drop to None.
+            try:
+                if not data_file.resolve().is_relative_to(artifacts_dir.resolve()):
+                    print(json.dumps({"security": (
+                        f"metrics load for artifact {artifact_id!r} in project "
+                        f"{project!r} has an out-of-bounds file path "
+                        f"{entry.get('file')!r} — refusing to read (manifest tampering?)."
+                    )}), file=sys.stderr)
+                    return None
+            except (OSError, ValueError):
+                return None  # un-resolvable path → fail closed
             if data_file.exists():
                 try:
                     return json.loads(data_file.read_text(encoding="utf-8"))
@@ -6064,6 +6314,7 @@ def main() -> None:
     p_run_create.add_argument("--project", required=True)
     p_run_create.add_argument("--requirement", required=True, help="Requirement text")
     p_run_create.add_argument("--profile", default=None, help="Pipeline profile: full/trivial/research/docs/bugfix")
+    p_run_create.add_argument("--depth", default=None, help="Depth axis (SRS §5.2): standard|light. Orthogonal to profile; tunes non-safety rigor only, NEVER hard gates. Omit → the profile's default depth.")
 
     # run-update
     p_run_update = sub.add_parser("run-update", help="Update a pipeline run")

@@ -138,6 +138,8 @@ export interface PipelineRunDetail {
   requirement: string;
   status: string;
   profile: string;
+  /** SRS design §5.2 depth axis (standard | light); null on a pre-depth run. */
+  depth: string | null;
   cycleTimeMin: number | null;
   reportMd: string;
   /** Workspace-relative REPORT.md path if present, else null. The detail drawer's
@@ -263,6 +265,7 @@ export const pipelinesService = {
         requirement: (data.requirement as string) ?? '',
         status: (data.status as string) ?? '',
         profile: (data.profile as string) ?? '',
+        depth: (data.depth as string | null) ?? null,
         cycleTimeMin: (data.cycle_time_min as number | null) ?? null,
         reportMd: (data.report_md as string) ?? '',
         reportPath: (data.report_path as string | null) ?? null,

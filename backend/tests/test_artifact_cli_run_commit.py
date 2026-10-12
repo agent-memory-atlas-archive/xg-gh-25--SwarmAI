@@ -658,3 +658,90 @@ class TestAutoCommitCarriesProjectTrailer:
             f"CI's own classifier rejects the message this code path produces: "
             f"{cct.classify(body)!r}\n{body}"
         )
+
+
+class TestReviewDeliverableCheckin:
+    """§4.9 Phase 3 块A: cmd_run_commit generates derivative B (the review
+    deliverable) into the real repo's .aidlc/deliverables/<run_id>/ and stages it
+    in the SAME commit as the code — so a reviewer sees code + context same-screen.
+    Dual-store: ledger A (workspace .artifacts/) is untouched (A→B one-way).
+    Covers DoD2 happy path (AC2). Boundaries (AC3) + content-safety (AC4) are
+    separate test classes.
+    """
+
+    def _git(self, repo, *a, env=None):
+        return subprocess.run(["git", "-C", str(repo), *a],
+                              capture_output=True, text=True, timeout=30, env=env)
+
+    def _repo_with_change(self, tmp_path, name):
+        repo = tmp_path / name
+        repo.mkdir()
+        self._git(repo, "init", "-q")
+        self._git(repo, "config", "user.email", "t@t.co")
+        self._git(repo, "config", "user.name", "t")
+        (repo / "f.py").write_text("v1\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-qm", "base")
+        (repo / "f.py").write_text("v2\n")
+        return repo
+
+    def test_deliverable_B_created_and_staged_in_same_commit(self, workspace, tmp_path, capsys):
+        repo = self._repo_with_change(tmp_path, "srcrepo")
+        run_id = "run_delivB"
+        # Ledger A: write a REPORT.md into the workspace run dir (what B copies).
+        run_file = _write_run(
+            workspace, run_id,
+            stages=[{"stage": "deliver", "status": "completed", "push_ready": True}],
+            files_touched=[str(repo / "f.py")],
+        )
+        run_dir = run_file.parent
+        (run_dir / "REPORT.md").write_text("# Report\n## Intent → Requirement 溯源\nFR-1 ...\n")
+
+        _run_commit(workspace, run_id)
+        capsys.readouterr()
+
+        # B exists in the REAL repo under .aidlc/deliverables/<run_id>/
+        bdir = repo / ".aidlc" / "deliverables" / run_id
+        assert (bdir / "REPORT.md").is_file(), "B REPORT.md must be checked into the real repo"
+        assert (bdir / "run-ref.txt").is_file(), "B run-ref.txt (back-pointer to A) must exist"
+        assert "## Intent → Requirement 溯源" in (bdir / "REPORT.md").read_text(), \
+            "B REPORT.md must carry A's §4.6 audit content (verbatim copy)"
+
+        # B is in the SAME commit as the code (HEAD commit touched BOTH f.py and B).
+        head_files = self._git(repo, "show", "--name-only", "--format=", "HEAD").stdout
+        assert "f.py" in head_files, "code file must be in the commit"
+        assert f".aidlc/deliverables/{run_id}/REPORT.md" in head_files, \
+            "B must be in the SAME commit as the code (§4.9 same-screen review)"
+
+        # Ledger A (workspace .artifacts/) is UNTOUCHED — A→B one-way, A durable.
+        assert (run_dir / "REPORT.md").is_file(), "ledger A REPORT.md must remain"
+        assert (run_dir / "REPORT.md").read_text().startswith("# Report"), "A untouched"
+
+    def test_workspace_only_run_skips_B_no_404(self, workspace, tmp_path, capsys):
+        """§4.9 边界②: if the only resolved root IS the daemon workspace (non-git /
+        workspace-resident code), B is NOT written into the workspace (that is the
+        404 bug). Deliver via ledger A instead."""
+        # Make the workspace itself a git repo so files_touched resolves to it,
+        # and point a touched file INTO the workspace (= the daemon workspace root).
+        self._git(workspace, "init", "-q")
+        self._git(workspace, "config", "user.email", "t@t.co")
+        self._git(workspace, "config", "user.name", "t")
+        wsfile = workspace / "ws_code.py"
+        wsfile.write_text("x=1\n")
+        self._git(workspace, "add", "-A")
+        self._git(workspace, "commit", "-qm", "base")
+        wsfile.write_text("x=2\n")
+
+        run_id = "run_wsonly"
+        run_file = _write_run(
+            workspace, run_id,
+            stages=[{"stage": "deliver", "status": "completed", "push_ready": True}],
+            files_touched=[str(wsfile)],
+        )
+        (run_file.parent / "REPORT.md").write_text("# Report\n")
+        _run_commit(workspace, run_id)
+        capsys.readouterr()
+
+        # No B dir created anywhere under the workspace .aidlc (would be the 404 dir).
+        assert not (workspace / ".aidlc" / "deliverables" / run_id).exists(), \
+            "B must NOT be written into the daemon workspace (§4.9 边界④ 404 defense)"

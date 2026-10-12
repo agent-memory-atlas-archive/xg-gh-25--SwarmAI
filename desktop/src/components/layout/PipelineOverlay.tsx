@@ -37,6 +37,7 @@ import {
   type PipelineRunDetail,
 } from '../../services/pipelines';
 import { fmtTs, WorkbenchToolbar, OverlayDrawer } from './overlayShell';
+import { ScopeDepthMatrix } from './ScopeDepthMatrix';
 
 export interface PipelineContentProps {
   /** Hand a prompt to a chat tab (land+activate a tab, THEN inject). Returns true
@@ -489,6 +490,20 @@ function RunDetailDrawer({
               <div className="text-[11px] font-mono text-[var(--color-text-faint)] mt-1">
                 {detail.project} · {detail.profile} · {fmtCycle(detail.cycleTimeMin)} · {fmtTs(detail.updatedAt || detail.createdAt)}
               </div>
+              {/* §5.3 scope×depth matrix — detail-on-demand (deference: not forced
+                  into view). Shows what THIS run's profile does vs the others; the
+                  active profile column is the one dominant element (Von Restorff). */}
+              <details className="mt-1.5 text-[11px]">
+                <summary className="cursor-pointer text-[var(--color-text-faint)] hover:text-[var(--color-text)] select-none">
+                  scope × depth
+                </summary>
+                <div className="mt-1.5">
+                  <ScopeDepthMatrix
+                    activeProfile={detail.profile}
+                    activeDepth={detail.depth ?? 'standard'}
+                  />
+                </div>
+              </details>
             </div>
 
             {/* The paused ⏸ banner is only meaningful while the run is genuinely paused.
