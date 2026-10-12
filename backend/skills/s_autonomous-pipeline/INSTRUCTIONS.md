@@ -1181,8 +1181,11 @@ Pipeline card instead (never lost, just a different surface).
 Rules: answerer-distinguished (`👤 user` vs `🧠 self-answered` MUST be visually distinct — the
 self-answered rows are what the user most needs to audit); load-bearing assumptions carry the
 `← 建议现在确认` flag; render from the artifact (no hand-copy — same source as the run-end REPORT
-§4.6.1, so the preview and the archive cannot drift). Skip entirely when EVALUATE produced no
-structured `requirements[]` (old-shape run) — the free-text landmark alone is sufficient.
+§4.6.1, so the preview and the archive cannot drift). Skip the inline-emit only when EVALUATE
+produced no structured `requirements[]` — i.e. a RELAXED-profile (trivial/docs/research) or a
+legacy old-shape run; the free-text landmark alone is then sufficient. ⚠️ On a STRICT profile
+(full/bugfix/goal) EVALUATE is required to emit the structured block (evaluate.md §Structured
+Requirements `[MUST]`), so "no requirements[]" is NOT a legitimate skip there — produce it.
 
 **Gate verdicts** — output with visual prominence when gates fire:
 ```

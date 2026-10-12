@@ -4969,3 +4969,76 @@ class TestClarificationsCrossBoundaryE2E:
         assert any("FR-1" in w and ("confirmed" in w or "status" in w)
                    for w in result["warnings"]), \
             f"clarification WARN did not thread through real validate(): {result['warnings']}"
+
+
+class TestProducerInstruction:
+    """Producer-wiring run: evaluate.md's §Structured Requirements must be a [MUST]
+    production instruction (not [GUIDE]) that names requirements[]+schema_version:1+
+    clarifications[] as required, so EVALUATE actually emits the structured block and
+    the glass-box downstream (REPORT audit / validator WARN / inline emit) lights up.
+    NON-VACUOUS (Gate-1): asserts the three fields are named as required production +
+    the schema_version pairing is explicit — not a bare '[MUST]' string match."""
+
+    def _section(self) -> str:
+        import pathlib
+        md = (pathlib.Path(__file__).resolve().parent.parent
+              / "skills" / "s_autonomous-pipeline" / "stages" / "evaluate.md").read_text()
+        # isolate the §Structured Requirements section (heading -> next ### heading).
+        # Guard (Gate-2 LOW): a renamed heading or a section-becomes-last edit must fail
+        # as a clean RED assertion, not an opaque ValueError in every test sharing this.
+        marker = "### Structured Requirements"
+        assert marker in md, f"§Structured Requirements heading missing from evaluate.md (renamed/removed?)"
+        start = md.index(marker)
+        nxt = md.find("\n### ", start + len(marker))
+        return md[start:] if nxt == -1 else md[start:nxt]
+
+    def test_section_is_must_not_guide(self):
+        sec = self._section()
+        heading = sec.splitlines()[0]
+        assert "[MUST]" in heading, f"§Structured Requirements must be [MUST]: {heading!r}"
+        assert "[GUIDE]" not in heading, f"§Structured Requirements must NOT be [GUIDE]: {heading!r}"
+
+    def test_names_three_fields_as_required_production(self):
+        """NON-VACUOUS: the section must name requirements[] + schema_version:1 +
+        clarifications[] as required production (a tag-only change would NOT pass this)."""
+        sec = self._section()
+        low = sec.lower()
+        assert "requirements[]" in low or "requirements[" in low, "must name requirements[]"
+        assert "schema_version" in low, "must name schema_version"
+        assert "clarifications" in low, "must name clarifications"
+        # MUST-strength production verb present (not optional 'produce it, don't fear a BLOCK').
+        # This catches the realistic regression: a [GUIDE]-era optional voice ('Produce it,
+        # don't fear a BLOCK') carries NONE of these MUST tokens, so a tag+voice reversion goes
+        # RED. We assert PRESENCE of required-production vocabulary — we deliberately do NOT try
+        # to prove, by string-matching, that the prose is semantically "unconditional": five
+        # adversarial rounds showed a prose-semantics assertion is an open-set arms race that a
+        # string test structurally cannot win AND that false-REDs legitimate skill-doc rewording
+        # (C044: a check that can't self-enforce its own intent is a net-negative — removed).
+        # The REAL enforcement of "EVALUATE actually produces the block" is agent-discipline
+        # ([MUST], per the design strangler) + this run's dogfood, NOT a doc-string regex.
+        assert any(k in low for k in ("must emit", "must produce", "必须产出", "必产", "mandatory", "required production")), \
+            "section must carry a MUST-strength production instruction, not optional voice"
+        # The exact operative directive phrase must be present (a tag+voice reversion to the
+        # old bare 'Produce a structured ...' drops the 'You MUST produce ... (strict profiles)'
+        # form → RED). Presence, not semantics — the honest ceiling of a doc-structure test.
+        assert "you must produce a structured `requirements[]` array** (strict profiles)" in low, \
+            "the operative 'You MUST produce ... (strict profiles)' directive must be present verbatim"
+
+    def test_schema_version_paired_with_requirements(self):
+        """Gate-1 dependency: schema_version:1 must be explicitly paired with
+        requirements[] IN PROSE (without version the validator WARN layer silently
+        no-ops). NON-VACUOUS fix (Gate-2 found the old form matched the pre-existing
+        JSON example 'schema_version: 1' and so passed on the un-upgraded [GUIDE] doc):
+        assert a PROSE pairing phrase, not the JSON snippet — the snippet survives a
+        prose-removal mutation, a prose phrase does not."""
+        sec = self._section()
+        low = sec.lower()
+        # Must carry an explicit PROSE pairing instruction (not the JSON example line).
+        # Any of these phrasings ties the array to the version in the instruction text.
+        pairing_phrases = ["non-optional pair", "emit both or neither", "emit both",
+                           "paired with `schema_version", "paired with schema_version",
+                           "alongside the array", "both or neither"]
+        assert any(p in low for p in pairing_phrases), \
+            ("§Structured Requirements must state the requirements[]+schema_version:1 "
+             "PAIRING in prose (not just the JSON example) — found none of: "
+             f"{pairing_phrases}")

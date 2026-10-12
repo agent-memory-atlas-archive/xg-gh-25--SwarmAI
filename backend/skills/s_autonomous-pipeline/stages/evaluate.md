@@ -757,13 +757,32 @@ required, never false-blocked. Distinct `Working-Backwards:` error tag (no overl
 with the Understanding / Ambiguity / REPRO gates). Fail-open on a missing/typo'd
 work_type — this is a framing-quality lens, not a safety gate.
 
-### Structured Requirements (`requirements[]`) + Real-time Visibility (Phase 2) `[GUIDE]`
+### Structured Requirements (`requirements[]`) + Real-time Visibility (Phase 2) `[MUST]`
 
-> Design §4.1/§4.4/§4.6.4. WARN-only (schema_version-gated) — produce it, don't fear a BLOCK.
+> Design §4.1/§4.4/§4.6.4. **A strict-profile EVALUATE (full/bugfix/goal) MUST emit a
+> structured `requirements[]` array AND `schema_version:1` AND `clarifications[]`** —
+> this is required production, not an optional nicety. (It is still WARN-only at the
+> validator layer — no publish-BLOCK — per the design's strangler-fig; "MUST" here is
+> agent-discipline, the same class as the M3 skeptic. Do NOT read "no BLOCK" as "skippable":
+> the three glass-box consumers below only light up when you actually emit the block.)
 > Autonomy-first: this is a RECORD of what you already decided, it adds NO default prompting.
+>
+> **⚠️ `requirements[]` and `schema_version:1` are a NON-OPTIONAL PAIR — emit BOTH or neither.**
+> The REPORT audit block renders on `requirements[]` presence alone (it does NOT check the
+> version), but `validate_requirements_block` SILENTLY returns `[]` (zero WARN) when
+> `schema_version` is absent or `< 1`. So a `requirements[]` without `schema_version:1` is a
+> FALSE-GREEN half-activation: the audit renders while every requirement WARN silently dies.
+> Always emit `schema_version:1` alongside the array.
+>
+> **Why this is MUST, not GUIDE (the point of the producer-wiring run):** the three downstream
+> consumers — the REPORT §4.6 audit block, the `validate_requirements_block` WARN layer, and
+> the §4.6.4 real-time inline emit — ALL read THIS artifact's `requirements[]`. A strict EVALUATE
+> that ships only free-text `acceptance_criteria` leaves the whole glass box dark (data never
+> flows), which is exactly the gap this instruction closes. Emit the structured block.
 
-**Produce a structured `requirements[]` array** in the evaluation artifact alongside the free-text
-`acceptance_criteria` (both coexist — strangler). Each requirement:
+**You MUST produce a structured `requirements[]` array** (strict profiles) in the evaluation
+artifact alongside the free-text `acceptance_criteria` (both coexist — strangler), paired with
+`schema_version:1`. Each requirement:
 
 ```json
 "schema_version": 1,
