@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "requirements": [
+    {
+      "id": "FR-1",
+      "statement": "B 生成门槛改为 run 有 sealed requirements(非 A 有 REPORT.md)",
+      "work_class": "task",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG:系统化方案非打补丁;删 cycle4 伪门槛"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "一个 push-ready run 有 evaluate requirements 但 A 无终版 REPORT(真实 DELIVER 时序)",
+          "when": "cmd_run_commit 调 _generate_review_deliverable",
+          "then": "B 被生成(created 非空)"
+        }
+      ]
+    },
+    {
+      "id": "FR-2",
+      "statement": "B 的审计内容从 requirements 机械渲染,不 copy A 的终版 REPORT",
+      "work_class": "task",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG 选方案A:解耦评审上下文与终版报告"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "run 有 requirements[]",
+          "when": "生成 B",
+          "then": "B 的 REQUIREMENTS.md 含 §4.6 溯源(原始意图+派生表+澄清+遗留),源是 render_audit_trail_md,与 REPORT 无耦合"
+        }
+      ]
+    },
+    {
+      "id": "FR-3",
+      "statement": "终版 REPORT 仍只落底账 A,双存储 A→B 单向不破",
+      "work_class": "enabler-story",
+      "source": {
+        "kind": "ddd-derived",
+        "ref": "正典 §4.9 双存储:A=全保真审计,B=就地评审上下文"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "修订后",
+          "when": "审查 B 内容",
+          "then": "B 不含 lessons/metrics;那些仅在 A 的终版 REPORT"
+        }
+      ]
+    },
+    {
+      "id": "FR-4",
+      "statement": "正典 §4.9/§4.6.1 措辞同步修订为新契约",
+      "work_class": "task",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG:同步修订正典;R7 doc-code 一致"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "代码改完",
+          "when": "读正典 §4.9 B 内容定义 + §4.6.1",
+          "then": "措辞描述'B=从 requirements 渲染的溯源快照',与代码一致,无悬空旧契约"
+        }
+      ]
+    }
+  ],
+  "clarifications": [
+    {
+      "qid": "Q1",
+      "question": "B 的产物名用 REQUIREMENTS.md 还是保留 REPORT.md?",
+      "options": [
+        "A. REQUIREMENTS.md(内容=需求溯源,名实相符)",
+        "B. 保留 REPORT.md 名(最小改动,但名实不符)",
+        "X. Other"
+      ],
+      "answer": "A. REQUIREMENTS.md",
+      "answered_by": "self",
+      "resolution": "self-answer:正典 §4.9 B 内容=§4.6 溯源(非终版 REPORT),REQUIREMENTS.md 名实相符;但 THINK 需评估 pipeline_pr.py 的 PR body 引用路径随之改"
+    },
+    {
+      "qid": "Q2",
+      "question": "根因是时序错配(我上一 run 的框定)还是内容契约错配?",
+      "options": [
+        "A. 内容契约错配:B 本不该依赖 REFLECT 产物",
+        "B. 时序错配:需改 pipeline 阶段顺序",
+        "X. Other"
+      ],
+      "answer": "A. 内容契约错配",
+      "answered_by": "self",
+      "resolution": "code-trace:B 的审计内容可从 requirements 机械渲染(render_audit_trail_md 已存在),DELIVER 时 requirements 已齐全;'等 REPORT' 是 cycle4 自引入的伪门槛,正典从无此约束。改时序(方案B/C/D)是在错误前提上缝补,已被 Gate-1 推翻"
+    }
+  ]
+}
