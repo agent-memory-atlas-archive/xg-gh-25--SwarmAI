@@ -307,36 +307,38 @@ class ArtifactRegistry:
         topic_slug = f"-{_slugify(topic)}" if topic else ""
 
         # Determine storage directory: runs/<run_id>/ or top-level.
-        # RUN-SCOPED names APPEND the artifact_id (run_fc95d24c / DoD0b): a
-        # pipeline publishes several artifacts of the SAME type on the SAME day
-        # into ONE run (e.g. a re-run stage, or two changesets), so a bare
-        # "{type}-{date}.json" collides — the 2nd write silently overwrote the
-        # 1st on disk while the manifest kept both ids, so id1 resolved to id2's
-        # data (build lost to deliver; think lost to plan — both hit in one
-        # session). The id makes run-scoped filenames unique. TOP-LEVEL names
-        # are LEFT UNCHANGED ("{type}-{date}[-topic].json"): the run-blind by-name
-        # date readers that once relied on this scheme were DELETED (#4 — they fed
-        # cross-run report contamination); the top-level name is kept only for
-        # non-run-scoped bare publishes. Run-scoped artifacts are ALWAYS read via
-        # the manifest entry['file'], never reconstructed by name.
+        # BOTH run-scoped and top-level names APPEND the artifact_id (run_fc95d24c
+        # fixed the run-scoped half; Action 3a / Kiro #8 fixes the top-level half):
+        # a second publish of the SAME type on the SAME day with the SAME topic
+        # produced an identical bare "{type}-{date}[-topic].json" — the 2nd write
+        # silently overwrote the 1st on disk while the manifest kept both ids, so
+        # id1 resolved to id2's data (build lost to deliver; think lost to plan).
+        # The id suffix removes the shared-name space in BOTH branches. The old
+        # "top-level names are unique per (type,date,topic)" assumption was FALSE —
+        # publish() mints a fresh id every call and unconditionally overwrites.
+        # The run-blind by-name date readers that once reconstructed this scheme
+        # were DELETED (#4 — they fed cross-run report contamination); artifacts are
+        # ALWAYS read via the manifest entry['file'], never reconstructed by name,
+        # so appending the id breaks no reader and needs no backfill of the existing
+        # bare files (their manifest entries already carry their original names).
         # The id is APPENDED (not prepended) so `startswith("{type}-")` filters
         # keep matching. bare_filename feeds BOTH the disk write (below) and the
         # manifest `filename` — computing it once keeps them consistent.
+        bare_filename = f"{artifact_type}-{date_str}{topic_slug}-{artifact_id}.json"
         if run_id:
-            bare_filename = f"{artifact_type}-{date_str}{topic_slug}-{artifact_id}.json"
             write_dir = artifacts_dir / "runs" / run_id
             write_dir.mkdir(parents=True, exist_ok=True)
             # file path in manifest is relative to .artifacts/
             filename = f"runs/{run_id}/{bare_filename}"
         else:
-            bare_filename = f"{artifact_type}-{date_str}{topic_slug}.json"
             write_dir = artifacts_dir
             filename = bare_filename
 
-        # Write artifact data file OUTSIDE the manifest lock: each run-scoped
-        # filename carries its artifact_id and top-level names are unique per
-        # (type, date, topic), so data-file writes don't collide; holding the
-        # manifest lock across a file write would be head-of-line blocking.
+        # Write artifact data file OUTSIDE the manifest lock: each filename (BOTH
+        # branches) carries its artifact_id, so data-file writes never collide;
+        # holding the manifest lock across a file write would be head-of-line
+        # blocking. (The old "top-level names are unique per (type,date,topic)"
+        # justification was FALSE — Kiro #8 — now superseded by the id suffix.)
         artifact_path = write_dir / bare_filename
         artifact_path.write_text(
             json.dumps(data, indent=2, default=str),

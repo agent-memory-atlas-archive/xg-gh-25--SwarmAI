@@ -750,11 +750,15 @@ class TestRunScopedFilenameCollision:
         assert a1.data["who"] == "BUILD", "id1 must resolve to BUILD (not overwritten)"
         assert a2.data["who"] == "DELIVER"
 
-    def test_top_level_filename_scheme_unchanged(self, workspace, registry):
-        """Top-level (no run_id) filenames must stay byte-identical to the old
-        scheme: `{type}-YYYYMMDD.json`, no artifact_id suffix. (The run-blind
-        by-name date readers that once consumed this scheme were deleted in #4;
-        the invariant is kept for non-run-scoped bare publishes.)"""
+    def test_top_level_filename_carries_artifact_id(self, workspace, registry):
+        """Action 3a (Kiro #8): top-level (no run_id) filenames now CARRY the
+        artifact_id — `{type}-YYYYMMDD-art_<hex>.json` — same as the run-scoped
+        scheme. The OLD no-id scheme (`{type}-YYYYMMDD.json`) let a second
+        same-day same-type publish overwrite the first on disk while the manifest
+        kept both ids (both resolving to the survivor). The id suffix removes the
+        shared-name space. (The run-blind by-name date readers that once relied on
+        the plain scheme were deleted in #4, so appending the id breaks nothing —
+        readers resolve via the manifest entry['file'], never by reconstruction.)"""
         project = "TopLevelApp"
         (workspace / "Projects" / project).mkdir()
 
@@ -764,7 +768,37 @@ class TestRunScopedFilenameCollision:
         research_files = [f.name for f in artifacts_dir.iterdir()
                           if f.name.startswith("research-")]
         assert len(research_files) == 1
-        # Exact old scheme: research-YYYYMMDD.json — NO artifact_id suffix.
+        # New scheme: research-YYYYMMDD-art_<8hex>.json — id suffix present.
         import re
-        assert re.fullmatch(r"research-\d{8}\.json", research_files[0]), \
-            f"top-level name must be unchanged, got {research_files[0]}"
+        assert re.fullmatch(r"research-\d{8}-art_[0-9a-f]{8}\.json", research_files[0]), \
+            f"top-level name must carry the artifact_id, got {research_files[0]}"
+
+    def test_bare_same_type_same_day_no_collision(self, workspace, registry):
+        """Action 3a (Kiro #8): two bare (no run_id) same-type same-day same-topic
+        publishes must NOT overwrite each other — the bare half of the collision
+        fixed run-scoped in run_fc95d24c (TestRunScopedFilenameCollision above).
+        Before the fix: `{type}-{date}{topic}.json` (no id) → 2nd write overwrote
+        1st on disk, both manifest ids resolved to the survivor (reproduced:
+        id1.data became SECOND).
+
+        Mutation: revert the `-{artifact_id}` append in publish()'s bare branch →
+        this test goes RED (1 file on disk, id1 resolves to id2's data)."""
+        project = "BareCollisionApp"
+        (workspace / "Projects" / project).mkdir()
+
+        id1 = registry.publish(project, "research", {"v": "FIRST"},
+                               producer="t", summary="first", topic="dup")  # bare
+        id2 = registry.publish(project, "research", {"v": "SECOND"},
+                               producer="t", summary="second", topic="dup")  # bare
+
+        assert id1 != id2
+        artifacts_dir = workspace / "Projects" / project / ".artifacts"
+        files = sorted(f.name for f in artifacts_dir.iterdir()
+                       if f.name.startswith("research-"))
+        assert len(files) == 2, f"two bare publishes must produce two files, got {files}"
+
+        a1 = registry.get_artifact(project, id1)
+        a2 = registry.get_artifact(project, id2)
+        assert a1 is not None and a2 is not None
+        assert a1.data["v"] == "FIRST", "id1 must resolve to FIRST (not overwritten)"
+        assert a2.data["v"] == "SECOND"

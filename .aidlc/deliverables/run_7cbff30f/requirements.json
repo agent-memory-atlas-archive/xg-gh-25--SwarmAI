@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "requirements": [
+    {
+      "id": "FR-1",
+      "statement": "Bare artifact filename carries the artifact_id so same-day same-type same-topic publishes don't overwrite",
+      "work_class": "bug",
+      "source": {
+        "kind": "user-stated",
+        "ref": "Kiro #8 — bare overwrite + id aliasing (reproduced)"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "two bare publishes of the same type/date/topic",
+          "when": "both land",
+          "then": "two distinct files on disk; the first id's data is preserved"
+        }
+      ]
+    }
+  ],
+  "clarifications": []
+}
