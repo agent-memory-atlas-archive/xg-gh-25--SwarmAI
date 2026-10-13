@@ -32,6 +32,19 @@ human intervention invisible, ALL biasing the same direction:
 This is SURFACED (the warning always prints — see main()), not hidden. The honest
 reading: a reported rate R means "autonomy is AT MOST R".
 
+ONE KNOWN DOWNWARD hole (opposite direction — the fix #4 caveat): runs committed
+BEFORE fix #4 recorded a FALSE 'codefix' intervention for the pipeline's OWN
+generated deliverable B (.aidlc/deliverables/<run_id>/{REPORT.md,requirements.json,
+run-ref.txt}) — B lands in the commit but is NOT agent-edited source, so the old
+inference mis-counted it as a human code-fix. These interventions are NOT
+retroactively rewritten, so pre-#4 runs carry a DEFLATING bias (their note reads
+only .aidlc/deliverables/<run_id>/ paths). Fix #4 excludes B going forward via
+_infer_codefix_from_commits(known_generated=...); new runs are correct, but the
+historical aggregate mixes these stale false-codefixes. The honest reading for a
+pre-#4 run with ONLY a B-path codefix note: its true autonomy is HIGHER than
+reported. (A one-time reviewed backfill stripping B-only codefix notes could
+retire this hole — deferred; it rewrites historical run.json, a separate task.)
+
 Usage:
     python backend/scripts/autonomous_rate.py                 # all projects
     python backend/scripts/autonomous_rate.py --project SwarmAI

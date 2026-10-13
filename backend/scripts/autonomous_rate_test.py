@@ -157,6 +157,49 @@ class TestInferCodefixFromCommits:
         assert ac._infer_codefix_from_commits(
             commits, files_touched, normalizer=fake_norm) == ["backend/human.py"]
 
+    # #4 fix — the pipeline's OWN generated deliverable B (.aidlc/deliverables/<run_id>/)
+    # lands in committed[].files but is NOT in files_touched (it is system-generated, not
+    # agent-edited source), so before this fix it was wrongly counted as a human codefix.
+    # `known_generated` excludes it: B is normalized by the SAME normalizer (abs -> repo-rel)
+    # and treated as known, so it never enters the codefix set. The exclusion is PRECISE —
+    # a genuine unreported human edit still surfaces (NOT fail-open).
+    @staticmethod
+    def _fake_norm(repo, files):
+        return {f[len(repo) + 1:] if f.startswith(repo + "/") else f for f in files}
+
+    def test_known_generated_excludes_deliverable_B(self):
+        # B (abs) committed as repo-rel; files_touched has only the real source.
+        commits = [{"repo": "/repo", "sha": "abc",
+                    "files": ["backend/foo.py", ".aidlc/deliverables/run_x/REPORT.md"]}]
+        files_touched = ["/repo/backend/foo.py"]
+        b_paths = ["/repo/.aidlc/deliverables/run_x/REPORT.md"]  # absolute, as _b_paths is
+        # Without known_generated the B file is a (false) codefix:
+        assert ac._infer_codefix_from_commits(
+            commits, files_touched, normalizer=self._fake_norm) == [".aidlc/deliverables/run_x/REPORT.md"]
+        # With known_generated=B, B is excluded -> no codefix:
+        assert ac._infer_codefix_from_commits(
+            commits, files_touched, normalizer=self._fake_norm, known_generated=b_paths) == []
+
+    def test_known_generated_does_not_mask_real_codefix(self):
+        # A genuine unreported human edit still surfaces even when B is excluded (not fail-open).
+        commits = [{"repo": "/repo", "sha": "abc",
+                    "files": ["backend/human.py", ".aidlc/deliverables/run_x/REPORT.md"]}]
+        files_touched = ["/repo/backend/foo.py"]  # neither human.py nor B recorded
+        b_paths = ["/repo/.aidlc/deliverables/run_x/REPORT.md"]
+        assert ac._infer_codefix_from_commits(
+            commits, files_touched, normalizer=self._fake_norm, known_generated=b_paths) == ["backend/human.py"]
+
+    def test_known_generated_none_is_unchanged(self):
+        # Default None -> identical to pre-fix behavior (no exclusion).
+        commits = [{"repo": "/repo", "sha": "abc", "files": ["backend/foo.py"]}]
+        files_touched = ["/repo/backend/foo.py"]
+        assert ac._infer_codefix_from_commits(
+            commits, files_touched, normalizer=self._fake_norm, known_generated=None) == []
+        # and a non-tracked file still flags with known_generated=None
+        commits2 = [{"repo": "/repo", "sha": "abc", "files": ["backend/human.py"]}]
+        assert ac._infer_codefix_from_commits(
+            commits2, files_touched, normalizer=self._fake_norm, known_generated=None) == ["backend/human.py"]
+
 
 # ───────────────────────── compute_autonomous_rate ──────────────────────────
 def _write_run(runs_root: Path, run_id: str, *, status: str, commits: int,

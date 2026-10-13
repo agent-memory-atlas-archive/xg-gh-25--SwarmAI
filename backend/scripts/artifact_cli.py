@@ -3041,8 +3041,13 @@ def _generate_review_deliverable(
     is the terminal report, the reviewer's full context; ledger A remains the audit root.)
 
     Returns ``(created_paths, warnings)``. ``created_paths`` are ABSOLUTE paths the
-    caller appends to ``files_touched`` so the EXISTING per-repo pathspec ``git add
-    -- <path>`` loop stages them — NEVER ``git add -A`` (Gate-1 guardrail). On any
+    caller STAGES by extending ``by_repo[target_root]`` so the EXISTING per-repo
+    pathspec ``git add -- <path>`` loop commits them — NEVER ``git add -A`` (Gate-1
+    guardrail). They are NOT written into ``files_touched`` (B is a system-generated
+    deliverable, not agent-edited source — ``files_touched`` is BUILD's self-report
+    of SOURCE edits, consumed by the completion gate / autonomy metric / surface).
+    Instead the caller passes ``created_paths`` as ``known_generated`` to the
+    codefix inference so B is excluded from the human-codefix verdict (#4). On any
     failure, returns ``([], [warning])`` — B is best-effort; a missing B never
     blocks the code commit (the ledger A is the durable truth).
 
@@ -3465,7 +3470,13 @@ def cmd_run_commit(args, reg: ArtifactRegistry) -> None:
             # is repo-relative — compare like-for-like or a false codefix fires
             # (Gate-2 F1). Same ls-files idiom used for tracked_rel above.
             codefix_files = _infer_codefix_from_commits(
-                committed, ft, normalizer=_git_repo_rel_normalizer
+                committed, ft, normalizer=_git_repo_rel_normalizer,
+                # #4: B (the pipeline's OWN DELIVER-time deliverable, staged into
+                # by_repo above) lands in the commit but is NOT agent-edited source,
+                # so it must NOT be counted as a human codefix. _b_paths is in scope
+                # from the B-generation block above; passing it excludes B precisely
+                # (a genuine unreported human edit still surfaces).
+                known_generated=_b_paths,
             )
             if codefix_files:
                 _append_intervention(
@@ -3968,7 +3979,7 @@ def _norm_repo_rel(files: "list[str]", repo_root: str) -> "set[str]":
 
 def _infer_codefix_from_commits(
     commits: "list[dict] | None", files_touched: "list[str] | None",
-    *, normalizer=None
+    *, normalizer=None, known_generated: "list[str] | None" = None
 ) -> "list[str]":
     """Return committed files that the run did NOT self-report in files_touched.
 
@@ -3989,12 +4000,22 @@ def _infer_codefix_from_commits(
     gap). ``normalizer=None`` (the default) treats files_touched as already
     comparable — keeps this a PURE function for unit tests with synthetic
     repo-relative paths. Pure core; the git fact is injected, not baked in.
+
+    ``known_generated`` (#4): absolute paths of SYSTEM-GENERATED deliverables (the
+    DELIVER-time derivative "B" under ``.aidlc/deliverables/<run_id>/``) that land
+    in the commit but are NOT agent-edited source — so they must NOT count as a
+    human codefix. They are normalized through the SAME per-repo ``normalizer`` as
+    files_touched (B is absolute, committed[].files is repo-relative) and treated
+    as tracked, so B never enters ``extra``. The exclusion is PRECISE (only the
+    exact B paths of THIS run) — a genuine unreported human edit still surfaces
+    (NOT fail-open). ``known_generated=None`` → no exclusion (default, unchanged).
     """
     if files_touched is None:
         return []  # cannot determine → honest lower-bound, no inference
     extra: list[str] = []
     seen: set[str] = set()
     cache: dict[str, set] = {}
+    gen_cache: dict[str, set] = {}
     for c in (commits or []):
         if not isinstance(c, dict):
             continue
@@ -4002,9 +4023,18 @@ def _infer_codefix_from_commits(
         if repo not in cache:
             cache[repo] = (normalizer(repo, files_touched) if normalizer
                            else set(files_touched))
+            # Normalize the known-generated set the SAME way, per repo — so a B
+            # absolute path resolves to the repo-relative form committed[].files
+            # uses. A B path foreign to this repo normalizes to nothing (harmless).
+            gen_cache[repo] = (
+                (normalizer(repo, known_generated) if normalizer
+                 else set(known_generated))
+                if known_generated else set()
+            )
         tracked = cache[repo]
+        generated = gen_cache[repo]
         for f in (c.get("files") or []):
-            if f not in tracked and f not in seen:
+            if f not in tracked and f not in generated and f not in seen:
                 extra.append(f)
                 seen.add(f)
     return extra

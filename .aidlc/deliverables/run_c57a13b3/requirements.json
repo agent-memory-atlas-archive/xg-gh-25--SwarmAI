@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "requirements": [
+    {
+      "id": "FR-1",
+      "statement": "pipeline 自生成的 B 派生物从 codefix 推断中排除(系统生成 ≠ 人工编辑)",
+      "work_class": "bug",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG 反馈 #4:3 个真实 run 各多一条 codefix 记录,run_44a06138 两次 run-commit 记 2 条,每个 pipeline run 自触发"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "一个只生成了 B 派生物、无人工改码的 run",
+          "when": "run-commit 跑 codefix 推断",
+          "then": "0 条 codefix intervention(B 被排除)"
+        }
+      ]
+    },
+    {
+      "id": "FR-2",
+      "statement": "排除只针对 B,真正未自报的人工编辑仍被识别(不削弱为 fail-open)",
+      "work_class": "task",
+      "source": {
+        "kind": "ddd-derived",
+        "ref": "MEMORY principle: gate 不能从防御退化为 fail-open;这里是加一个精确排除集,不是删推断"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "一个 committed、不在 files_touched、也不是 B 的文件",
+          "when": "codefix 推断",
+          "then": "仍被判为 codefix"
+        }
+      ]
+    }
+  ],
+  "clarifications": [
+    {
+      "qid": "Q1",
+      "question": "修法是把 B 从 codefix 推断中排除,还是把 B 写回 files_touched?",
+      "options": [
+        "A. 把 B 作为已知系统生成物排除集传给 _infer_codefix_from_commits",
+        "B. 把 B 的 _b_paths append 进 run.json 的 files_touched",
+        "X. Other"
+      ],
+      "answer": "A. 把 B 作为已知系统生成物排除集传给 _infer_codefix_from_commits",
+      "answered_by": "self",
+      "resolution": "B 是 pipeline 生成的交付物投影(_generate_review_deliverable 的 verbatim copy),不是 agent 编辑的源码。写进 files_touched 会误导下游(暗示 '这个 run 改了这 3 个文件',而它是 '生成' 非 '改')—— files_touched 的语义是 BUILD 自报改了哪些源码。排除集语义更准:B 既不是人工 codefix 也不是 agent 源码编辑,它是系统 deliverable,本就该在 codefix 推断之外。_b_paths 已在 cmd_run_commit 同一作用域可见(:3274 定义,:3467 使用),传入零额外成本。"
+    }
+  ]
+}
