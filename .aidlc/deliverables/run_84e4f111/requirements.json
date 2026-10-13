@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "requirements": [
+    {
+      "id": "FR-1",
+      "statement": "删除后端 scope-depth-axis 死码(pipeline_profiles 4 符号 + artifact_cli 3 处)",
+      "work_class": "task",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG: #5 depth 整个回退/下线,P9 该不该存在的答案是删"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "scope-depth 从未工作(无 production 消费方)",
+          "when": "删除 DEPTH_TIERS/DEPTH_DEFAULTS/normalize_depth/resolve_depth + --depth arg + run.json 写入",
+          "then": "grep 0 剩余消费方,import 不断"
+        }
+      ]
+    },
+    {
+      "id": "FR-2",
+      "statement": "删除前端 scope-depth-axis 死码(ScopeDepthMatrix 组件 + PipelineOverlay 引用 + pipelines.ts depth 字段)",
+      "work_class": "task",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG #5"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "后端永不发 depth 字段 → 前端永远 standard + sdm-* CSS 未定义",
+          "when": "删除组件 + import + render + 字段",
+          "then": "前端 build clean,无悬空 depth 读取"
+        }
+      ]
+    },
+    {
+      "id": "FR-3",
+      "statement": "不触碰所有无关 depth 用法(KEEP 清单)",
+      "work_class": "task",
+      "source": {
+        "kind": "ddd-derived",
+        "ref": "两个 code-trace agent 分离出 60+ 无关 depth 用法"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "'depth' 一词在 60+ 处有无关含义(树深/hop/schema 校验/thinking)",
+          "when": "只删 scope-depth-axis",
+          "then": "KEEP 清单的测试删后仍全绿"
+        }
+      ]
+    }
+  ],
+  "clarifications": [
+    {
+      "qid": "Q1",
+      "question": "补全还是删除死功能?",
+      "options": [
+        "A. 删除/下线",
+        "B. 补全让它工作",
+        "X. Other"
+      ],
+      "answer": "A. 删除/下线",
+      "answered_by": "user",
+      "resolution": "XG 明确:P9 先问该不该存在,从没工作过→删不复活"
+    },
+    {
+      "qid": "Q2",
+      "question": "_check_depth / _check_semantic_depth 是不是 scope-depth 的一部分要删?",
+      "options": [
+        "A. 是,删",
+        "B. 否,是 schema 校验器,KEEP",
+        "X. Other"
+      ],
+      "answer": "B. 否,是 schema 校验器,KEEP",
+      "answered_by": "self",
+      "resolution": "code-trace + DDD(IMPROVEMENT line 2231/959)确认 _check_depth 是 artifact 结构完整性校验,与 scope-depth-axis 无关"
+    }
+  ]
+}

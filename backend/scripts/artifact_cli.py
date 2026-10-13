@@ -55,7 +55,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.artifact_registry import ArtifactRegistry
-from core.pipeline_profiles import get_profile_stages, normalize_profile, resolve_depth
+from core.pipeline_profiles import get_profile_stages, normalize_profile
 
 # Sibling module in backend/scripts/ — pure completion commit+surface gate logic.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -1721,14 +1721,6 @@ def cmd_run_create(args, reg: ArtifactRegistry) -> None:
         # C3: store canonical profile if given; None stays None (profile is classified
         # after EVALUATE — "not yet set" is meaningful and must not become "full").
         "profile": normalize_profile(args.profile) if args.profile else None,
-        # SRS §5.2 depth axis — resolve_depth(profile, override): a valid --depth wins,
-        # else the profile's default (unknown profile → standard, never silently light).
-        # Stored at birth so the Pipeline-card matrix badge + any depth-aware rigor can
-        # read it; orthogonal to profile (never changes the stage list).
-        "depth": resolve_depth(
-            normalize_profile(args.profile) if args.profile else None,
-            getattr(args, "depth", None),
-        ),
         "status": "running",
         "stages": [],
         "taste_decisions": [],
@@ -6463,7 +6455,6 @@ def main() -> None:
     p_run_create.add_argument("--project", required=True)
     p_run_create.add_argument("--requirement", required=True, help="Requirement text")
     p_run_create.add_argument("--profile", default=None, help="Pipeline profile: full/trivial/research/docs/bugfix")
-    p_run_create.add_argument("--depth", default=None, help="Depth axis (SRS §5.2): standard|light. Orthogonal to profile; tunes non-safety rigor only, NEVER hard gates. Omit → the profile's default depth.")
 
     # run-update
     p_run_update = sub.add_parser("run-update", help="Update a pipeline run")

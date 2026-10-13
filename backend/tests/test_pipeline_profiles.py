@@ -142,3 +142,36 @@ class TestIsRelaxedProfile:
         assert is_relaxed_profile("xyz") is False
         assert is_relaxed_profile("Ful") is False
         assert is_relaxed_profile(None) is False
+
+
+class TestScopeDepthAxisRemoved:
+    """Anti-resurrection guard for the deleted scope-depth axis.
+
+    The scope-depth axis (light/standard run-rigor) was end-to-end dead code:
+    artifact_cli wrote a `depth` field to run.json but the PipelineRunDetail
+    response model never emitted it, so the frontend ScopeDepthMatrix always
+    fell back to 'standard'. It was deleted (not completed) per P9 — a feature
+    with zero live consumer should not be resurrected. These tests fail if the
+    4 symbols reappear in pipeline_profiles, and confirm the surviving profile
+    contract is untouched by the deletion.
+    """
+
+    def test_depth_symbols_are_gone(self):
+        """The 4 scope-depth symbols must not exist on the module."""
+        import core.pipeline_profiles as pp
+        assert not hasattr(pp, "DEPTH_TIERS")
+        assert not hasattr(pp, "DEPTH_DEFAULTS")
+        assert not hasattr(pp, "normalize_depth")
+        assert not hasattr(pp, "resolve_depth")
+
+    def test_surviving_profile_contract_intact(self):
+        """Deleting the depth axis must leave the profile contract whole."""
+        import core.pipeline_profiles as pp
+        assert hasattr(pp, "normalize_profile")
+        assert hasattr(pp, "get_profile_stages")
+        assert hasattr(pp, "is_relaxed_profile")
+        assert hasattr(pp, "PIPELINE_PROFILES")
+        # The surviving symbols still behave correctly.
+        assert is_relaxed_profile("trivial") is True
+        assert is_relaxed_profile("full") is False
+        assert len(get_profile_stages("full")) > 0
