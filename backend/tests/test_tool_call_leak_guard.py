@@ -28,7 +28,14 @@ import types
 
 import pytest
 
-from core.session_utils import detect_tool_call_leak, _is_retriable_error
+import json
+from pathlib import Path
+
+from core.session_utils import (
+    detect_tool_call_leak,
+    strip_tool_call_leak,
+    _is_retriable_error,
+)
 
 
 # ── 1. Pure detector — table-driven ────────────────────────────────────────
@@ -106,6 +113,120 @@ def test_detected_leak_is_retriable():
     """INV3: the RuntimeError message the guard raises is recognized as
     retriable, so send() routes it to the --resume retry path."""
     assert _is_retriable_error("Tool-call XML leaked into text channel (session_id=x)") is True
+
+
+# ── 1b. strip_tool_call_leak — the WRITE-side cleaner ───────────────────────
+#
+# Difference from the detector: it must remove the TRUNCATED residue a mid-stream
+# kill persists (<invoke name="Bash"> with NO following <parameter/</invoke>),
+# AND it must preserve legitimate fenced/inline references byte-for-byte
+# (per-MATCH, not per-line — the IMPROVEMENT.md 2026-08-31 false-negative class).
+
+# Raw leaks the cleaner MUST remove (incl. the truncated persisted shape).
+STRIP_LEAK_CASES = [
+    # Truncated persisted shape — the dominant data.db form (kill mid-stream)
+    'court\n<invoke name="Bash">',
+    'ToDo bar 都是红色、一致。\n\ncourt\n<invoke name="Bash">',
+    'court\n<invoke name="Edit">\n\ncourt替换:',
+    # Complete body — removed whole
+    'analysis\ncall\n<invoke name="Bash">\n<parameter name="command">ls</parameter>',
+    # Self-closing
+    'doing the thing\n<invoke name="Read"></invoke>',
+    # Leak at the very start
+    '<invoke name="Bash">\n<parameter name="command">cd /x</parameter>',
+]
+
+# Legitimate references the cleaner MUST preserve byte-for-byte (all in code spans).
+STRIP_PRESERVE_CASES = [
+    '看两张截图,我的回复每次都在 `<invoke name="Bash">` 那一刻停了',
+    'The harness emits `<invoke name="Bash">` as the tool-call format.',
+    'Example:\n```\ncall\n<invoke name="Bash">\n<parameter name="command">x</parameter>\n```\nguarded.',
+    '```\n<invoke name="Skill">\n<parameter name="skill">foo</parameter>\n</invoke>\n```',
+    'My reply stopped at `<invoke name="Bash">` — that was a leak.',
+    'just a normal assistant reply with no tool syntax at all',
+    '',
+]
+
+
+@pytest.mark.parametrize("text", STRIP_LEAK_CASES)
+def test_strip_removes_raw_leak(text):
+    """A raw leak fragment (incl. the truncated persisted shape) is removed, and
+    the result no longer contains a <invoke name= body outside code spans."""
+    cleaned = strip_tool_call_leak(text)
+    assert "<invoke name=" not in cleaned
+    assert cleaned != text  # something was actually stripped
+
+
+@pytest.mark.parametrize("text", STRIP_PRESERVE_CASES)
+def test_strip_preserves_legit_references(text):
+    """A fenced/inline reference to the syntax is preserved BYTE-FOR-BYTE — 0
+    false-strip (the RP42 orthogonal signal + per-MATCH, not per-line)."""
+    assert strip_tool_call_leak(text) == text
+
+
+def test_strip_per_match_not_per_line():
+    """The decisive per-MATCH case: a text block carrying BOTH a legitimate inline
+    reference AND a raw leak keeps the reference and strips ONLY the raw leak. A
+    per-line grep -v exclusion would drop the whole line and lose the reference
+    (IMPROVEMENT.md 2026-08-31 run_de417612)."""
+    text = 'As I said `<invoke name="Bash">` is the format.\n\ncourt\n<invoke name="Edit">\n\ncourt done'
+    cleaned = strip_tool_call_leak(text)
+    # legit inline reference preserved
+    assert '`<invoke name="Bash">`' in cleaned
+    # raw leak removed
+    assert '<invoke name="Edit">' not in cleaned
+
+
+def test_strip_is_idempotent():
+    """Cleaning already-clean text (or already-cleaned text) is a no-op."""
+    once = strip_tool_call_leak('court\n<invoke name="Bash">\n\ntext')
+    assert strip_tool_call_leak(once) == once
+
+
+def test_strip_against_real_corpus():
+    """Ground-truth double-direction: against the real data.db corpus, every
+    robust-RAW sample has its <invoke body removed, every robust-FENCED sample is
+    preserved byte-for-byte (0 false-strip, 0 miss). The corpus 'label' field is
+    NOT trusted — it is re-derived here with the robust predicate (restore \\n
+    escaping, mask code spans, then a residual bare <invoke => RAW)."""
+    corpus_path = Path(
+        "/Users/gawan/.swarm-ai/SwarmWS/Projects/SwarmAI/.artifacts/"
+        "leak-feedback-corpus/corpus.json"
+    )
+    if not corpus_path.exists():
+        pytest.skip("leak-feedback corpus not present (workspace-local artifact)")
+    rows = json.loads(corpus_path.read_text())
+
+    import re as _re
+    _fence = _re.compile(r"```.*?```", _re.DOTALL)
+    _inline = _re.compile(r"`[^`]*`")
+
+    def robust_is_raw(text: str) -> bool:
+        if not text or "<invoke" not in text:
+            return False
+        norm = text.replace("\\n", "\n").replace("\\t", "\t")
+        residual = _inline.sub("", _fence.sub("", norm))
+        return "<invoke" in residual
+
+    raw_total = raw_cleaned = fenced_total = fenced_preserved = 0
+    for row in rows:
+        text = row.get("text", "")
+        if "<invoke" not in text:
+            continue
+        if robust_is_raw(text):
+            raw_total += 1
+            if "<invoke name=" not in strip_tool_call_leak(text):
+                raw_cleaned += 1
+        else:
+            fenced_total += 1
+            if strip_tool_call_leak(text) == text:
+                fenced_preserved += 1
+
+    assert raw_total > 0, "corpus has no RAW samples — predicate or data drift"
+    assert raw_cleaned == raw_total, f"RAW not fully cleaned: {raw_cleaned}/{raw_total}"
+    assert fenced_preserved == fenced_total, (
+        f"FENCED false-stripped: {fenced_preserved}/{fenced_total} preserved"
+    )
 
 
 # ── 2. Orchestrator guard (integration) ─────────────────────────────────────
@@ -288,9 +409,11 @@ def test_orchestrator_passes_clean_text_block():
 
 
 def test_orchestrator_does_not_fire_when_real_tool_use_present():
-    """Third signal: if the message ALSO contains a real ToolUseBlock, a sibling
-    TextBlock containing <invoke> body text is the model TALKING about a tool
-    call, not leaking one — the guard must NOT fire."""
+    """Third signal: if the message ALSO contains a real ToolUseBlock, the turn
+    is legitimate (the model DID invoke a tool) — the guard must NOT kill. But
+    the leak-feedback fix (run_da39669c) additionally requires the raw <invoke>
+    text be STRIPPED from the persisted content, so it cannot re-seed the loop on
+    resume (the mixed-message gap, data.db session a0f04b00)."""
     from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock
 
     orch = _make_orchestrator()
@@ -307,6 +430,46 @@ def test_orchestrator_does_not_fire_when_real_tool_use_present():
 
     events, raised = asyncio.run(_drive(orch, [msg, _make_result_message()]))
 
-    # ... but because a REAL tool_use is present, the guard must not fire.
+    # ... because a REAL tool_use is present, the guard must NOT kill (killing
+    # would abort legitimate in-flight tool execution).
     assert orch._parent._kill_calls["n"] == 0
     assert raised is None
+    # ... AND the raw leak text must be stripped from every yielded assistant
+    # content block (the mixed-message persist gap this fix closes).
+    for ev in events:
+        if ev.get("type") == "assistant":
+            for block in ev.get("content", []):
+                assert "<invoke name=" not in block.get("text", "")
+
+
+def test_orchestrator_strips_leak_but_keeps_prose_in_mixed_message():
+    """The mixed-message strip is per-MATCH: legitimate text around the leak is
+    preserved while only the raw <invoke> body is removed — the turn's real
+    content survives, the leak does not."""
+    from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock
+
+    orch = _make_orchestrator()
+    orch._parent._streaming_start_time = 0.0
+    mixed = 'Rendering now.\n<invoke name="Edit">\n<parameter name="x">y</parameter>'
+    msg = AssistantMessage(
+        content=[
+            TextBlock(text=mixed),
+            ToolUseBlock(id="toolu_2", name="Edit", input={"x": "y"}),
+        ],
+        model="test-model",
+    )
+
+    events, raised = asyncio.run(_drive(orch, [msg, _make_result_message()]))
+
+    assert raised is None
+    assert orch._parent._kill_calls["n"] == 0
+    # The real prose survived; the leak body did not.
+    asst_texts = [
+        b.get("text", "")
+        for ev in events
+        if ev.get("type") == "assistant"
+        for b in ev.get("content", [])
+    ]
+    joined = "\n".join(asst_texts)
+    assert "Rendering now." in joined
+    assert "<invoke name=" not in joined

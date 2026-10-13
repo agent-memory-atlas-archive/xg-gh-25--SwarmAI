@@ -20,6 +20,7 @@ from core.context_injector import (
     _compute_layer_caps,
     _summarize_tool_blocks,
     _format_message,
+    _extract_text_from_content,
     _filter_tool_only_messages,
     _apply_token_budget,
     _assemble_context,
@@ -203,6 +204,47 @@ class TestSummarizeToolBlocks:
         result = _summarize_tool_blocks(content)
         assert len(result) == 1
         assert "Bash" in result[0]
+
+
+# ── Resume-context leak cleaning (feedback-loop cut) ─────────────────
+
+
+class TestResumeContextLeakCleaning:
+    """Both text-extraction functions that feed the resume system prompt
+    (_format_message, _extract_text_from_content) strip raw tool-call leaks so a
+    leak persisted in history is not re-injected into the next turn's prompt —
+    while preserving legitimate fenced/inline references byte-for-byte."""
+
+    def test_format_message_strips_raw_leak(self):
+        """A historical assistant message carrying a raw (truncated) leak has the
+        <invoke body removed before it enters the resume prompt."""
+        msg = {
+            "role": "assistant",
+            "content": [{"type": "text", "text": 'did the thing\n\ncourt\n<invoke name="Bash">'}],
+        }
+        result = _format_message(msg)
+        assert result is not None
+        assert "<invoke name=" not in result
+        assert "did the thing" in result  # legit prose preserved
+
+    def test_format_message_preserves_fenced_reference(self):
+        """A legitimate inline reference to the syntax survives byte-for-byte —
+        the meta-discussion case must NOT be washed out."""
+        text = 'the harness emits `<invoke name="Bash">` as the format'
+        msg = {"role": "assistant", "content": [{"type": "text", "text": text}]}
+        result = _format_message(msg)
+        assert result == f"Assistant: {text}"
+
+    def test_extract_text_strips_raw_leak(self):
+        content = [{"type": "text", "text": 'analysis\ncall\n<invoke name="Edit">\n<parameter name="x">y</parameter>'}]
+        result = _extract_text_from_content(content)
+        assert "<invoke name=" not in result
+        assert "analysis" in result
+
+    def test_extract_text_preserves_fenced_reference(self):
+        text = 'see `<invoke name="Read">` in the docs'
+        result = _extract_text_from_content([{"type": "text", "text": text}])
+        assert result == text
 
 
 # ── _format_message ────────────────────────────────────────────────

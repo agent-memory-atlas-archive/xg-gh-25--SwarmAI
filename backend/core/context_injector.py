@@ -25,6 +25,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from core import executors
+from core.session_utils import strip_tool_call_leak
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +132,10 @@ def _format_message(message: dict) -> str | None:
             if block_type == "text":
                 text = block.get("text", "")
                 if text:
-                    parts.append(text)
+                    # Clean raw tool-call leaks before this historical text is
+                    # spliced into the resume prompt (cuts the leak feedback
+                    # loop); fenced/inline references preserved byte-for-byte.
+                    parts.append(strip_tool_call_leak(text))
             elif block_type == "image":
                 parts.append("[image attachment]")
             elif block_type == "document":
@@ -185,7 +189,14 @@ def _apply_token_budget(
 # Each function is independently guarded.  Returns empty/default on error.
 
 def _extract_text_from_content(content: list | None) -> str:
-    """Pull concatenated text blocks from a message's content list."""
+    """Pull concatenated text blocks from a message's content list.
+
+    Each text block is passed through ``strip_tool_call_leak`` — this text is
+    spliced back into a resumed session's system prompt, and a raw tool-call
+    leak persisted in history (``<invoke ...>`` emitted as text) would otherwise
+    re-induce the model to leak again (the self-reinforcing loop). Legitimate
+    fenced/inline references are preserved byte-for-byte.
+    """
     if not isinstance(content, list):
         return ""
     parts = []
@@ -193,7 +204,7 @@ def _extract_text_from_content(content: list | None) -> str:
         if isinstance(block, dict) and block.get("type") == "text":
             t = block.get("text", "")
             if t:
-                parts.append(t)
+                parts.append(strip_tool_call_leak(t))
     return "\n".join(parts)
 
 

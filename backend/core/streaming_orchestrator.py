@@ -1056,42 +1056,77 @@ class StreamingOrchestrator:
                         # kill + raise a retriable error so send() respawns with
                         # --resume and the model re-attempts with a proper
                         # tool_use. detect_tool_call_leak strips code fences /
-                        # inline backticks (documentation), and we additionally
-                        # require NO real tool_use in this message — both guard
-                        # against false-firing on a turn that discusses the
-                        # syntax. NOTE: the same text may have already streamed
-                        # live via text_delta; the kill+resume + turn-end
-                        # reconcile replaces that transient on-screen partial.
-                        # DB persistence (the durable harm) happens only on the
-                        # yielded `assistant` event, which we skip here.
-                        from .session_utils import detect_tool_call_leak
+                        # inline backticks (documentation). NOTE: the same text
+                        # may have already streamed live via text_delta; the
+                        # kill+resume + turn-end reconcile replaces that transient
+                        # on-screen partial. DB persistence (the durable harm)
+                        # happens only on the yielded `assistant` event.
+                        #
+                        # TWO cases, split by whether this message has a REAL
+                        # tool_use (`_has_real_tool_use`), per the leak-feedback
+                        # fix (run_da39669c):
+                        #   • NO real tool_use + leak  → PURE-LEAK: the turn made
+                        #     no real call, the subprocess state is off the rails;
+                        #     drop the block, kill + raise retriable → --resume
+                        #     respawn. DISPOSITION UNCHANGED (XG-directed: a leak
+                        #     is not survivable in place).
+                        #   • real tool_use + leak text → MIXED: the model DID
+                        #     invoke a real tool, so the turn is legitimate and
+                        #     must NOT be killed (killing would abort in-flight
+                        #     tool execution). But the sibling leak text would
+                        #     still persist raw <invoke> to the DB and re-induce
+                        #     the loop on resume — so STRIP it per-block (keeping
+                        #     fenced/inline references) rather than persisting it.
+                        #     This closes the mixed-message gap where the old
+                        #     message-level `_has_real_tool_use` skip let the leak
+                        #     text through verbatim (data.db session a0f04b00).
+                        from .session_utils import (
+                            detect_tool_call_leak,
+                            strip_tool_call_leak,
+                        )
 
-                        if not _has_real_tool_use and detect_tool_call_leak(block.text):
-                            logger.warning(
-                                "session_unit.tool_call_leak_detected "
-                                "session_id=%s — model emitted tool-call XML as "
-                                "text (block_len=%d); dropping block + "
-                                "killing for --resume respawn",
-                                self._parent.session_id, len(block.text),
-                            )
-                            # Exception-safe: guarantee the retriable RuntimeError
-                            # is raised even if kill() throws — otherwise a kill()
-                            # error would propagate as a NON-retriable error and
-                            # bypass the intended --resume retry path.
-                            try:
-                                await self._parent.kill()
-                            except Exception as kill_exc:
+                        if detect_tool_call_leak(block.text):
+                            if not _has_real_tool_use:
                                 logger.warning(
-                                    "session_unit.tool_call_leak_kill_failed "
-                                    "session_id=%s: %s",
-                                    self._parent.session_id,
-                                    f"{type(kill_exc).__name__}: {kill_exc}",
+                                    "session_unit.tool_call_leak_detected "
+                                    "session_id=%s — model emitted tool-call XML "
+                                    "as text (block_len=%d); dropping block + "
+                                    "killing for --resume respawn",
+                                    self._parent.session_id, len(block.text),
                                 )
-                            raise RuntimeError(
-                                f"Tool-call XML leaked into text channel "
-                                f"(session_id={self._parent.session_id}) — "
-                                f"retrying with --resume for a proper tool_use"
+                                # Exception-safe: guarantee the retriable
+                                # RuntimeError is raised even if kill() throws —
+                                # otherwise a kill() error would propagate as a
+                                # NON-retriable error and bypass --resume retry.
+                                try:
+                                    await self._parent.kill()
+                                except Exception as kill_exc:
+                                    logger.warning(
+                                        "session_unit.tool_call_leak_kill_failed "
+                                        "session_id=%s: %s",
+                                        self._parent.session_id,
+                                        f"{type(kill_exc).__name__}: {kill_exc}",
+                                    )
+                                raise RuntimeError(
+                                    f"Tool-call XML leaked into text channel "
+                                    f"(session_id={self._parent.session_id}) — "
+                                    f"retrying with --resume for a proper tool_use"
+                                )
+                            # MIXED message: keep the turn (real tool_use ran),
+                            # but strip the raw leak text so it never persists.
+                            cleaned_text = strip_tool_call_leak(block.text)
+                            logger.warning(
+                                "session_unit.tool_call_leak_stripped_mixed "
+                                "session_id=%s — leak text in a message WITH a "
+                                "real tool_use; stripped from persistence "
+                                "(block_len=%d→%d), turn preserved",
+                                self._parent.session_id,
+                                len(block.text), len(cleaned_text),
                             )
+                            content_blocks.append(
+                                {"type": "text", "text": cleaned_text}
+                            )
+                            continue
                         content_blocks.append({"type": "text", "text": block.text})
                     elif isinstance(block, ThinkingBlock):
                         # Skip content-free thinking blocks. Bedrock CAN emit

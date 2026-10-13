@@ -462,6 +462,73 @@ _TOOL_CALL_LEAK_RE = re.compile(
     r'<invoke\s+name="[^"]+"\s*>\s*(?:<parameter\s+name=|</invoke>)',
 )
 
+# CLEAN anchor (used by strip_tool_call_leak, NOT by the DETECT path). It is
+# deliberately WIDER than _TOOL_CALL_LEAK_RE: a leak that is KILLED mid-stream
+# persists to data.db TRUNCATED — the model got as far as ``<invoke name="Bash">``
+# before the subprocess was SIGKILLed, so there is NO following ``<parameter`` /
+# ``</invoke>`` that _TOOL_CALL_LEAK_RE requires. (Measured on data.db session
+# a0f04b00: 8 persisted leaks, all of the bare ``court\n<invoke name="Bash">``
+# truncated shape — _TOOL_CALL_LEAK_RE returns False on every one.) The strip
+# step runs on ALREADY-PERSISTED history (resume-context assembly), so it must
+# catch the truncated residue, not only the complete live body. It greedily
+# consumes any complete ``<parameter>...</parameter>`` bodies + a trailing
+# ``</invoke>`` when they ARE present, so a complete leak is removed whole.
+_TOOL_CALL_LEAK_STRIP_RE = re.compile(
+    r'<invoke\s+name="[^"]*"\s*>'
+    r'(?:\s*<parameter\s+name="[^"]*"\s*>.*?</parameter>)*'
+    r'\s*(?:</invoke>)?',
+    re.DOTALL,
+)
+
+# Sentinel used to MASK fenced / inline-code spans while operating on the raw
+# text, then restore them verbatim. \x00 cannot appear in normal assistant text,
+# so collisions are impossible.
+_MASK_OPEN = "\x00"
+_MASK_CLOSE = "\x00"
+
+
+def _mask_doc_contexts(text: str) -> tuple[str, list[str]]:
+    """Replace fenced (```...```) and inline (`...`) code spans with opaque
+    sentinels, returning (masked_text, spans). The SINGLE SOURCE of the RP42
+    orthogonal signal ("documentation lives in code spans; a real leak is raw
+    unfenced text") — both ``detect_tool_call_leak`` and ``strip_tool_call_leak``
+    consume it, so the fence/inline-strip rule is defined in exactly one place.
+
+    The returned spans are restored by substituting ``\\x00<index>\\x00`` back to
+    ``spans[index]`` — so a legitimate in-code reference to ``<invoke ...>`` is
+    preserved byte-for-byte, while a RAW leak outside any code span is exposed to
+    the matcher.
+
+    ``\\x00`` is the masking sentinel, so any PRE-EXISTING ``\\x00`` in the input is
+    scrubbed FIRST — otherwise a literal ``\\x00<digit>\\x00`` byte sequence the model
+    emitted would be reassembled by ``_restore_doc_contexts`` into one of the masked
+    spans, silently duplicating/moving content into the resume prompt. ``\\x00`` (NUL)
+    has no legitimate meaning in assistant prose, so dropping it is harmless and makes
+    the round-trip collision structurally impossible. (NUL is absent in the
+    overwhelming case, so the replace is a cheap no-op.)
+    """
+    text = text.replace("\x00", "")
+    spans: list[str] = []
+
+    def _stash(m: "re.Match[str]") -> str:
+        spans.append(m.group(0))
+        return f"{_MASK_OPEN}{len(spans) - 1}{_MASK_CLOSE}"
+
+    masked = _TOOL_CALL_FENCE_RE.sub(_stash, text)
+    masked = _TOOL_CALL_INLINE_CODE_RE.sub(_stash, masked)
+    return masked, spans
+
+
+def _restore_doc_contexts(masked: str, spans: list[str]) -> str:
+    """Inverse of ``_mask_doc_contexts`` — restore every masked span verbatim."""
+    if not spans:
+        return masked
+    return re.sub(
+        r"\x00(\d+)\x00",
+        lambda m: spans[int(m.group(1))],
+        masked,
+    )
+
 
 def detect_tool_call_leak(text: str) -> bool:
     """Return True if ``text`` contains leaked tool-call XML in the text channel.
@@ -471,10 +538,12 @@ def detect_tool_call_leak(text: str) -> bool:
     text instead of a real tool_use block.
 
     False-positive-safe on documentation: fenced code blocks and inline-backtick
-    spans (where assistant prose shows the syntax) are stripped before matching,
-    so a turn that merely *explains* the leak shape is not flagged.  This matters
-    because this is a meta-heavy codebase whose own turns routinely discuss this
-    exact syntax — a false positive would wrongfully kill a legitimate turn.
+    spans (where assistant prose shows the syntax) are masked before matching
+    (via the shared ``_mask_doc_contexts`` — the single source of the fence/inline
+    rule), so a turn that merely *explains* the leak shape is not flagged. This
+    matters because this is a meta-heavy codebase whose own turns routinely
+    discuss this exact syntax — a false positive would wrongfully kill a
+    legitimate turn.
 
     Pure function (str -> bool) so it can be unit-tested in isolation.  Called
     from the StreamingOrchestrator TextBlock branch (the DB-persist gate), which
@@ -488,11 +557,58 @@ def detect_tool_call_leak(text: str) -> bool:
     """
     if not text or "<invoke" not in text:
         return False  # fast path — the overwhelming majority of blocks
-    # Strip documentation contexts so prose that SHOWS the syntax is ignored;
-    # a real leak is raw unfenced text.
-    stripped = _TOOL_CALL_FENCE_RE.sub("", text)
-    stripped = _TOOL_CALL_INLINE_CODE_RE.sub("", stripped)
-    return _TOOL_CALL_LEAK_RE.search(stripped) is not None
+    # Mask documentation contexts so prose that SHOWS the syntax is ignored;
+    # a real leak is raw unmasked text. (Masking, not deletion, keeps the shared
+    # helper usable by the strip path which must restore the spans.)
+    masked, _spans = _mask_doc_contexts(text)
+    return _TOOL_CALL_LEAK_RE.search(masked) is not None
+
+
+def strip_tool_call_leak(text: str) -> str:
+    """Return ``text`` with any RAW tool-call leak fragments removed, preserving
+    legitimate fenced/inline-code references byte-for-byte.
+
+    This is the WRITE-side companion to ``detect_tool_call_leak`` (which is a
+    read-only bool). It exists because leaked ``<invoke ...>`` text that reaches
+    data.db gets spliced back into a resumed session's system prompt verbatim
+    (``context_injector.build_resume_context``), re-inducing the model to leak
+    again — a self-reinforcing loop. Cleaning the fragment at the point it enters
+    the prompt cuts that loop.
+
+    Two differences from the detector, both deliberate:
+
+    1. **Wider anchor.** It uses ``_TOOL_CALL_LEAK_STRIP_RE``, which matches a
+       bare ``<invoke name="X">`` even when the body is TRUNCATED (no following
+       ``<parameter`` / ``</invoke>``) — the shape a mid-stream kill leaves in the
+       DB. The detector's narrower full-body regex would miss exactly the
+       persisted residue this function must clean.
+    2. **Per-MATCH, not per-line.** Fenced/inline spans are MASKED first, the leak
+       is removed from the raw remainder, then the spans are restored verbatim —
+       so a text block that contains BOTH a legitimate `` `<invoke ...>` `` inline
+       reference AND a raw leak keeps the reference and drops only the leak. A
+       line-granular ``grep -v``-style exclusion would drop the whole line and
+       lose the legitimate reference (the per-line false-negative class recorded
+       in IMPROVEMENT.md 2026-08-31).
+
+    Pure function (str -> str). Idempotent: cleaning already-clean text (or text
+    whose only ``<invoke>`` references are in code spans) returns it unchanged.
+
+    Args:
+        text: assistant text that may contain a raw leak fragment.
+
+    Returns:
+        The text with raw leak fragments replaced by a short placeholder; fenced /
+        inline-code references preserved verbatim.
+    """
+    if not text or "<invoke" not in text:
+        return text  # fast path — the overwhelming majority of blocks
+    masked, spans = _mask_doc_contexts(text)
+    cleaned, n = _TOOL_CALL_LEAK_STRIP_RE.subn("[tool-call omitted]", masked)
+    if n == 0:
+        # Nothing matched outside code spans — restore and return unchanged
+        # (preserves the original byte-for-byte, incl. the masked spans).
+        return _restore_doc_contexts(masked, spans)
+    return _restore_doc_contexts(cleaned, spans)
 
 
 def _build_error_event(
