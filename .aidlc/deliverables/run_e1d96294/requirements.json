@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "requirements": [
+    {
+      "id": "FR-1",
+      "statement": "think-stage artifact 类型校验接受 STAGE_ROUTING 声明的全部合法产出(research + alternatives),而非单一 research",
+      "work_class": "bug",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG 反馈 #3:22+ run 的 THINK 内容静默从 REPORT 消失"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "一个 THINK 发布为 type=alternatives 的 run",
+          "when": "run-report 加载 think 槽",
+          "then": "artifact 被接受加载,REPORT 含 Research Findings/Alternatives 块"
+        }
+      ]
+    },
+    {
+      "id": "FR-2",
+      "statement": "类型校验不被削弱为无校验 —— 仅扩到 think 的两个合法 produces,错类型 artifact 仍拒绝",
+      "work_class": "task",
+      "source": {
+        "kind": "ddd-derived",
+        "ref": "MEMORY principle: LLM judge/gate 不能从防御退化为 fail-open;这里是把单值校验扩成白名单,不是删校验"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "think 槽放了一个 evaluation-typed artifact",
+          "when": "run-report 加载",
+          "then": "仍被拒绝(unavailable)"
+        }
+      ]
+    }
+  ],
+  "clarifications": [
+    {
+      "qid": "Q1",
+      "question": "修法是扩 _STAGE_ARTIFACT_TYPE 的值为集合,还是改 think 发布为 type=research?",
+      "options": [
+        "A. 扩校验接受 {research, alternatives}(honor STAGE_ROUTING)",
+        "B. 改 THINK 发布为 type=research",
+        "X. Other"
+      ],
+      "answer": "A. 扩校验接受 {research, alternatives}(honor STAGE_ROUTING)",
+      "answered_by": "self",
+      "resolution": "STAGE_ROUTING['think'].optional_produces=['alternatives'] 已明确声明 alternatives 是 think 的合法产出,且 'alternatives' 是 publish 的有效 artifact type 而 'research' 也是;24+9 个历史 run 已用 alternatives,改发布类型会(a)不修复存量(b)和 STAGE_ROUTING 契约打架。扩校验是根因修复,honor 既有契约。"
+    }
+  ]
+}

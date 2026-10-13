@@ -5729,7 +5729,7 @@ class LoadResult:
 
 def _load_artifact_for_metrics(
     project: str, run_id: str | None, artifact_id: str | None,
-    expected_type: str | None = None,
+    expected_type: "str | set[str] | frozenset[str] | list[str] | tuple[str, ...] | None" = None,
 ) -> LoadResult:
     """Load artifact data by ID with the Action B read contract.
 
@@ -5740,7 +5740,11 @@ def _load_artifact_for_metrics(
         run_id (~2169 pre-date the write side) passes (rejecting it would lose
         real data). A mismatch → ``unavailable``.
       - artifact TYPE (Kiro #4) — when ``expected_type`` is given, ``entry.type``
-        must match; mismatch → ``unavailable``. ``expected_type=None`` skips it.
+        must be IN it: a scalar is one valid type, a set/collection is a closed
+        allowlist of valid types (think accepts research OR alternatives). A
+        scalar is normalized to a 1-element set, so single-type stages stay
+        exactly as strict; a type outside the set → ``unavailable`` (never
+        fail-open). ``expected_type=None`` skips the check entirely.
       - the existing path-containment TRUST BOUNDARY (run_44a06138) — a
         ``..``-escaping ``entry.file`` is refused loudly → ``unavailable``.
     Any missing/corrupt file or manifest → ``unavailable`` (never a silent 0).
@@ -5766,8 +5770,19 @@ def _load_artifact_for_metrics(
         if entry_run_id is not None and run_id is not None and entry_run_id != run_id:
             return LoadResult("unavailable")
         # TYPE (#4) — enforce only when caller declares an expected_type.
-        if expected_type is not None and entry.get("type") != expected_type:
-            return LoadResult("unavailable")
+        # MEMBERSHIP, not scalar equality: a stage may have >1 contract-blessed
+        # artifact type (think → research OR alternatives, per STAGE_ROUTING's
+        # produces + optional_produces). A scalar expected_type is normalized to a
+        # 1-element set, so single-type stages stay exactly as strict. Still a
+        # CLOSED allowlist — a type outside the set is rejected (never fail-open).
+        if expected_type is not None:
+            accepted = (
+                expected_type
+                if isinstance(expected_type, (set, frozenset, list, tuple))
+                else {expected_type}
+            )
+            if entry.get("type") not in accepted:
+                return LoadResult("unavailable")
         data_file = artifacts_dir / entry.get("file", "")
         # TRUST BOUNDARY (run_44a06138): read-side twin of
         # ArtifactRegistry._entry_to_artifact. The manifest `file` is
@@ -5793,13 +5808,17 @@ def _load_artifact_for_metrics(
     return LoadResult("unavailable")  # no entry with this id
 
 
-# Stage → expected artifact type (the read-contract #4 type check). Mirrors the
-# STAGE_ROUTING "Must Produce" column: evaluate→evaluation, think→research,
-# plan→design_doc, build→changeset, review→review, test→test_report,
-# deliver→delivery, goal_cycle→changeset (goal's build-equivalent).
+# Stage → expected artifact type(s) (the read-contract #4 type check). Mirrors the
+# STAGE_ROUTING produces(+optional_produces) contract: evaluate→evaluation,
+# think→{research, alternatives} (think's produces=research + optional_produces=
+# alternatives — BOTH are valid, so a set), plan→design_doc, build→changeset,
+# review→review, test→test_report, deliver→delivery, goal_cycle→changeset.
+# A scalar value = single valid type; a set = any member is valid (membership
+# test in _load_artifact_for_metrics). Keeping think scalar silently dropped
+# every type=alternatives THINK artifact from REPORT.md (#3).
 _STAGE_ARTIFACT_TYPE = {
     "evaluate": "evaluation",
-    "think": "research",
+    "think": {"research", "alternatives"},
     "plan": "design_doc",
     "build": "changeset",
     "goal_cycle": "changeset",

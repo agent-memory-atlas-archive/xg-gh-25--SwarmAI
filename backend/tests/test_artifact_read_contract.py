@@ -109,6 +109,58 @@ class TestTypeCheck:
         assert res.state == "available"
         assert res.data == {"v": 9}
 
+    # #3 fix — the type gate must accept a SET of valid types (membership), not
+    # just a scalar. THINK is published as either `research` OR `alternatives`
+    # (STAGE_ROUTING['think'] produces=research + optional_produces=alternatives),
+    # so _STAGE_ARTIFACT_TYPE['think'] = {"research","alternatives"}. Before this
+    # fix the scalar gate rejected the alternatives case → THINK content silently
+    # dropped from REPORT.md across 24+ runs.
+    def test_set_expected_accepts_alternatives_member(self, workspace, monkeypatch):
+        """A set expected_type accepts a member type (the actual #3 bug: think=alternatives)."""
+        import scripts.artifact_cli as cli
+        monkeypatch.setattr(cli, "_get_workspace", lambda: workspace)
+        _seed_artifact(workspace, "P", art_id="art_alt", art_type="alternatives",
+                       run_id="run_A", payload={"key_findings": ["kf1"], "alternatives": [{"constraint": "SIMPLICITY"}]})
+        res = cli._load_artifact_for_metrics("P", "run_A", "art_alt", {"research", "alternatives"})
+        assert res.state == "available"
+        assert res.data.get("key_findings") == ["kf1"]
+
+    def test_set_expected_accepts_research_member(self, workspace, monkeypatch):
+        """The other member of the set still loads (no regression for type=research think)."""
+        import scripts.artifact_cli as cli
+        monkeypatch.setattr(cli, "_get_workspace", lambda: workspace)
+        _seed_artifact(workspace, "P", art_id="art_res", art_type="research",
+                       run_id="run_A", payload={"v": 7})
+        res = cli._load_artifact_for_metrics("P", "run_A", "art_res", {"research", "alternatives"})
+        assert res.state == "available"
+
+    def test_set_expected_rejects_nonmember(self, workspace, monkeypatch):
+        """Still a CLOSED allowlist AND discriminates by MEMBERSHIP: with the SAME set
+        gate, a member loads but a non-member is rejected. Pinning both against one set
+        is what proves the gate does membership (not scalar `!=`, under which a str is
+        never == a set, so EVERY type — member or not — would 'reject' for the wrong
+        reason and this test would pass vacuously on the reverted code)."""
+        import scripts.artifact_cli as cli
+        monkeypatch.setattr(cli, "_get_workspace", lambda: workspace)
+        gate = {"research", "alternatives"}
+        _seed_artifact(workspace, "P", art_id="art_member", art_type="alternatives",
+                       run_id="run_A", payload={"v": 1})
+        _seed_artifact(workspace, "P", art_id="art_wrong", art_type="evaluation",
+                       run_id="run_A", payload={"v": 2})
+        # member → available, non-member → unavailable, SAME gate: only true membership
+        # (not scalar `!=`) can satisfy both halves simultaneously.
+        assert cli._load_artifact_for_metrics("P", "run_A", "art_member", gate).state == "available"
+        assert cli._load_artifact_for_metrics("P", "run_A", "art_wrong", gate).state == "unavailable"
+
+    def test_think_stage_type_is_a_set(self, monkeypatch):
+        """_STAGE_ARTIFACT_TYPE['think'] accepts both think produces (contract honored)."""
+        import scripts.artifact_cli as cli
+        think_types = cli._STAGE_ARTIFACT_TYPE["think"]
+        assert "research" in think_types and "alternatives" in think_types
+        # other stages stay single-type (scalar) — strictness unchanged
+        assert cli._STAGE_ARTIFACT_TYPE["evaluate"] == "evaluation"
+        assert cli._STAGE_ARTIFACT_TYPE["plan"] == "design_doc"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AC3 — three-state (available / unavailable / not_run)
