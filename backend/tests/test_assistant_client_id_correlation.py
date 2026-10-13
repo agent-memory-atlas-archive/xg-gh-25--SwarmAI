@@ -194,3 +194,129 @@ class TestContinuationClientIdStash:
     # send()'s new-turn reset batch — by test_stale_turn_client_id_cleared_at_send_entry
     # in test_session_unit_cleanliness.py. That drives the REAL send() (this file's
     # harness stubs unit.send, which would make a reset-in-send() assertion vacuous).
+
+
+class TestPersistSideLeakClean:
+    """Persist-side tool-call-leak clean (run_2bdec5c0).
+
+    _persist_assistant_blocks must clean raw tool-call leak from each text block
+    BEFORE db.messages.put, so data.db never stores raw ``<invoke>`` text that
+    the session_recall read path would splice back into a resumed prompt
+    (the re-induction loop the resume-side cleaner, run_da39669c, did not cover).
+
+    Verified by inspecting the content dict actually passed to db.messages.put.
+    """
+
+    @pytest.mark.asyncio
+    async def test_raw_leak_stripped_before_persist(self):
+        """AC1 — a0f04b00's truncated-leak shape is cleaned out of the persisted content."""
+        ctx, mock_db = _patch_db()
+        leak = 'court\n<invoke name="Bash">\n\ncourt先读当前 lead:'
+        with ctx:
+            ok = await SessionRouter._persist_assistant_blocks(
+                "sess-leak",
+                [{"type": "text", "text": leak}],
+                model="m",
+            )
+        assert ok is True
+        row = mock_db.messages.put.await_args.args[0]
+        persisted = row["content"][0]["text"]
+        assert "<invoke name=" not in persisted, (
+            f"raw leak reached data.db: {persisted!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fenced_reference_preserved_and_tool_use_untouched(self):
+        """AC2 — legit fenced ``<invoke>`` reference kept byte-for-byte; tool_use block untouched."""
+        ctx, mock_db = _patch_db()
+        fenced = '讨论语法:`<invoke name="X">` 应走 tool_use 通道。'
+        tool_use_block = {"type": "tool_use", "id": "tu_1", "name": "Bash",
+                          "input": {"command": "ls"}}
+        with ctx:
+            await SessionRouter._persist_assistant_blocks(
+                "sess-mixed",
+                [{"type": "text", "text": fenced}, tool_use_block],
+                model="m",
+            )
+        row = mock_db.messages.put.await_args.args[0]
+        blocks = row["content"]
+        assert blocks[0]["text"] == fenced, "fenced reference not byte-identical"
+        assert blocks[1] == tool_use_block, "tool_use block was modified"
+
+    @pytest.mark.asyncio
+    async def test_detect_decision_not_invoked_by_persist(self):
+        """AC4 — persist cleaning is DECOUPLED from the kill decision.
+
+        The persist path cleans content via strip_tool_call_leak but must NOT touch
+        detect_tool_call_leak (which governs whether streaming kills the turn — a
+        separate concern). This asserts BOTH halves observably so it is non-vacuous:
+          • strip_tool_call_leak IS called (the clean path was actually exercised)
+          • detect_tool_call_leak is NOT called (decoupling holds)
+        A mutation that swapped strip→detect, or deleted the clean entirely, goes RED
+        on the first assertion — the old `assert_not_called()`-only form was vacuous
+        (detect is never referenced in the function body, so it passed for ANY impl).
+        """
+        ctx, mock_db = _patch_db()
+        with patch(
+            "core.session_utils.strip_tool_call_leak",
+            side_effect=lambda t: t,  # passthrough — we assert it's CALLED, not its effect
+        ) as mock_strip, patch(
+            "core.session_utils.detect_tool_call_leak",
+        ) as mock_detect, ctx:
+            await SessionRouter._persist_assistant_blocks(
+                "sess-decouple",
+                [{"type": "text", "text": 'court\n<invoke name="Bash">'}],
+                model="m",
+            )
+        mock_strip.assert_called_once_with('court\n<invoke name="Bash">')
+        mock_detect.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_clean_exception_does_not_block_persist(self):
+        """AC5 — a cleaning exception degrades to persisting the ORIGINAL blocks, never loses content."""
+        ctx, mock_db = _patch_db()
+        original = [{"type": "text", "text": 'court\n<invoke name="Bash">'}]
+        with patch(
+            "core.session_utils.strip_tool_call_leak",
+            side_effect=RuntimeError("boom"),
+        ), ctx:
+            ok = await SessionRouter._persist_assistant_blocks(
+                "sess-degrade", original, model="m",
+            )
+        # persist MUST still succeed (crash-safe), content falls back to original
+        assert ok is True
+        mock_db.messages.put.assert_awaited_once()
+        row = mock_db.messages.put.await_args.args[0]
+        assert row["content"] == original, "exception path must persist original blocks, not drop content"
+
+    @pytest.mark.asyncio
+    async def test_cleaning_covers_all_three_call_sites(self):
+        """AC3 — the SINGLE persist chokepoint cleans leak regardless of which of the
+        3 call sites invoked it. The 3 sites (streaming main :3483, continue_with_answer
+        :3728, continue_with_permission :3758) all funnel the same `content` list through
+        `_persist_assistant_blocks`, differing ONLY in the client_id/label kwargs — never
+        in the cleaning (which lives in the function body). So cleaning must hold across
+        every call-site kwarg signature.
+
+        NON-VACUOUS: this asserts the persisted content (observable effect), not that the
+        source calls strip. Mutation proof — delete the in-body clean and all 3 go RED.
+        """
+        leak = 'court\n<invoke name="Bash">\n\ncourt先读:'
+        # Each tuple = (bare, "-asst", label=answer, label=permission) — the real kwarg
+        # shapes the 3 call sites pass (session_router.py :3483/:3728/:3758).
+        call_site_kwargs = [
+            {"client_id": "cid-asst"},                       # streaming main (:3483)
+            {"client_id": "cid-asst", "label": "answer"},    # continue_with_answer (:3728)
+            {"client_id": "cid-asst", "label": "permission"},# continue_with_permission (:3758)
+        ]
+        for kwargs in call_site_kwargs:
+            ctx, mock_db = _patch_db()
+            with ctx:
+                ok = await SessionRouter._persist_assistant_blocks(
+                    "sess-callsite", [{"type": "text", "text": leak}], model="m", **kwargs,
+                )
+            assert ok is True, f"persist failed for call-site kwargs {kwargs}"
+            persisted = mock_db.messages.put.await_args.args[0]["content"][0]["text"]
+            assert "<invoke name=" not in persisted, (
+                f"raw leak reached data.db via call-site kwargs {kwargs}: {persisted!r}"
+            )

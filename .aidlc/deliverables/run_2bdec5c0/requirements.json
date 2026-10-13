@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "requirements": [
+    {
+      "id": "FR-1",
+      "statement": "persist 写入点落库前清洗每个 assistant text block 的 raw tool-call leak",
+      "work_class": "bug",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG: 起 B 的 bugfix run — persist 端堵回灌源头"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "assistant content blocks 含 court\\n<invoke name=Bash> 裸 leak",
+          "when": "_persist_assistant_blocks 落库",
+          "then": "写入 data.db 的 content 不含 raw <invoke,合法 fenced 引用保留"
+        }
+      ]
+    },
+    {
+      "id": "FR-2",
+      "statement": "清洗与 kill 判据解耦,crash-safe persist 不被清洗异常阻断",
+      "work_class": "enabler-story",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG: 不碰 kill 判据;维持不 kill 行为"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "strip 抛异常 或 streaming kill 决策",
+          "when": "persist 执行",
+          "then": "detect 判据不变;清洗异常降级为原文落库+告警,不丢内容"
+        }
+      ]
+    }
+  ],
+  "clarifications": [
+    {
+      "qid": "Q1",
+      "question": "court/antml harness 前缀残骸要不要一并清?",
+      "options": [
+        "A. 全局清 court",
+        "B. 只在 leak 上下文锚定清",
+        "C. 不清,仅清 <invoke> body"
+      ],
+      "answer": "C. 不清,仅清 <invoke> body",
+      "answered_by": "self",
+      "resolution": "全库 347 条正常 assistant 消息含 court(英文词+同类残骸),全局清高误伤;persist 是 write-once 不可逆;research 实测 court 诱导性远弱于 <invoke>。本 run 只清承重的 <invoke> body(8/8 验证),court 低价值高风险不做。"
+    },
+    {
+      "qid": "Q2",
+      "question": "要不要同时清 session_recall 读端?",
+      "options": [
+        "A. 读写两端都清",
+        "B. 只清 persist 写端"
+      ],
+      "answer": "B. 只清 persist 写端",
+      "answered_by": "self",
+      "resolution": "P8 源头拦>每门兜底:写端清干净后 data.db 永不存 raw leak,recall/resume 所有读端读到的都是干净内容,无需每个读端重复加 strip。"
+    }
+  ]
+}

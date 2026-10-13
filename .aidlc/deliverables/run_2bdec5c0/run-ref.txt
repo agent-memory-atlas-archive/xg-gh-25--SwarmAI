@@ -1,0 +1,3 @@
+run_id: run_2bdec5c0
+project: SwarmAI
+ledger: .artifacts/runs/run_2bdec5c0/ (daemon workspace)
