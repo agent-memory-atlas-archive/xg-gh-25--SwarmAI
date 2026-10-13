@@ -330,3 +330,122 @@ class TestAdvanceValidationOwnership:
         captured = capsys.readouterr()
         assert "REPORT.md not found" in captured.err
         assert "artifacts_dir" not in captured.err, "NameError must not surface"
+
+
+class TestRunDirPathTraversal:
+    """#2 (run_dd8411f6): `_run_dir`/`_resolve_run_file` must reject a run_id
+    that could escape its project's runs/ dir. Before the fix, `_run_dir`
+    concatenated the caller-supplied run_id with zero validation, so a run_id
+    like '../../../OTHER/.artifacts/runs/run_x' escaped to another project —
+    every run-id-bearing command (update/checkpoint/resume/observe/report/commit)
+    inherited the hole via `_run_dir`."""
+
+    def _cli(self, tmp_path, monkeypatch):
+        import sys
+        from pathlib import Path as _P
+        _scripts_dir = str(_P(__file__).resolve().parent.parent / "scripts")
+        if _scripts_dir not in sys.path:
+            sys.path.insert(0, _scripts_dir)
+        import scripts.artifact_cli as cli
+        monkeypatch.setattr(cli, "_get_workspace", lambda: tmp_path)
+        return cli
+
+    def test_run_dir_rejects_traversal_run_id(self, tmp_path, monkeypatch):
+        """AC3: a run_id containing '../' must raise ValueError at _run_dir entry
+        (the choke point), never return an escaping path."""
+        cli = self._cli(tmp_path, monkeypatch)
+        (tmp_path / "Projects" / "P" / ".artifacts" / "runs").mkdir(parents=True)
+        with pytest.raises(ValueError):
+            cli._run_dir("P", "../../../etc/runs/run_evil")
+
+    def test_resolve_run_file_inherits_traversal_guard(self, tmp_path, monkeypatch):
+        """AC4: _resolve_run_file routes through _run_dir, so it inherits the
+        same guard — a traversal run_id must raise before any filesystem touch."""
+        cli = self._cli(tmp_path, monkeypatch)
+        (tmp_path / "Projects" / "P" / ".artifacts" / "runs").mkdir(parents=True)
+        with pytest.raises(ValueError):
+            cli._resolve_run_file("P", "../../OTHER/.artifacts/runs/run_x")
+
+    def test_run_dir_accepts_legit_run_id(self, tmp_path, monkeypatch):
+        """AC4 regression: a legitimate run_<hex> id is unaffected — _run_dir
+        returns the expected path under the project's runs/ dir."""
+        cli = self._cli(tmp_path, monkeypatch)
+        (tmp_path / "Projects" / "P" / ".artifacts" / "runs").mkdir(parents=True)
+        got = cli._run_dir("P", "run_abc12345")
+        expected = tmp_path / "Projects" / "P" / ".artifacts" / "runs" / "run_abc12345"
+        assert got == expected
+
+    def test_advance_rejects_traversal_run_id(self, tmp_path, monkeypatch):
+        """AC3 (Gate-1 amendment A): `advance`'s pre-validation builds the run
+        dir inline from --run-id; it must inherit the traversal guard (routes
+        through _run_dir). A traversal id raises ValueError, not read a file
+        outside the project."""
+        cli = self._cli(tmp_path, monkeypatch)
+        (tmp_path / "Projects" / "P" / ".artifacts" / "runs").mkdir(parents=True)
+        with pytest.raises(ValueError):
+            cli._auto_validate_before_advance("P", "review",
+                                              "../../OTHER/.artifacts/runs/run_x")
+
+    def test_main_translates_traversal_valueerror_to_clean_exit(self, tmp_path, monkeypatch, capsys):
+        """AC3 (Gate-1 amendment B): a traversal run_id reaching main() must exit
+        cleanly with the CLI's standard {"error":...} JSON + non-zero code (2),
+        NOT crash with an un-caught ValueError traceback. The traversal is blocked
+        either way; this makes the refusal legible rather than a stack trace."""
+        import sys
+        cli = self._cli(tmp_path, monkeypatch)
+        (tmp_path / "Projects" / "P" / ".artifacts" / "runs").mkdir(parents=True)
+        monkeypatch.setattr(sys, "argv", [
+            "artifact_cli.py", "run-get",
+            "--project", "P",
+            "--run-id", "../../../etc/runs/run_evil",
+        ])
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2, "traversal must exit 2, not crash with a traceback"
+        err = capsys.readouterr().err
+        parsed = json.loads(err.strip().splitlines()[-1])
+        assert "error" in parsed, f"stderr must be the standard JSON error, got: {err!r}"
+
+    def test_main_does_not_swallow_corrupt_json_as_identifier_reject(self, tmp_path, monkeypatch):
+        """AC (Gate-2 fix): the main() ValueError catch must NOT swallow a
+        json.JSONDecodeError (a ValueError subclass) from a corrupt --stage-json /
+        malformed run.json — that is a user/data error and must KEEP its original
+        propagating behavior, not be mislabeled as a path-identifier reject (exit 2).
+        Without the `except json.JSONDecodeError: raise` guard, a JSON typo would be
+        indistinguishable from a security refusal."""
+        import sys
+        cli = self._cli(tmp_path, monkeypatch)
+        _mk_run(tmp_path, "run_real", status="running",
+                stages=[{"stage": "build", "status": "completed", "artifact_id": "a"}])
+        monkeypatch.setattr(sys, "argv", [
+            "artifact_cli.py", "run-update",
+            "--project", "P",
+            "--run-id", "run_real",
+            "--stage-json", "{bad json not parseable",
+        ])
+        # Must raise JSONDecodeError (propagated), NOT SystemExit(2) with the
+        # identifier-error shape. A SystemExit(2) here would mean the corrupt JSON
+        # was mislabeled as a traversal refusal.
+        with pytest.raises(json.JSONDecodeError):
+            cli.main()
+
+    def test_analytics_batch_skips_bad_id_not_aborts(self, tmp_path, monkeypatch, capsys):
+        """AC (Gate-2 #2 follow-through): _run_dir now RAISES on a malformed on-disk
+        `id`. cmd_run_analytics loops over _load_completed_runs (which does NOT
+        validate the id field), so a single corrupt/legacy run.json must be SKIPPED,
+        not abort the whole batch. Pre-guard behavior degraded gracefully; preserve it."""
+        cli = self._cli(tmp_path, monkeypatch)
+        (tmp_path / "Projects" / "P" / ".artifacts" / "runs").mkdir(parents=True)
+        # One malformed-id run + one valid run. The valid run must still be aggregated.
+        bad = {"id": "../../../etc/evil", "project": "P", "stages": []}
+        good = {"id": "run_good1234", "project": "P", "stages": []}
+        monkeypatch.setattr(cli, "_load_completed_runs", lambda project, limit=10: [bad, good])
+
+        class _Args:
+            project = "P"
+            limit = 10
+        # Must NOT raise (the bad id is skipped, not fatal). It prints analytics JSON
+        # or a "No metrics extracted" message — either is a graceful completion.
+        cli.cmd_run_analytics(_Args(), reg=None)
+        out = capsys.readouterr().out
+        assert out.strip(), "analytics must produce output, not abort on one bad id"

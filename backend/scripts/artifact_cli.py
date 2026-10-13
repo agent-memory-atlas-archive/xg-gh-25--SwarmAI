@@ -851,10 +851,12 @@ def _auto_validate_before_advance(
     if not run_id:
         return
 
-    run_file = (
-        _get_workspace() / "Projects" / project / ".artifacts" / "runs"
-        / run_id / "run.json"
-    )
+    # run_dd8411f6 (#2, Gate-1 amendment A): route through _run_dir so a traversal
+    # run_id is rejected here too — `advance` builds this path inline from the
+    # --run-id CLI arg and previously bypassed the _run_dir choke point. A
+    # traversal id raises ValueError; a safe-but-unknown id passes validation and
+    # falls through to the existing `.exists()` no-op (so the typo no-op is kept).
+    run_file = _run_dir(project, run_id) / "run.json"
     if not run_file.exists():
         # Typo'd / unknown run-id → nothing to validate. Blocks YOUR advance loudly
         # only if you also can't advance the state machine; never touches another run.
@@ -906,9 +908,10 @@ def _auto_validate_before_advance(
         # run_f3975b8b: `artifacts_dir` was previously defined by the deleted
         # active-run scan. Now that we validate ONLY the explicitly-named run,
         # build the run dir from the named run_id directly.
-        run_dir = (
-            _get_workspace() / "Projects" / project / ".artifacts" / "runs" / run_id
-        )
+        # run_dd8411f6 (#2, Gate-1 amendment A): via _run_dir (traversal-guarded).
+        # Unreachable with a traversal id anyway — :854 above already validated —
+        # but routing here too keeps the single choke point, no inline path-build.
+        run_dir = _run_dir(project, run_id)
         if not (run_dir / "REPORT.md").exists():
             print(json.dumps({
                 "validation_blocked": True,
@@ -1042,7 +1045,20 @@ def _pipeline_runs_dir(project: str) -> Path:
 
 
 def _run_dir(project: str, run_id: str) -> Path:
-    """Get directory for a specific run: .artifacts/runs/<run_id>/."""
+    """Get directory for a specific run: .artifacts/runs/<run_id>/.
+
+    THE single choke point for building a run dir from a caller-supplied run_id —
+    `_resolve_run_file` routes through here, so validating here covers every
+    run-id-bearing command (update/checkpoint/resume/observe/report/commit).
+    run_dd8411f6 (#2): run_id is a CLI arg that upstream tooling may fill from
+    requirement/LLM text; an unvalidated segment like '../../OTHER/.artifacts/
+    runs/run_x' would let a subsequent write escape to another project. SSOT
+    (mirrors _ensure_project_dir): delegate containment to ArtifactRegistry.
+    _validate_path_identifiers — the ONE place that owns "is this caller-supplied
+    identifier safe to build a path from?" Raises ValueError on traversal.
+    """
+    from core.artifact_registry import ArtifactRegistry
+    ArtifactRegistry(_get_workspace())._validate_path_identifiers(project, run_id)
     return _pipeline_runs_dir(project) / run_id
 
 
@@ -3368,7 +3384,12 @@ def cmd_run_commit(args, reg: ArtifactRegistry) -> None:
             continue
 
         # Anything actually staged? (files may be unchanged)
-        staged = subprocess.run(["git", "-C", root, "diff", "--cached", "--name-only"],
+        # #1d (run_dd8411f6): pathspec-scope to THIS run's real_files. A bare
+        # `diff --cached` reports the WHOLE index — if a parallel session pre-
+        # staged a file, it would leak into `staged` and then into commits[].files
+        # (:committed below). Scoping to `-- *real_files` keeps `staged` run-scoped.
+        staged = subprocess.run(["git", "-C", root, "diff", "--cached", "--name-only",
+                                 "--", *real_files],
                                 capture_output=True, text=True, timeout=10).stdout.strip()
         if not staged:
             # FIX B (run_c526d393): nothing staged = this run's files were ALREADY
@@ -3403,7 +3424,12 @@ def cmd_run_commit(args, reg: ArtifactRegistry) -> None:
                 )
             continue
 
-        commit = subprocess.run(["git", "-C", root, "commit", "-m", commit_msg],
+        # #1d (run_dd8411f6): pathspec-scope the commit to THIS run's real_files.
+        # A bare `commit -m` commits the ENTIRE index — sweeping in any file a
+        # parallel session pre-staged (R29 violation). `-- *real_files` commits
+        # ONLY this run's paths; a pre-staged foreign file stays staged, uncommitted.
+        commit = subprocess.run(["git", "-C", root, "commit", "-m", commit_msg,
+                                 "--", *real_files],
                                 capture_output=True, text=True, timeout=15)
         if commit.returncode == 0:
             sha = subprocess.run(["git", "-C", root, "rev-parse", "--short", "HEAD"],
@@ -5202,7 +5228,9 @@ def _record_validation_event(
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
         run_file.write_text(json.dumps(run_state, indent=2), encoding="utf-8")
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, ValueError):
+        # ValueError added run_dd8411f6 (#2 follow-through): _run_dir now raises on a
+        # malformed run_id — must stay inside this "never crash pipeline" contract.
         pass  # Best-effort — never crash pipeline for metrics
 
 
@@ -5838,7 +5866,15 @@ def cmd_run_analytics(args, reg: ArtifactRegistry) -> None:
     all_metrics: list[dict] = []
     for run_state in runs:
         run_id = run_state["id"]
-        metrics_file = _run_dir(args.project, run_id) / "METRICS.json"
+        # run_dd8411f6 (#2 follow-through): _run_dir now RAISES on a malformed on-disk
+        # `id` (traversal-guard, run_dd8411f6). `_load_completed_runs` does NOT validate
+        # the `id` field, so a single corrupt/legacy run.json would abort the WHOLE
+        # analytics batch. Degrade gracefully — skip that run, keep aggregating the rest
+        # (pre-guard behavior was a harmless .exists()=False fall-through; preserve it).
+        try:
+            metrics_file = _run_dir(args.project, run_id) / "METRICS.json"
+        except ValueError:
+            continue
         if metrics_file.exists():
             try:
                 m = json.loads(metrics_file.read_text(encoding="utf-8"))
@@ -6625,7 +6661,28 @@ def main() -> None:
         "ddd-noise": cmd_ddd_noise,
         "release-gate": cmd_release_gate,
     }
-    handlers[args.command](args, reg)
+    try:
+        handlers[args.command](args, reg)
+    except json.JSONDecodeError:
+        # NARROW the catch below: JSONDecodeError subclasses ValueError. A corrupt
+        # user-supplied --stage-json / --taste-decision / a malformed run.json must
+        # KEEP its original uncaught-traceback behavior (it is a user/data error, not
+        # a blocked-identifier refusal), not be mislabeled as a path-identifier reject.
+        raise
+    except ValueError as e:
+        # run_dd8411f6 (#2, Gate-1 amendment B): a traversal run_id/project raises
+        # ValueError from _validate_path_identifiers (via _run_dir / _ensure_project_dir).
+        # main() has no other top-level catch, so without this a blocked-but-malicious
+        # identifier would crash with a Python traceback instead of the CLI's standard
+        # {"error": ...} JSON + clean non-zero exit. The traversal is still BLOCKED
+        # (no path escape) either way; this just makes the refusal legible, not a crash.
+        # NOTE: the `advance` command does NOT reach here — cmd_advance wraps
+        # _auto_validate_before_advance in its own `except Exception` and surfaces a
+        # traversal run_id as "Validator crashed" + exit 1 (still fail-closed/blocked,
+        # just a different exit code + message). Every OTHER run-id-bearing command
+        # (run-update/commit/checkpoint/resume/observe/report) reaches this handler.
+        print(json.dumps({"error": str(e)}), file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

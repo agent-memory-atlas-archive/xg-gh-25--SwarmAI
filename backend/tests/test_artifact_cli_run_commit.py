@@ -146,6 +146,48 @@ class TestRunCommitPathspecOnly:
         last = self._git(repo, "show", "--name-only", "--format=", "HEAD").stdout.strip()
         assert last == "mine.py", f"commit should contain only mine.py, got: {last!r}"
 
+    def test_commit_ignores_pre_staged_foreign_file(self, workspace, tmp_path, capsys):
+        """#1d (run_dd8411f6): the FOREIGN file is pre-STAGED into the index
+        (not just working-tree dirty). A bare `git commit -m` would sweep the
+        whole index → commit the parallel session's staged file + record it into
+        commits[].files. The fix pathspec-scopes BOTH the commit AND the
+        diff --cached to this run's real_files. The prior test left the sibling
+        UNSTAGED (which a bare commit skips anyway), so it never exercised this
+        bug — this one does."""
+        repo = tmp_path / "prestage_repo"
+        repo.mkdir()
+        self._git(repo, "init", "-q")
+        self._git(repo, "config", "user.email", "t@t.co")
+        self._git(repo, "config", "user.name", "t")
+        (repo / "mine.py").write_text("v1\n")
+        (repo / "parallel.py").write_text("v1\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-qm", "base")
+
+        # This run edits mine.py; a parallel session edits AND STAGES parallel.py.
+        (repo / "mine.py").write_text("v2 — my run\n")
+        (repo / "parallel.py").write_text("v2 — OTHER session, pre-staged\n")
+        self._git(repo, "add", "--", "parallel.py")  # ← pre-staged into the index
+
+        _write_run(workspace, "run_prestage",
+                   stages=[{"stage": "deliver", "status": "completed", "push_ready": True}],
+                   files_touched=[str(repo / "mine.py")])
+        _run_commit(workspace, "run_prestage")
+
+        result = json.loads(capsys.readouterr().out)
+        assert result["pushed"] is False
+        # The HEAD commit must contain ONLY mine.py — NOT the pre-staged parallel.py
+        last = self._git(repo, "show", "--name-only", "--format=", "HEAD").stdout.strip()
+        assert last == "mine.py", f"commit must contain only mine.py, got: {last!r}"
+        # parallel.py must remain STAGED (still in the index, uncommitted)
+        staged = self._git(repo, "diff", "--cached", "--name-only").stdout
+        assert "parallel.py" in staged, "parallel session's pre-staged file must stay staged, not committed"
+        # committed[].files must NOT record the foreign file
+        committed = result.get("committed", [])
+        all_files = [f for c in committed for f in c.get("files", [])]
+        assert "parallel.py" not in all_files, f"commits[].files leaked foreign file: {all_files}"
+        assert any("mine.py" in f for f in all_files), f"this run's file must be recorded: {all_files}"
+
     def test_warns_about_untracked_working_tree_changes(self, workspace, tmp_path, capsys):
         # A "forgotten record" must surface as a warning (parallel.py dirty but not
         # in files_touched) — and the run's own file must NOT be falsely warned.

@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "requirements": [
+    {
+      "id": "FR-1",
+      "statement": "cmd_run_commit 只提交本 run 的 files_touched,裸 git commit 改为带 pathspec",
+      "work_class": "bug",
+      "source": {
+        "kind": "user-stated",
+        "ref": "review #1d:别的 session 暂存的文件被裸 commit 扫走并记进 commits[].files"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "index 里有一个并行 session 预先 staged 的无关文件",
+          "when": "run-commit 跑",
+          "then": "该无关文件未被提交、仍 staged;committed[].files 只含本 run real_files"
+        }
+      ]
+    },
+    {
+      "id": "FR-2",
+      "statement": "_run_dir/_resolve_run_file 对 run_id 做路径穿越校验",
+      "work_class": "bug",
+      "source": {
+        "kind": "user-stated",
+        "ref": "review #2:run-update --run-id '../../../B/...' 返回0并改了项目B的run.json"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "run_id 含 '../' 穿越段",
+          "when": "任一 run 命令解析该 run_id",
+          "then": "ValueError/非0退出,不写目标外路径"
+        }
+      ]
+    }
+  ],
+  "clarifications": [
+    {
+      "qid": "Q1",
+      "question": "#1d 和 #2 是否同一 run?",
+      "options": [
+        "A. 同一(都在 artifact_cli.py,commit/path 安全同类)",
+        "B. 分开"
+      ],
+      "answer": "A. 同一",
+      "answered_by": "self",
+      "resolution": "XG 明确'两个都是小而根治的改',同文件同子系统,一个 bugfix run"
+    }
+  ]
+}
