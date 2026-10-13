@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "requirements": [
+    {
+      "id": "FR-1",
+      "statement": "_RESUME_QUERY_HEADER 去掉『background you already know』假自信措辞，显式声明压缩摘要+先查源",
+      "work_class": "bug",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG：『不是上下文丢了，是我没去取』是更严重的问题，怎么解决 —— 根因是 preamble 制造假自信"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "cold-resume 走 query 通道",
+          "when": "agent 读到 _RESUME_QUERY_HEADER",
+          "then": "不再被告知摘要=已知全部，而是被告知先查源"
+        }
+      ]
+    },
+    {
+      "id": "FR-2",
+      "statement": "三处 preamble（query header + checkpoint + legacy）统一加 re-fetch-from-source caveat",
+      "work_class": "bug",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG 直指的根因 + Gate-0 skeptic 发现第三处 _LEGACY_PREAMBLE 同缺"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "任意一条 resume 路径",
+          "when": "agent 要对早于本session的事下结论",
+          "then": "preamble 已指示先 recall/读源，不凭摘要"
+        }
+      ]
+    },
+    {
+      "id": "NFR-1",
+      "statement": "零行为/契约变更，纯措辞",
+      "work_class": "task",
+      "source": {
+        "kind": "ddd-derived",
+        "ref": "cross_boundary=false：preamble 是拼进 prompt 的字符串常量，无 seam"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "改完",
+          "when": "跑现有 resume 测试",
+          "then": "全绿，无回归"
+        }
+      ]
+    }
+  ],
+  "clarifications": [
+    {
+      "qid": "Q1",
+      "question": "改一处(_RESUME_QUERY_HEADER)还是全部三处?",
+      "options": [
+        "A. 只改 query header",
+        "B. 三处 preamble 全改",
+        "X. Other"
+      ],
+      "answer": "B. 三处 preamble 全改",
+      "answered_by": "self",
+      "resolution": "self-answer: R27 全消费方 —— grep 出 3 个 resume preamble 常量(_RESUME_QUERY_HEADER / _CHECKPOINT_PREAMBLE / _LEGACY_PREAMBLE)，同一认知缺陷在三条路径都存在，只改一处会在另两条路径复发"
+    }
+  ]
+}

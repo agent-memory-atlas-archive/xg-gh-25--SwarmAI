@@ -887,3 +887,26 @@ class TestHardClamp:
         out = _run_resume(session, model_context_window=128_000)
         assert "task 39" in out          # newest user directive present
         assert "turn0 " not in out       # oldest assistant turn dropped
+
+
+class TestCheckpointPreambleCompletenessCaveat:
+    """Regression: both resume preambles in context_injector must declare the
+    summary is COMPRESSED (not complete) and instruct re-fetching earlier-than-
+    session facts from source. C050/C051 family (3rd recurrence)."""
+
+    def test_checkpoint_preamble_has_completeness_caveat(self):
+        from core.context_injector import _CHECKPOINT_PREAMBLE
+        low = _CHECKPOINT_PREAMBLE.lower()
+        assert "compressed summary" in low, "checkpoint preamble must declare compressed"
+        assert "re-fetch" in low, "must instruct re-fetching from source"
+
+    def test_legacy_preamble_has_completeness_caveat(self):
+        from core.context_injector import _LEGACY_PREAMBLE
+        low = _LEGACY_PREAMBLE.lower()
+        assert "compressed summary" in low, "legacy preamble must declare compressed"
+        assert "re-fetch" in low, "must instruct re-fetching from source"
+
+    def test_checkpoint_preamble_keeps_anti_reexecution_rule(self):
+        from core.context_injector import _CHECKPOINT_PREAMBLE
+        # the existing anti-re-execution guard must be preserved
+        assert "Do NOT re-execute" in _CHECKPOINT_PREAMBLE

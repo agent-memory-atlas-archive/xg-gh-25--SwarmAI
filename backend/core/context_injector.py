@@ -45,6 +45,10 @@ _CHECKPOINT_PREAMBLE = (
     "- Do NOT re-execute any actions, tool calls, or code changes.\n"
     "- Use the checkpoint to understand what was happening.\n"
     "- Use the recent turns to understand conversational context.\n"
+    "- This checkpoint is a COMPRESSED summary, NOT complete context. For any "
+    "finding, number, list, or decision from EARLIER than this session, "
+    "re-fetch from source (workspace docs / transcript / recall) before "
+    "concluding — do NOT answer from this summary alone.\n"
     "- Wait for the user's NEW message and respond ONLY to that.\n"
     "- If the user says 'resume' or 'continue', pick up the task "
     "described in the checkpoint."
@@ -60,6 +64,10 @@ _LEGACY_PREAMBLE = (
     "- Do NOT re-answer, re-apologize, or re-explain anything from the history.\n"
     "- Do NOT re-execute any actions, tool calls, or code changes mentioned below.\n"
     "- Do NOT reference this history section unless the user explicitly asks about it.\n"
+    "- This history is a COMPRESSED summary, NOT complete context. For any "
+    "finding, number, list, or decision from EARLIER than this session, "
+    "re-fetch from source (workspace docs / transcript / recall) before "
+    "concluding — do NOT answer from this summary alone.\n"
     "- Wait for the user's NEW message (after this section) and respond ONLY to that."
 )
 

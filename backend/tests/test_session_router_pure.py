@@ -834,3 +834,32 @@ class TestQueryPrefixBlockBuilders:
         once = _compose_full_text(base, "PFX")
         twice = _compose_full_text(base, "PFX")  # from base, not from `once`
         assert once == twice, "always recomposed from base, never compounded"
+
+
+class TestResumePreambleCompletenessCaveat:
+    """Regression: resume preambles must frame the summary as a COMPRESSED
+    summary and tell the agent to re-fetch earlier-than-session facts from
+    source — never as 'complete context you already know'. Earned when a
+    resumed agent answered 'what was X defined as earlier' from the summary
+    instead of recall/docs (C050/C051 family, 3rd recurrence)."""
+
+    def test_resume_query_header_drops_false_confidence_phrase(self):
+        from core.session_router import _RESUME_QUERY_HEADER
+        assert "background you already know" not in _RESUME_QUERY_HEADER, (
+            "the false-confidence phrase must be gone — it frames the summary "
+            "as the agent's complete knowledge"
+        )
+
+    def test_resume_query_header_has_completeness_caveat(self):
+        from core.session_router import _RESUME_QUERY_HEADER
+        low = _RESUME_QUERY_HEADER.lower()
+        assert "compressed summary" in low, "must declare it is a compressed summary"
+        assert "re-fetch from source" in low or "re-fetch" in low, (
+            "must instruct re-fetching earlier facts from source"
+        )
+
+    def test_resume_query_header_keeps_provenance_and_marker(self):
+        from core.session_router import _RESUME_QUERY_HEADER, _RESUME_QUERY_FOOTER
+        # anti-confabulation framing + boundary marker must be preserved (AC3)
+        assert "NOT the current request" in _RESUME_QUERY_HEADER
+        assert "END RESUMED HISTORY" in _RESUME_QUERY_FOOTER
