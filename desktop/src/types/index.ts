@@ -479,6 +479,18 @@ export interface CompactionGuardEvent {
   patternDescription?: string;
 }
 
+/**
+ * One-shot "context was compacted" notice from the backend `context_compacted`
+ * SSE event (CLI-native autocompact — approach A). The backend is the sole
+ * judge (it owns the PreCompact flag); the frontend is a pure projection that
+ * renders `message` once. Distinct from CompactionGuardEvent, which is the
+ * amnesia-loop *detector* (a different trigger).
+ */
+export interface CompactionNotice {
+  message: string;
+  trigger: 'auto' | 'manual';
+}
+
 export interface StreamEvent {
   type: 'assistant' | 'tool_use' | 'tool_result' | 'result' | 'error' | 'reconnecting' | 'session_resuming' | 'ask_user_question' | 'session_start' | 'session_cleared' | 'cmd_permission_request' | 'cmd_permission_decision' | 'cmd_permission_acknowledged' | 'heartbeat' | 'agent_activity' | 'tool_invocation' | 'capability_activated' | 'sources_updated' | 'summary_updated' | 'context_warning' | 'context_compacted' | 'compaction_guard' | 'mcp_health_warning' | 'recovery_exhausted' | 'still_working' | (string & {});
   content?: ContentBlock[];

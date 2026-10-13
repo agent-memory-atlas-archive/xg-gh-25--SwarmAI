@@ -3857,4 +3857,152 @@ describe('TabStatusIndicator component', () => {
       }
     });
   });
+
+  // -------------------------------------------------------------------------
+  // context_compacted — CLI-native autocompact user-visible notice (approach A).
+  // The backend emits a `context_compacted` event (SessionUnit._emit_post_stream_
+  // metadata) carrying a fixed message after the SDK compacts the window. The
+  // frontend's existing :3615 branch cleared contextWarning; it must now ALSO
+  // surface the message as a one-shot compactionNotice (single backend-sourced
+  // judge → front-end pure projection, no second source of truth).
+  // -------------------------------------------------------------------------
+  describe('context_compacted compaction notice', () => {
+    it('sets compactionNotice from a context_compacted event message', () => {
+      const msgId = 'msg-compact';
+      const { result } = renderHook(() =>
+        useChatStreamingLifecycle(createMockDeps()),
+      );
+      act(() => {
+        initTestTab('tab-compact');
+        result.current.setIsStreaming(true);
+        result.current.setMessages([
+          makeMessage({ id: msgId, role: 'assistant', content: [] }),
+        ]);
+      });
+      const handler = result.current.createStreamHandler(msgId, 'tab-compact');
+      act(() => {
+        handler({
+          type: 'context_compacted',
+          sessionId: 'sess-compact',
+          trigger: 'auto',
+          message: 'Conversation above has been summarized\nThe conversation…',
+        });
+      });
+      expect(result.current.compactionNotice).not.toBeNull();
+      expect(result.current.compactionNotice?.message).toContain('summarized');
+      expect(result.current.compactionNotice?.trigger).toBe('auto');
+    });
+
+    it('still clears an existing contextWarning on context_compacted (post-compact pct resets)', () => {
+      const msgId = 'msg-compact2';
+      const { result } = renderHook(() =>
+        useChatStreamingLifecycle(createMockDeps()),
+      );
+      act(() => {
+        initTestTab('tab-compact2');
+        result.current.setIsStreaming(true);
+        result.current.setContextWarning({
+          level: 'critical',
+          pct: 95,
+          tokensEst: 950000,
+          message: 'Context 95% full',
+        });
+        result.current.setMessages([
+          makeMessage({ id: msgId, role: 'assistant', content: [] }),
+        ]);
+      });
+      const handler = result.current.createStreamHandler(msgId, 'tab-compact2');
+      act(() => {
+        handler({
+          type: 'context_compacted',
+          sessionId: 'sess-compact2',
+          trigger: 'auto',
+          message: 'summarized',
+        });
+      });
+      // Existing behavior preserved: the warning banner clears after compaction.
+      expect(result.current.contextWarning).toBeNull();
+      // New behavior: the notice is surfaced.
+      expect(result.current.compactionNotice).not.toBeNull();
+    });
+
+    it('persists the notice to the ORIGINATING tab slice for a BACKGROUND-tab compaction (not dropped)', () => {
+      // Gate-2 operational finding: a background-tab compaction must not be silently
+      // dropped. The notice is written to tabState.compactionNotice unconditionally so
+      // tab-switch restore can surface it; only the active tab mirrors to React state.
+      const msgId = 'msg-bg-compact';
+      const { result } = renderHook(() =>
+        useChatStreamingLifecycle(createMockDeps()),
+      );
+      act(() => {
+        initTestTab('tab-bg-A');
+        initTestTab('tab-bg-B'); // B becomes active (last init)
+        result.current.setMessages([
+          makeMessage({ id: msgId, role: 'assistant', content: [] }),
+        ]);
+      });
+      // Stream handler bound to the BACKGROUND tab A while B is active.
+      const handler = result.current.createStreamHandler(msgId, 'tab-bg-A');
+      act(() => {
+        handler({
+          type: 'context_compacted',
+          sessionId: 'sess-bg',
+          trigger: 'auto',
+          message: 'summarized',
+        });
+      });
+      // Active-tab React state is NOT set (A is a background tab)...
+      expect(result.current.compactionNotice).toBeNull();
+      // ...but the notice IS persisted to tab A's slice for later restore.
+      const tabA = testTabMap.get('tab-bg-A');
+      expect(tabA?.compactionNotice).not.toBeNull();
+      expect(tabA?.compactionNotice?.message).toContain('summarized');
+    });
+
+    it('does NOT seed the active tab slice (one-shot toast must not re-fire on switch-back)', () => {
+      // Meta-review cross-fix finding 6b: for the ACTIVE tab the toast fires via React
+      // state; seeding tabState.compactionNotice too would make a switch-away-and-back
+      // re-fire the same compaction (clearCompactionNotice clears only React state).
+      // So the active tab's slice must stay null — only the background path seeds it.
+      const msgId = 'msg-active-compact';
+      const { result } = renderHook(() =>
+        useChatStreamingLifecycle(createMockDeps()),
+      );
+      act(() => {
+        initTestTab('tab-active'); // this is the active tab
+        result.current.setMessages([
+          makeMessage({ id: msgId, role: 'assistant', content: [] }),
+        ]);
+      });
+      const handler = result.current.createStreamHandler(msgId, 'tab-active');
+      act(() => {
+        handler({
+          type: 'context_compacted',
+          sessionId: 'sess-active',
+          trigger: 'auto',
+          message: 'summarized',
+        });
+      });
+      // Active tab: React state set (toast fires now)...
+      expect(result.current.compactionNotice).not.toBeNull();
+      // ...but the per-tab slice is NOT seeded (no latent re-fire trigger on switch-back).
+      const tabActive = testTabMap.get('tab-active');
+      expect(tabActive?.compactionNotice ?? null).toBeNull();
+    });
+
+    it('clearCompactionNotice resets the one-shot notice', () => {
+      const { result } = renderHook(() =>
+        useChatStreamingLifecycle(createMockDeps()),
+      );
+      act(() => {
+        initTestTab('tab-compact3');
+        result.current.setCompactionNotice({ message: 'summarized', trigger: 'auto' });
+      });
+      expect(result.current.compactionNotice).not.toBeNull();
+      act(() => {
+        result.current.clearCompactionNotice();
+      });
+      expect(result.current.compactionNotice).toBeNull();
+    });
+  });
 });

@@ -769,6 +769,50 @@ class PromptBuilder:
         }
 
     # ------------------------------------------------------------------
+    # build_compact_notice
+    # ------------------------------------------------------------------
+
+    # The user-facing notice shown AFTER the SDK's CLI-native autocompact runs.
+    # This is a BACKEND CONSTANT (not agent-generated) so the message is stable
+    # and identical regardless of which turn/trigger fired the compaction.
+    COMPACT_NOTICE_TEXT = (
+        "Conversation above has been summarized\n"
+        "The conversation in this session reached the agent context limit. "
+        "Earlier messages have been summarized, and the summary is sent to the "
+        "agent as context instead of the full text."
+    )
+
+    @classmethod
+    def build_compact_notice(cls, trigger: Optional[str]) -> dict:
+        """Build a ``context_compacted`` SSE event for CLI-native autocompact.
+
+        Mirrors :meth:`build_context_warning` as the pure event-builder for the
+        compaction-visibility feature (approach A). The message is a fixed
+        backend constant (:attr:`COMPACT_NOTICE_TEXT`) — never agent-generated —
+        so the user sees a stable, honest "context was compacted" notice.
+
+        This does NOT trigger or perform any compaction. It only *describes* a
+        compaction the SDK already performed (observed via the PreCompact hook).
+        No ``_client_io`` lock, no proactive soft-compact (deleted run_2b1957f8).
+
+        Args:
+            trigger: the PreCompact ``trigger`` field (``"auto"`` | ``"manual"``).
+                Any unexpected/None value normalizes to ``"auto"`` (defensive —
+                an unknown trigger must never crash the result-tail emission).
+
+        Returns:
+            A dict ``{type, trigger, message}`` for the SSE stream. The frontend
+            ``context_compacted`` handler renders ``message`` as a one-shot
+            system notice.
+        """
+        norm_trigger = trigger if trigger in ("auto", "manual") else "auto"
+        return {
+            "type": "context_compacted",
+            "trigger": norm_trigger,
+            "message": cls.COMPACT_NOTICE_TEXT,
+        }
+
+    # ------------------------------------------------------------------
     # get_model_context_window
     # ------------------------------------------------------------------
 

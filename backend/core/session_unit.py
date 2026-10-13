@@ -3098,6 +3098,39 @@ class SessionUnit:
             except Exception:
                 pass  # Never block on guard failure
 
+        # Compaction visibility notice (CLI-native autocompact — approach A).
+        # The PreCompact hook (hook_builder._pre_compact_hook) sets an INDEPENDENT
+        # flag `_compact_notice_pending` on this same session_context dict when the
+        # SDK compacts the context window. We surface a user-visible
+        # `context_compacted` SSE event here (same result-tail path as
+        # context_warning above) carrying a fixed notice. The flag is INDEPENDENT
+        # of `_compacted` on purpose: post_compact_injection (runtime_hooks) owns
+        # `_compacted` with its own fire-once reset — reusing it would make the two
+        # consumers race for one flag and drop one signal. We clear ONLY our own
+        # flag; `_compacted` is left untouched for post_compact_injection. This is
+        # pure visibility: no compaction is triggered here, no `_client_io` lock is
+        # held (that was the deleted proactive soft-compact, run_2b1957f8).
+        try:
+            ctx = self._hook_session_context
+            if ctx and ctx.get("_compact_notice_pending"):
+                from .prompt_builder import PromptBuilder
+                notice_evt = PromptBuilder.build_compact_notice(
+                    ctx.get("_compact_trigger")
+                )
+                events.append(notice_evt)
+                # Fire-once: clear so the notice is not re-emitted next turn.
+                ctx["_compact_notice_pending"] = False
+                logger.info(
+                    "session_unit.compact_notice_emitted session_id=%s trigger=%s",
+                    self.session_id,
+                    notice_evt.get("trigger"),
+                )
+        except Exception as exc:
+            logger.warning(
+                "session_unit.compact_notice_failed session_id=%s: %s",
+                self.session_id, exc,
+            )
+
         # System prompt metadata for TSCC popover
         try:
             from . import session_registry

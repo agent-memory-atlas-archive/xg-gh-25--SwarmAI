@@ -24,7 +24,7 @@
  */
 
 import { useState, useRef, useMemo, useCallback, useEffect } from 'react';
-import type { Message, UnifiedAttachment, ContentBlock, SystemPromptMetadata, CompactionGuardEvent } from '../types/index';
+import type { Message, UnifiedAttachment, ContentBlock, SystemPromptMetadata, CompactionGuardEvent, CompactionNotice } from '../types/index';
 import type { PendingQuestion, OpenTab } from '../pages/chat/types';
 import type { ContextWarning } from './useChatStreamingLifecycle';
 import { INITIAL_STATE, type StreamingState } from './streaming-machine';
@@ -129,6 +129,10 @@ export interface UnifiedTab {
   contextWarning: ContextWarning | null;
   /** Per-tab compaction guard event from backend (null = no active guard event). */
   compactionGuard: CompactionGuardEvent | null;
+  /** Per-tab PENDING one-shot compaction notice (CLI-native autocompact). Set when
+   *  a background tab compacts; CONSUMED (shown as a toast then cleared) on tab-switch
+   *  restore so a background-tab compaction is not silently dropped. null = none pending. */
+  compactionNotice: CompactionNotice | null;
   /** Per-tab system prompt metadata delivered via SSE (null = not yet received). */
   promptMetadata: SystemPromptMetadata | null;
   /** Per-tab expanded/compact mode for ChatInput (runtime-only, NOT serialized). */
@@ -371,6 +375,7 @@ function createDefaultTab(agentId: string): UnifiedTab {
     status: 'idle',
     contextWarning: null,
     compactionGuard: null,
+    compactionNotice: null,
     promptMetadata: null,
     isReconnecting: false,
     isResuming: false,
@@ -403,6 +408,7 @@ function hydrateTab(s: PersistedTab): UnifiedTab {
     status: 'idle',
     contextWarning: null,
     compactionGuard: null,
+    compactionNotice: null,
     promptMetadata: null,
     isReconnecting: false,
     isResuming: false,
@@ -713,6 +719,7 @@ export function useUnifiedTabState(
         status: 'idle',
         contextWarning: null,
         compactionGuard: null,
+        compactionNotice: null,
         promptMetadata: null,
         attachments: [],
         streamState: { ...INITIAL_STATE },

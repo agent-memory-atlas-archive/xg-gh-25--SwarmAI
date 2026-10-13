@@ -489,7 +489,15 @@ async def build_hooks(
                 f"PreCompact hook fired — trigger={trigger}, "
                 f"session={session_context.get('sdk_session_id')}"
             )
+            # `_compacted` → consumed by post_compact_injection (agent-facing
+            # continuation context). `_compact_notice_pending` + `_compact_trigger`
+            # → consumed by SessionUnit._emit_post_stream_metadata to surface a
+            # user-visible `context_compacted` SSE notice. TWO INDEPENDENT flags
+            # on purpose: each consumer has its own fire-once reset, so sharing one
+            # flag would make them race and drop a signal.
             session_context["_compacted"] = True
+            session_context["_compact_notice_pending"] = True
+            session_context["_compact_trigger"] = trigger
             return {"decision": "approve"}
 
         registry.register("PreCompact", _pre_compact_hook, "pre_compact_flag")

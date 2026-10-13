@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "requirements": [
+    {
+      "id": "FR-1",
+      "statement": "PreCompact 触发时前端收到结构化 compact SSE 事件并显示进行中气泡",
+      "work_class": "user-story",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG:触发后告诉用户触发了 auto compact"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "一个会话上下文达到 CLI autocompact 阈值",
+          "when": "PreCompact hook 触发",
+          "then": "前端同轮收到 compact 事件并渲染进行中气泡"
+        }
+      ]
+    },
+    {
+      "id": "FR-2",
+      "statement": "compact 完成后前端展示指定固定文案",
+      "work_class": "user-story",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG:compact 完后 response 指定文案"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "compact 已完成",
+          "when": "下一轮响应",
+          "then": "前端展示用户指定的两行英文固定文案(后端注入常量)"
+        }
+      ]
+    },
+    {
+      "id": "FR-3",
+      "statement": "agent 自动续接任务不改(post_compact_injection 已有)",
+      "work_class": "task",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG:然后继续任务"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "compact 完成",
+          "when": "post_compact_injection 注入续接上下文",
+          "then": "agent 继续原任务,行为不变"
+        }
+      ]
+    },
+    {
+      "id": "NFR-1",
+      "statement": "不改 task_budget/阈值,不加回被删的主动 soft-compact,前端纯投影单一判官",
+      "work_class": "enabler-story",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG:纯可见化不碰阈值 + TECH.md:73 北极星 + run_2b1957f8 教训"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "方案 A",
+          "when": "实现",
+          "then": "task_budget 常量不变,无 _check_context_soft_compact 复活,前端不新增第二 compact 状态真相源"
+        }
+      ]
+    }
+  ],
+  "clarifications": [
+    {
+      "qid": "Q1",
+      "question": "compact 完成文案是 agent 生成还是后端注入常量?",
+      "options": [
+        "A. 后端注入常量(用户逐字指定)",
+        "B. agent 生成",
+        "X. Other"
+      ],
+      "answer": "A. 后端注入常量(用户逐字指定)",
+      "answered_by": "self",
+      "resolution": "用户在需求中逐字给出两行英文文案,明确是展示给用户的固定文案 → 后端注入常量,非 agent 生成。"
+    }
+  ]
+}

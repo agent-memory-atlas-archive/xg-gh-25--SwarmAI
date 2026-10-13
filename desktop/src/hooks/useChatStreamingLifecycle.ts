@@ -46,6 +46,7 @@ import type {
   StreamEvent,
   SystemPromptMetadata,
   CompactionGuardEvent,
+  CompactionNotice,
 } from '../types';
 import type { PendingQuestion } from '../pages/chat/types';
 import { queuedMessageFromRetryPayload, retryPayloadHasAttachments, shouldResurfaceQuestion, computeDrainRetirement, shouldArmSpinnerFromBackend, forceClearStreamVerdict, healGraceExpiryVerdict, desyncConvergeVerdict, nextReconcileDelay, type HealGraceVerdict } from './streaming-guards';
@@ -959,6 +960,14 @@ export interface ChatStreamingLifecycle {
   /** Set the compaction guard display mirror (used by tab switch restore). */
   setCompactionGuard: React.Dispatch<React.SetStateAction<CompactionGuardEvent | null>>;
 
+  // Compaction notice (delivered via SSE context_compacted event — CLI-native autocompact)
+  /** Non-null when the backend emits a context_compacted SSE event (one-shot "context was summarized" notice). */
+  compactionNotice: CompactionNotice | null;
+  /** Set the compaction notice (used by the stream handler + tests). */
+  setCompactionNotice: React.Dispatch<React.SetStateAction<CompactionNotice | null>>;
+  /** Dismiss the one-shot compaction notice (after the toast is shown). */
+  clearCompactionNotice: () => void;
+
   // Hang detection — true when streaming but no real (non-heartbeat) SDK events for >60s
   /** True when the active stream has received only heartbeats for >60s. */
   isLikelyStalled: boolean;
@@ -1721,6 +1730,12 @@ export function useChatStreamingLifecycle(
 
   // --- Compaction guard (delivered via SSE compaction_guard event) ---
   const [compactionGuard, setCompactionGuard] = useState<CompactionGuardEvent | null>(null);
+
+  // --- Compaction notice (delivered via SSE context_compacted event — CLI-native autocompact) ---
+  const [compactionNotice, setCompactionNotice] = useState<CompactionNotice | null>(null);
+  const clearCompactionNotice = useCallback(() => {
+    setCompactionNotice(null);
+  }, []);
 
   const clearContextWarning = useCallback(() => {
     const tabId = activeTabIdRef.current;
@@ -3611,7 +3626,11 @@ export function useChatStreamingLifecycle(
           // will handle transition. This event is purely informational.
         }
         // Context compacted — backend emits when the SDK compacts the context window
-        // (either auto or manual trigger). Clear the originating tab's warning.
+        // (either auto or manual trigger). Two effects:
+        //   1. Clear the originating tab's stale context_warning (pct resets post-compact).
+        //   2. Surface a one-shot user-visible notice (CLI-native autocompact — approach A).
+        //      The backend is the SOLE judge (it owns the PreCompact flag); this is a pure
+        //      projection of event.message — no second source of truth, no front-end inference.
         else if (event.type === 'context_compacted') {
           const tabState = capturedTabId
             ? tabMapRef.current.get(capturedTabId)
@@ -3619,8 +3638,28 @@ export function useChatStreamingLifecycle(
           if (tabState) {
             tabState.contextWarning = null;
           }
+          const notice: CompactionNotice | null = event.message
+            ? {
+                message: event.message,
+                trigger: event.trigger === 'manual' ? 'manual' : 'auto',
+              }
+            : null;
           if (capturedTabId === null || capturedTabId === activeTabIdRef.current) {
+            // ACTIVE tab: fire the one-shot toast NOW via React state. Do NOT also
+            // seed tabState.compactionNotice — unlike the stateful context_warning
+            // BANNER (correct to re-show on switch-back), this is a ONE-SHOT toast;
+            // seeding the per-tab slice here would make a switch-away-and-back re-fire
+            // the SAME compaction's toast (clearCompactionNotice clears only React
+            // state, not the slice). So the per-tab persist is BACKGROUND-ONLY below.
             setContextWarning(null);
+            if (notice) {
+              setCompactionNotice(notice);
+            }
+          } else if (tabState && notice) {
+            // BACKGROUND tab: persist to the originating tab's slice so the notice is
+            // not silently dropped — ChatPage's tab-switch restore consumes+clears it
+            // (one-shot toast on switch-back). Only the background path seeds the slice.
+            tabState.compactionNotice = notice;
           }
         }
         // Context window warning — backend emits context usage at all levels
@@ -4577,6 +4616,9 @@ export function useChatStreamingLifecycle(
     setPromptMetadata,
     compactionGuard,
     setCompactionGuard,
+    compactionNotice,
+    setCompactionNotice,
+    clearCompactionNotice,
     isLikelyStalled,
     isWaitingForBusy,
     cancelBusyWait,
