@@ -698,14 +698,44 @@ const InlineCode = memo(function InlineCode({ children }: { children: React.Reac
  * Resolves an image src to a backend API URL so local workspace images render
  * in the markdown preview. Handles relative paths (images/foo.png) resolved
  * against the workspace-relative basePath.
- * Remote URLs (http://, https://, data:) pass through unchanged.
+ *
+ * SECURITY (root ⑤, run_5e604f45): a REMOTE http(s) image src is DROPPED (returns
+ * undefined → React omits the <img src> attr → NO network fetch), closing a
+ * tracking-pixel / data-exfil vector where a markdown `![](https://evil/x.png)` in
+ * chat/requirement text made the CSP=null webview auto-GET an external URL on display
+ * (no click). react-markdown v10 drops raw HTML (no rehype-raw), so `![](url)` → this
+ * resolver → the img component is the SOLE image vector; dropping here covers BOTH
+ * desktop and Hive/web. Only LOCAL images survive: an http(s) URL whose host is exactly
+ * `localhost`/`127.0.0.1` (the daemon raw-file endpoint, any port), plus `data:`/`blob:`
+ * (used by local/off-DOM render paths), plus relative/absolute workspace paths resolved
+ * to the local API below. The Tauri CSP `img-src` is a desktop-only belt; this component
+ * check is the load-bearing fix.
+ *
+ * Returns `undefined` (NOT '') for a blocked src — an empty-string src makes WebKit
+ * self-fetch the page URL; `undefined` makes React omit the attribute entirely.
  */
-function resolveImageSrc(src: string | undefined, basePath?: string): string | undefined {
+export function resolveImageSrc(src: string | undefined, basePath?: string): string | undefined {
   if (!src) return src;
-  // Remote URLs and data URIs — pass through
-  if (/^(https?:|data:|blob:)/i.test(src)) return src;
 
-  // Build workspace-relative path
+  // Data/blob URIs — local, pass through.
+  if (/^(data:|blob:)/i.test(src)) return src;
+
+  // Remote http(s): keep ONLY if the host is exactly localhost / 127.0.0.1 (the local
+  // daemon, any port). Any other host is DROPPED. EXACT host match — never
+  // startsWith/includes (else `https://localhost.evil.com` would leak). FAIL-CLOSED:
+  // a malformed URL (`https:// x`) throws in `new URL()`; we DROP it rather than let
+  // the throw bubble into the img render and blank the whole chat tab via the
+  // variant="tab" ErrorBoundary (Gate-1 BLOCKING, run_5e604f45).
+  if (/^https?:/i.test(src)) {
+    try {
+      const host = new URL(src).hostname;
+      return host === 'localhost' || host === '127.0.0.1' ? src : undefined;
+    } catch {
+      return undefined; // malformed → drop (fail-closed)
+    }
+  }
+
+  // Build workspace-relative path (relative or absolute workspace path — local only).
   let relativePath = src;
   if (!src.startsWith('/')) {
     if (basePath === undefined) return src; // no base context — can't resolve
@@ -846,10 +876,12 @@ const baseMarkdownComponents: Record<string, React.ComponentType<any>> = {
   // Horizontal rule
   hr: () => <hr className="my-3 border-[var(--color-border)]" />,
 
-  // Images — base version without path resolution; overridden per-instance with basePath
+  // Images — base version (CHAT path, basePath undefined). MUST route through
+  // resolveImageSrc so a remote `![](https://evil/x.png)` is DROPPED (no external fetch).
+  // Previously passed `src={src}` raw, which was the exfil bypass (root ⑤, run_5e604f45).
   img: ({ src, alt }) => (
     <img
-      src={src}
+      src={resolveImageSrc(src)}
       alt={alt || ''}
       className="max-w-full h-auto my-4 rounded-lg border border-[var(--color-border)]"
       loading="lazy"

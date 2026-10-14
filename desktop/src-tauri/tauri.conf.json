@@ -12,7 +12,7 @@
   "app": {
     "windows": [],
     "security": {
-      "csp": null
+      "csp": "img-src 'self' http://localhost:* http://127.0.0.1:* http://tauri.localhost http://asset.localhost asset: data: blob:"
     }
   },
   "bundle": {
