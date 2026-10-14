@@ -863,3 +863,35 @@ class TestReviewDeliverableCheckin:
         # No B dir created anywhere under the workspace .aidlc (would be the 404 dir).
         assert not (workspace / ".aidlc" / "deliverables" / run_id).exists(), \
             "B must NOT be written into the daemon workspace (§4.9 边界④ 404 defense)"
+
+    def test_faillloud_autogen_failure_BLOCKS_commit_no_code_committed(self, workspace, tmp_path, capsys):
+        """FR-2 integration (R28: the fail-loud BLOCK path must be execution-tested):
+        when A has NO terminal REPORT.md AND auto-generation itself raises (真异常 —
+        corrupt/unreadable ledger), cmd_run_commit must EXIT 2 with a COMMIT-BLOCKED
+        signal AND leave the code UNcommitted — never ship code without the audit
+        projection. Mutation-sound: delete the caller's sentinel check → this goes
+        from exit-2/uncommitted to exit-0/committed."""
+        from unittest.mock import patch
+        repo = self._repo_with_change(tmp_path, "faillloudrepo")
+        self._land_eval_artifact(workspace)  # eval artifact in workspace ledger
+        run_id = "run_faillloud"
+        run_file = _write_run(
+            workspace, run_id,
+            stages=[{"stage": "evaluate", "status": "completed", "artifact_id": "art_evalB"},
+                    {"stage": "deliver", "status": "completed", "push_ready": True}],
+            files_touched=[str(repo / "f.py")],
+        )
+        # NO REPORT.md on disk → auto-gen path taken; force it to RAISE (true anomaly).
+        assert not (run_file.parent / "REPORT.md").is_file(), "precondition: no REPORT.md"
+        head_before = self._git(repo, "rev-parse", "HEAD").stdout.strip()
+        with patch("scripts.artifact_cli.cmd_run_report", side_effect=RuntimeError("corrupt ledger")):
+            r = _run_commit(workspace, run_id)
+        err = capsys.readouterr().err
+        assert r.get("exit") == 2, f"fail-loud auto-gen failure must BLOCK (exit 2); got {r}"
+        assert "COMMIT BLOCKED" in err, f"must emit COMMIT-BLOCKED signal; stderr={err}"
+        # The decisive assertion: NO code was committed (HEAD unchanged).
+        head_after = self._git(repo, "rev-parse", "HEAD").stdout.strip()
+        assert head_after == head_before, \
+            "fail-loud BLOCK must leave code UNcommitted — HEAD moved, meaning code shipped without audit"
+        assert not (repo / ".aidlc" / "deliverables" / run_id).exists(), \
+            "no B dir on a blocked commit"

@@ -102,17 +102,24 @@ def _src_repo(tmp_path, name, gitignore=None):
 
 
 def _write_run_with_requirements(workspace, run_id, files_touched, *, write_report=False,
-                                 requirements=None, clarifications=None):
+                                 requirements=None, clarifications=None, reflect_lessons=None):
     """AC3 契约迁移 fixture: a run whose B-generation substance is the EVALUATE
     `requirements[]` (NOT a terminal REPORT.md). By default write_report=False —
     this reproduces the REAL DELIVER-time sequence where run-commit runs BEFORE
-    REFLECT writes REPORT.md. B must still generate from requirements."""
+    REFLECT writes REPORT.md. B must still generate from requirements.
+
+    reflect_lessons (default None): when a list is given, append a completed `reflect`
+    stage carrying those lessons[] — so cmd_run_report projects a SUBSTANTIVE §9 (the
+    seed-lessons→run-report ordering satisfied). Default None keeps the pre-REFLECT
+    shape (no reflect stage → degenerate §9 → B correctly skipped)."""
     run_dir = workspace / "Projects" / "TestProject" / ".artifacts" / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     stages = [
         {"stage": "evaluate", "status": "completed", "artifact_id": "art_eval1"},
         {"stage": "deliver", "status": "completed", "push_ready": True},
     ]
+    if reflect_lessons is not None:
+        stages.append({"stage": "reflect", "status": "completed", "lessons": reflect_lessons})
     data = {
         "id": run_id, "project": "TestProject",
         "requirement": "把 depth 轴加到 pipeline(需求溯源快照内容来源)",
@@ -206,25 +213,78 @@ class TestContentContractCopyReport:
         assert "the original intent verbatim" in body, "provenance section must carry the original intent"
         assert "FR-1" in body, "provenance section must carry the requirement derivation"
 
-    def test_no_report_no_B_warns_loudly(self, workspace, tmp_path):
-        """AC3 + meta-review MED: when A has NO terminal REPORT.md on disk, B is not
-        generated (nothing to copy) AND a LOUD warning is returned (NOT a silent no-op).
-        The report-before-commit ordering is agent-discipline prose, so an ordering
-        violation must surface in run-commit's WARN channel — else B silently never
-        generates (the exact bug this saga reverts). deliver.md's Pipeline Report step
-        normally guarantees REPORT.md exists before run-commit; this is the loud guard
-        if it somehow does not."""
+    def test_missing_report_is_auto_generated_then_B_produced(self, workspace, tmp_path):
+        """FR-1 (supersedes the old no-B-warns-loudly contract): when A has NO terminal
+        REPORT.md on disk at run-commit time, _generate_review_deliverable must AUTO-GENERATE
+        it (reusing cmd_run_report, the deterministic run.json→REPORT.md projection) and THEN
+        produce B — not skip-with-warning. The old behavior silently lost the audit projection
+        on every ordering-violated run (52% of historical runs); the guarantee now lives in
+        code, not deliver.md prose. The run.json has enough stages for cmd_run_report to render
+        a substantive report."""
         from scripts.artifact_cli import _generate_review_deliverable
         from unittest.mock import patch
-        repo = _src_repo(tmp_path, "noreprepo")
-        # _write_run_with_requirements writes NO REPORT.md by default (write_report=False)
-        _write_run_with_requirements(workspace, "run_norep", [str(repo / "f.py")], write_report=False)
+        repo = _src_repo(tmp_path, "autogenrepo")
+        # §9 already seeded (reflect lessons present) → auto-gen renders a SUBSTANTIVE
+        # report → the unchanged §9-degenerate gate passes → B is produced. (The ordering
+        # that was violated is "REPORT.md on disk"; lessons were already in the ledger.)
+        run_dir, _ = _write_run_with_requirements(
+            workspace, "run_autogen", [str(repo / "f.py")], write_report=False,
+            reflect_lessons=["auto-gen fills the file-absence hole, §9 content stays gated"])
+        assert not (run_dir / "REPORT.md").is_file(), "precondition: no REPORT.md on disk"
         with patch("scripts.artifact_cli._get_workspace", return_value=workspace):
-            created, warnings = _generate_review_deliverable("TestProject", "run_norep", str(repo))
-        assert created == [], f"no terminal REPORT.md → no B; got {created}"
-        # NOT a silent no-op — the ordering-violation case must warn loudly.
-        assert warnings and any("no terminal REPORT.md" in w for w in warnings), \
-            f"missing REPORT.md must WARN loudly (not silent), got {warnings}"
+            created, warnings = _generate_review_deliverable("TestProject", "run_autogen", str(repo))
+        # REPORT.md was auto-generated into ledger A ...
+        assert (run_dir / "REPORT.md").is_file(), \
+            f"missing REPORT.md must be AUTO-GENERATED, not skipped; warnings={warnings}"
+        # ... and B was produced from it.
+        b_report = next((c for c in created if Path(c).name == "REPORT.md"), None)
+        assert b_report, f"after auto-generate, B REPORT.md must be produced; got {created}, {warnings}"
+        # OBSERVABILITY: a successful auto-gen must surface a (non-blocking) warning so an
+        # operator SEES the DELIVER ordering was slipped-and-recovered — the whole point of
+        # the feature is to make the violation visible, not silently paper it over.
+        assert any("AUTO-GENERATED" in w for w in warnings), \
+            f"auto-gen success must emit an ordering-slip warning; got {warnings}"
+
+    def test_autogen_failure_fails_loud_not_silent(self, workspace, tmp_path):
+        """FR-2: if auto-generation of REPORT.md itself fails (真异常 — e.g. cmd_run_report
+        raises on an unreadable/corrupt ledger), B is NOT produced AND the warning carries the
+        fail-loud sentinel so the caller BLOCKS the commit rather than silently committing
+        without the audit projection. The INPUT-SHAPE guard: a generation failure is loud, never
+        a silent no-op (IMPROVEMENT.md: fail-loud must guard the failure, not swallow it)."""
+        from scripts.artifact_cli import _generate_review_deliverable, _FAILLOUD_SENTINEL
+        from unittest.mock import patch
+        repo = _src_repo(tmp_path, "autogenfailrepo")
+        run_dir, _ = _write_run_with_requirements(
+            workspace, "run_autogenfail", [str(repo / "f.py")], write_report=False)
+        with patch("scripts.artifact_cli._get_workspace", return_value=workspace), \
+             patch("scripts.artifact_cli.cmd_run_report", side_effect=RuntimeError("boom")):
+            created, warnings = _generate_review_deliverable("TestProject", "run_autogenfail", str(repo))
+        assert created == [], f"auto-gen failure → no B; got {created}"
+        assert warnings and any(w.startswith(_FAILLOUD_SENTINEL) for w in warnings), \
+            f"auto-gen failure must carry the fail-loud sentinel (caller blocks); got {warnings}"
+
+    def test_autogen_with_degenerate_section9_still_skips_B_no_faillloud(self, workspace, tmp_path):
+        """FR-3 / Gate-1 caveat b: auto-gen only fills the FILE-ABSENCE hole — it does NOT
+        bypass the §9 content gate. If REPORT.md is absent AND lessons were never seeded
+        (no reflect stage), auto-gen produces a report whose §9 is DEGENERATE; the unchanged
+        _report_section9_is_degenerate check must still SKIP B with the ordering-violation
+        warning — and crucially NOT the fail-loud sentinel (this is a legitimate ordering
+        skip, not an anomaly that should BLOCK the commit)."""
+        from scripts.artifact_cli import _generate_review_deliverable, _FAILLOUD_SENTINEL
+        from unittest.mock import patch
+        repo = _src_repo(tmp_path, "autogendegenrepo")
+        # reflect_lessons=None → no reflect stage → auto-gen renders degenerate §9.
+        run_dir, _ = _write_run_with_requirements(
+            workspace, "run_autogendegen", [str(repo / "f.py")], write_report=False)
+        with patch("scripts.artifact_cli._get_workspace", return_value=workspace):
+            created, warnings = _generate_review_deliverable("TestProject", "run_autogendegen", str(repo))
+        # Auto-gen DID run (file now exists) ...
+        assert (run_dir / "REPORT.md").is_file(), "auto-gen should still create the file"
+        # ... but B is skipped by the §9 gate, and it is NOT a fail-loud anomaly.
+        assert created == [], f"degenerate §9 → B skipped; got {created}"
+        assert warnings, "degenerate §9 skip must warn (visible ordering violation)"
+        assert not any(w.startswith(_FAILLOUD_SENTINEL) for w in warnings), \
+            f"a legitimate §9-ordering skip must NOT carry the fail-loud sentinel; got {warnings}"
 
 
 class TestReportIsLedgerProjectionNotPlaceholder:

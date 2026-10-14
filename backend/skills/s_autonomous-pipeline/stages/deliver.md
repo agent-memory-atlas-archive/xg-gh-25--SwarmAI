@@ -1041,6 +1041,25 @@ So the §9 lessons MUST exist in the ledger BEFORE `run-commit`. The fix: extrac
 lessons NOW (at the DELIVER tail, before commit) and write them into the **reflect stage
 record** — then project — then commit:
 
+> **Safety net (code-enforced, not just this prose).** If `run-commit` finds NO terminal
+> `REPORT.md` on disk (ordering violated / a resumed run), it AUTO-GENERATES it by projecting
+> the ledger (`cmd_run_report`) rather than silently losing B. If that generation itself
+> FAILS (真异常 — corrupt/unreadable ledger), the commit is BLOCKED (exit 2, "COMMIT BLOCKED"),
+> never committed without the audit projection. This moves the "B must exist" guarantee from
+> agent-discipline ordering (which failed on a majority of historical runs) into code — but
+> §9 CONTENT quality is still gated: if lessons were never seeded, the auto-generated §9 is
+> degenerate and B is correctly SKIPPED-with-warning. So doing the three steps below in order
+> is still how you get a SUBSTANTIVE B; the safety net only guarantees you never ship code
+> WITHOUT one, or ship one that silently lost the audit trail.
+>
+> **If the BLOCK fires on what looks like a TRANSIENT fault** (a momentary FS/permission
+> error during render, not a genuinely corrupt ledger): the block is fail-SAFE (the code
+> commit did NOT happen — nothing was staged), so no data is lost. Diagnose the ledger, then
+> simply re-run `run-report` + `run-commit`; there is no auto-retry (by design — a transient
+> fault should surface to you, not loop silently). When auto-gen SUCCEEDS, run-commit now
+> emits a (non-blocking) warning saying REPORT.md was auto-generated — that warning is your
+> signal that the ordering was slipped and recovered, not that anything is wrong.
+
 ```bash
 # (1) Extract this run's lessons and write them into the REFLECT stage record.
 #     Target stage="reflect" (NOT deliver) — the completion gate's reflect-lessons
