@@ -473,6 +473,54 @@ class TestRunUpdateCarryForward:
         deliver = next(s for s in _read_run(run_file)["stages"] if s["stage"] == "deliver")
         assert deliver["adversarial_review"]["profile_tier"] == "new", "explicit adv must win"
 
+    def test_finalize_omitting_lessons_preserves_seeded_lessons(self, workspace, monkeypatch):
+        """REPORT-projection fix (run_2250a938): the DELIVER 'Pipeline Report' step SEEDS
+        the reflect record's lessons EARLY (status='recorded') so the projected REPORT and
+        its git-committed copy B carry §9 before run-commit. REFLECT later finalizes the
+        SAME reflect record to completed, and its own guidance is 'reuse the seeded lessons,
+        do NOT re-extract' — so the finalize payload legitimately OMITS lessons. Without
+        carry-forward that omission WIPES the seeded lessons → the completion
+        reflect-lessons-substantive gate BLOCKS and A's §9 re-renders empty (A/B drift
+        reopens). `lessons` must carry forward exactly like artifact_id/adversarial_review."""
+        import scripts.artifact_cli as cli
+        from core.artifact_registry import ArtifactRegistry
+        monkeypatch.setattr(cli, "_get_workspace", lambda: workspace)
+        reg = ArtifactRegistry(workspace)
+        seeded = ["[pitfall] a one-shot event modeled as shared state is a race source",
+                  "[decision] root-fix deletes the competing renderer, not patches it"]
+        # DELIVER-tail seed: reflect record created early at status='recorded' WITH lessons.
+        _create_run(workspace, "TestProject", "run_cf7", "running",
+                    stages=[{"stage": "reflect", "status": "recorded", "lessons": seeded}])
+        # REFLECT finalize that OMITS lessons (the 'reuse, do not re-extract' shape).
+        args = self._update_args(workspace, "run_cf7",
+                                 json.dumps({"stage": "reflect", "status": "completed",
+                                             "stage_doc_consumed": True, "token_cost": 100}))
+        cli.cmd_run_update(args, reg)
+        run_file = workspace / "Projects" / "TestProject" / ".artifacts" / "runs" / "run_cf7" / "run.json"
+        reflect = next(s for s in _read_run(run_file)["stages"] if s["stage"] == "reflect")
+        assert reflect.get("lessons") == seeded, \
+            "seeded lessons must survive the recorded→completed finalize replace (gate + §9 read them)"
+        assert reflect["status"] == "completed", "status still upgrades (not blocked by carry-forward)"
+
+    def test_explicit_lessons_win_over_seeded(self, workspace, monkeypatch):
+        """If REFLECT DOES re-send a refined lessons list, the explicit value wins (the
+        carry-forward only fills an OMITTED field, never shadows a provided one)."""
+        import scripts.artifact_cli as cli
+        from core.artifact_registry import ArtifactRegistry
+        monkeypatch.setattr(cli, "_get_workspace", lambda: workspace)
+        reg = ArtifactRegistry(workspace)
+        _create_run(workspace, "TestProject", "run_cf8", "running",
+                    stages=[{"stage": "reflect", "status": "recorded",
+                             "lessons": ["[pitfall] seeded original"]}])
+        refined = ["[pitfall] refined during REFLECT", "[decision] added a second one"]
+        args = self._update_args(workspace, "run_cf8",
+                                 json.dumps({"stage": "reflect", "status": "completed",
+                                             "stage_doc_consumed": True, "lessons": refined}))
+        cli.cmd_run_update(args, reg)
+        run_file = workspace / "Projects" / "TestProject" / ".artifacts" / "runs" / "run_cf8" / "run.json"
+        reflect = next(s for s in _read_run(run_file)["stages"] if s["stage"] == "reflect")
+        assert reflect["lessons"] == refined, "explicit refined lessons must win over the seeded carry"
+
 
 class TestCompletionGateBoolAdversarialReview:
     """run_ca0190fb: the deliver-stage auto-aggregation (cmd_run_update, status=

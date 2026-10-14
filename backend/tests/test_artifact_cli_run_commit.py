@@ -759,15 +759,16 @@ class TestReviewDeliverableCheckin:
         manifest.setdefault("artifacts", []).append(entry)
         mf.write_text(json.dumps(manifest), encoding="utf-8")
 
-    def test_B_generates_for_pre_schema_manifest_entry_without_type(self, workspace, tmp_path, capsys):
-        """Meta-review HIGH regression: a manifest entry predating the mandatory
-        `type` field (type absent) must STILL resolve the requirements artifact so
-        requirements.json is written into B. The requirements lookup passes
-        expected_type=None, so a missing type does NOT silently reject it. (B itself
-        is gated on A's terminal REPORT.md existing — written here to satisfy the gate.)"""
+    def test_B_generates_from_terminal_report_regardless_of_manifest_type(self, workspace, tmp_path, capsys):
+        """B is a verbatim copy of ledger A's terminal REPORT.md — its generation is
+        gated ONLY on that report existing on disk, NOT on resolving the evaluate
+        artifact (the orphan requirements.json sidecar was removed, so the manifest's
+        `type` field no longer gates B at all). A type-less manifest entry — once a
+        meta-review HIGH regression because requirements.json resolution rejected it —
+        is now simply irrelevant to B: the single REPORT.md still generates."""
         repo = self._repo_with_change(tmp_path, "preschemarepo")
         run_id = "run_pre"
-        self._land_eval_artifact(workspace, with_type=False)  # NO type field
+        self._land_eval_artifact(workspace, with_type=False)  # NO type field — must NOT matter now
         run_file = _write_run(
             workspace, run_id,
             stages=[{"stage": "evaluate", "status": "completed", "artifact_id": "art_evalB"},
@@ -779,11 +780,12 @@ class TestReviewDeliverableCheckin:
         _run_commit(workspace, run_id)
         capsys.readouterr()
         bdir = repo / ".aidlc" / "deliverables" / run_id
-        # B copied the terminal REPORT.md, AND requirements.json was resolved from the
-        # type-less manifest entry (expected_type=None).
+        # B copied the terminal REPORT.md; the single projected report is all B carries.
         assert (bdir / "REPORT.md").is_file(), "B must generate when A has a terminal REPORT.md"
-        assert (bdir / "requirements.json").is_file(), \
-            "requirements.json must resolve even when the manifest entry lacks a `type` field (expected_type=None)"
+        assert not (bdir / "requirements.json").exists(), \
+            "orphan requirements.json removed — a type-less manifest entry is now irrelevant to B"
+        assert {p.name for p in bdir.iterdir()} == {"REPORT.md"}, \
+            "B carries ONLY the projected REPORT.md"
 
     def test_deliverable_B_created_and_staged_in_same_commit(self, workspace, tmp_path, capsys):
         repo = self._repo_with_change(tmp_path, "srcrepo")
@@ -810,12 +812,15 @@ class TestReviewDeliverableCheckin:
         # lives inside it), NOT a separate REQUIREMENTS.md.
         bdir = repo / ".aidlc" / "deliverables" / run_id
         assert (bdir / "REPORT.md").is_file(), "B REPORT.md must be checked into the real repo"
-        assert (bdir / "run-ref.txt").is_file(), "B run-ref.txt (back-pointer to A) must exist"
         rep_body = (bdir / "REPORT.md").read_text()
         assert "需求溯源审计" in rep_body and "FR-1" in rep_body, \
             "B REPORT.md must carry the §4.6 provenance section (copied from A's terminal report)"
-        assert "REQUIREMENTS.md" not in {p.name for p in bdir.iterdir()}, \
-            "B must NOT carry a separate REQUIREMENTS.md (the provenance is inside REPORT.md)"
+        # B carries EXACTLY the projected REPORT.md — the orphan sidecars (a separate
+        # REQUIREMENTS.md machine-SRS AND the run-ref.txt back-pointer) are gone: the
+        # provenance lives inside REPORT.md §4.6, and a cross-machine reader could never
+        # resolve run-ref's workspace ledger path anyway.
+        assert {p.name for p in bdir.iterdir()} == {"REPORT.md"}, \
+            "B must carry ONLY REPORT.md (no REQUIREMENTS.md, no run-ref.txt)"
 
         # B is in the SAME commit as the code (HEAD commit touched BOTH f.py and B).
         head_files = self._git(repo, "show", "--name-only", "--format=", "HEAD").stdout

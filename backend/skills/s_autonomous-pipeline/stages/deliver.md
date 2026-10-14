@@ -1016,125 +1016,66 @@ is gone and the doc will be worse.
 
 ---
 
-### Pipeline Report
+### Pipeline Report — generate the FINAL report by LEDGER PROJECTION (not by hand)
 
-Generate pipeline report as markdown in the project's artifacts directory.
-Save to: `Projects/<PROJECT>/.artifacts/runs/<RUN_ID>/REPORT.md`
+> **[MUST] REPORT.md is a deterministic PROJECTION of the ledger, authored by ONE
+> renderer (`cmd_run_report`). You do NOT hand-write it.** The run ledger (run.json +
+> each stage's published artifact) is the single source of truth; `cmd_run_report`
+> aggregates it into a human-readable REPORT.md (TL;DR, §4.6 需求溯源审计 Intent→
+> Requirement provenance, Evaluation, TDD results, quality gates, adversarial findings,
+> files changed, §9 REFLECT lessons, Methodology Impact). Two renderers for one report
+> = guaranteed drift — this stage used to ALSO hand-write a §1-§11 markdown template,
+> which produced a §1 that was a prose paraphrase and a §9 frozen at
+> `_(populated in REFLECT)_`. That competing template is DELETED. There is now exactly
+> one renderer; fill the ledger (via the stage artifacts + the lesson step below), then
+> project it.
 
-The report follows this template (every run produces one):
+**🚨 The ordering that makes the git-committed report CORRECT (do these three in order):**
+The audit copy a reviewer sees in git (`.aidlc/deliverables/<RUN_ID>/REPORT.md`, "B") is
+a verbatim copy of this report, taken by `run-commit`. If the report is generated before
+REFLECT's lessons exist, B is frozen WITHOUT them — the reviewer can't see what the run
+learned, and A (ledger) is later regenerated correct while B stays stale (permanent drift).
+So the §9 lessons MUST exist in the ledger BEFORE `run-commit`. The fix: extract this run's
+lessons NOW (at the DELIVER tail, before commit) and write them into the **reflect stage
+record** — then project — then commit:
 
-```markdown
-# Autonomous Pipeline Report: <title>
+```bash
+# (1) Extract this run's lessons and write them into the REFLECT stage record.
+#     Target stage="reflect" (NOT deliver) — the completion gate's reflect-lessons
+#     substantive-check and cmd_run_report §9 both read reflect.lessons. REFLECT (Step 5)
+#     later REUSES these same lessons (it does NOT re-extract) and does the DDD-cultivation
+#     / IMPROVEMENT.md writes. Each lesson >20 chars, [tag]-prefixed, cross-transferable
+#     (R30#4 AUDIENCE test — a durable principle/pitfall/decision, not a this-run construction log).
+python backend/scripts/artifact_cli.py run-update --project <PROJECT> --run-id <RUN_ID> \
+  --stage-json '{"stage":"reflect","status":"recorded","lessons":["[pitfall] ...","[decision] ..."]}'
 
-**Run ID:** run_<id> | **Project:** <PROJECT> | **Profile:** <profile>
-**Date:** <ISO date> | **Status:** PUSH-READY / NOT-PUSH-READY
+# (2) Project the FINAL report from the ledger (now carries §9). ONE renderer, no hand-writing.
+python backend/scripts/artifact_cli.py run-report --project <PROJECT> --run-id <RUN_ID> --force
 
-## TL;DR
-<2-3 sentences: what was built, what problem it solves, what value it delivers.
-Written for someone who won't read the rest of the report. Skip jargon.>
+# (3) THEN run-commit (below) copies the already-final report as B → single commit, B correct in one shot.
+```
 
-## 1. Requirement
-<original requirement text>
+Save location (projected automatically): `Projects/<PROJECT>/.artifacts/runs/<RUN_ID>/REPORT.md`.
 
-## 2. Evaluation
-| Dimension | Score | Rationale |
-|---|---|---|
-| Strategic | X/5 | ... |
-| Feasibility | X/5 | ... |
-| ROI | X.X | GO/DEFER/REJECT |
+> **Why "recorded" not "completed" in step (1):** REFLECT (Step 5) still runs as a full
+> stage after DELIVER — it finalizes the reflect record to `completed` after doing
+> cultivation/learn/ADR. Step (1) here only SEEDS the lessons early so the projection +
+> B-copy carry them; it does not skip REFLECT. The lessons written here are the ones
+> REFLECT reuses (do not re-extract different ones there — that would re-introduce a
+> second source of §9).
+>
+> **If a run genuinely has no lessons:** write an honest `lessons: []`-equivalent (a
+> single `[note] no cross-transferable lesson — <why>` ≥20 chars). The completion gate
+> still enforces substantiveness; the report §9 renders what the ledger holds. NEVER let
+> §9 show a `_(populated in REFLECT)_` placeholder — that is the drift this stage removes.
 
-**Scope:** <classification> | **Acceptance Criteria:** <list>
-
-## 3. Methodology: DDD + SDD + TDD
-
-### DDD Knowledge Applied
-| Stage | Doc | Insight | Decision Impact |
-|-------|-----|---------|-----------------|
-| <stage> | <PRODUCT/TECH/IMPROVEMENT/PROJECT.md> | <specific quote or fact> | <what it changed> |
-
-(Only list instances where DDD CHANGED an outcome. Omit stages where docs were read but didn't influence decisions.)
-
-### Approach
-<chosen approach from THINK/PLAN or direct — one sentence>
-
-### TDD Cycle
-RED (<N> tests generated, all failed) → GREEN (code until pass) → VERIFY (full suite)
-Bugs caught in RED phase: <N> (<brief description of most significant>)
-
-## 4. Pipeline Execution
-| Stage | Status | Artifact | Key Output |
-|---|---|---|---|
-| EVALUATE | done | art_xxx | GO, ROI X.X |
-| THINK | done/skip | art_xxx | ... |
-| ... | ... | ... | ... |
-
-## 5. TDD Results
-| Metric | Value |
-|---|---|
-| Acceptance criteria | N |
-| Tests generated | M |
-| Tests per criterion | X.X |
-| Bugs caught (RED phase) | K |
-| Smoke tests (new paths) | S |
-| Runtime crashes caught by smoke | C |
-| User-path traces | T |
-| Bugs found by user-path trace | B |
-| Regressions | 0 |
-| Total test suite | N tests, all passing |
-
-## 6. Decision Log
-| Stage | Decision | Classification | Reasoning |
-|---|---|---|---|
-| BUILD | ... | mechanical | ... |
-
-## 7. Quality Gates
-| Gate | Result |
-|---|---|
-| REVIEW (code quality) | N findings, M auto-fixed |
-| REVIEW (security) | clean / N findings |
-| REVIEW (integration) | N symbols checked, M connected, K warnings |
-| BUILD (user-path) | T traces, B bugs found and fixed |
-| TEST (TDD) | pass |
-| VALIDATOR | 6/6 checks |
-| Push-Ready | ✅ PUSH-READY / ❌ NOT-PUSH-READY (blockers: ...) |
-
-## 7.5 Adversarial Review (Multi-Specialist)
-| Specialist | Dispatched | Findings | Fixed | Noted |
-|-----------|-----------|----------|-------|-------|
-| Correctness | ✓/✗ | N | M | K |
-| Security | ✓/✗ | N | M | K |
-| Performance | ✓/✗ | N | M | K |
-| API Contract | ✓/✗ | N | M | K |
-| Red Team | ✓/✗ (conditional) | N | M | K |
-
-**Confidence gating:** N total → M shown (K suppressed at confidence ≤4)
-**Multi-specialist confirmed:** N findings confirmed by 2+ specialists
-
-**Key findings (HIGH/MED, confidence >= 7 only):**
-| ID | Specialist | Finding | Why Invisible to Other Gates | Fix Applied |
-|----|-----------|---------|------------------------------|-------------|
-| <S-1> | <specialist> | <specific issue> | <why BUILD/REVIEW/TEST couldn't catch this> | <fix> |
-
-**Gate value:** <HIGH/MED/LOW — one sentence explaining what specialist review uniquely provided>
-
-## 7.6 Meta-Review (Pipeline Blind Spot Analysis)
-| Category | Verdict | Detail |
-|----------|---------|--------|
-| Deployment context | CLEAR / RISK | <what was found> |
-| Operational scaling | CLEAR / RISK | <no-op cost, steady-state> |
-| Cross-boundary format | CLEAR / RISK | <format assumptions> |
-| First-run vs steady-state | CLEAR / RISK | <backlog behavior> |
-| Cross-fix interaction | CLEAR / RISK / N/A | <do the fixes compose; single fix = N/A> |
-
-**Overall:** CLEAR / RISKS_IDENTIFIED (N items, M addressed)
-
-## 7.7 Completion Audit
-| # | Acceptance Criterion | Evidence | Verified |
-|---|---------------------|----------|----------|
-| 1 | ... | test_xxx.py::test_yyy | ✅ |
-| 2 | ... | [gap: not implemented] | ❌ |
-
-**Gaps found:** N | **Gaps fixed:** M | **Attention flags:** K
+**What the projected report contains (for reference — you do NOT type these; `cmd_run_report`
+renders them from the ledger):** TL;DR · §1 Requirement · §4.6 需求溯源审计 (Intent→
+Requirement) · §2 Evaluation · §3 Methodology · §4 Pipeline Execution · §5 TDD Results ·
+§6 Decision Log · §7 Quality Gates · §7.5 Adversarial · §7.6 Meta-Review · §7.7 Completion
+Audit · §8 Files Changed · §9 Lessons · §10 Known Gaps · §11 Methodology Impact. If a
+section renders thin, the fix is to enrich the STAGE ARTIFACT it projects from (Rule 22 —
+run.json is the audit source), never to hand-edit REPORT.md.
 
 ## 7.8 Doc Sync Check
 | Check | Result | Gap |

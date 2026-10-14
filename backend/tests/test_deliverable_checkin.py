@@ -220,8 +220,41 @@ class TestContentContractCopyReport:
             f"missing REPORT.md must WARN loudly (not silent), got {warnings}"
 
 
-class TestBoundary1GitignoreConflict:
-    """边界①: .aidlc/deliverables/ gitignored → WARN + skip B, never edit .gitignore."""
+class TestReportIsLedgerProjectionNotPlaceholder:
+    """AC1+AC4 (anti-drift guard): the audit copy B a reviewer sees in git must carry the
+    run's REAL §9 REFLECT lessons — never the `_(populated in REFLECT)_` placeholder that
+    the deleted hand-written template produced. B is a verbatim copy of ledger A; A is the
+    deterministic ledger projection (`cmd_run_report`). This test goes RED if anyone
+    re-introduces a hand-written template whose §9 is a frozen placeholder, OR if B is
+    frozen before the lessons are seeded into the reflect record. It is the executable
+    form of NFR-1 (completeness-as-contract: §9 shows truth, never a lying placeholder)."""
+
+    def test_B_report_carries_real_lessons_not_placeholder(self, workspace, tmp_path):
+        """A's terminal REPORT.md (projected with real §9 lessons present) → B copies it
+        verbatim, so B's §9 carries the real lessons and NOT the removed placeholder."""
+        from scripts.artifact_cli import _generate_review_deliverable
+        from unittest.mock import patch
+        repo = _src_repo(tmp_path, "lessonsrepo")
+        # A terminal report as cmd_run_report would project it with §9 FILLED (lessons
+        # seeded into the reflect record at DELIVER-tail, before run-commit).
+        report_body = (
+            "# Report\n## 需求溯源审计\nFR-1\n"
+            "## 9. Lessons\n"
+            "- [pitfall] a one-shot event modeled as shared state is a race source\n"
+            "- [decision] root-fix deletes the competing renderer, not patches it\n"
+        )
+        _write_run_with_report(workspace, "run_les", [str(repo / "f.py")], report=report_body)
+        with patch("scripts.artifact_cli._get_workspace", return_value=workspace):
+            created, _ = _generate_review_deliverable("TestProject", "run_les", str(repo))
+        b_report = next((c for c in created if Path(c).name == "REPORT.md"), None)
+        assert b_report, f"B REPORT.md must exist, got {created}"
+        body = Path(b_report).read_text(encoding="utf-8")
+        # The real lessons are present …
+        assert "a one-shot event modeled as shared state" in body, \
+            "B's §9 must carry the run's REAL reflect lessons (projected from the ledger)"
+        # … and the removed hand-written-template placeholder is NOT.
+        assert "_(populated in REFLECT)_" not in body, \
+            "B must NEVER carry the §9 placeholder — that was the two-renderer drift this fix removes"
 
     def test_gitignored_dest_skips_B_and_does_not_edit_gitignore(self, workspace, tmp_path, capsys):
         repo = _src_repo(tmp_path, "ignrepo", gitignore=".aidlc/\n")
@@ -286,11 +319,18 @@ class TestBoundary3SealedOnly:
 
         bdir = repo / ".aidlc" / "deliverables" / "run_seal"
         got = sorted(p.name for p in bdir.iterdir()) if bdir.exists() else []
-        # ONLY the sealed trio: a verbatim copy of A's terminal REPORT.md +
-        # requirements.json (if an eval artifact existed) + run-ref.txt — never the
-        # per-stage snapshots littered into ledger A.
-        assert set(got) <= {"REPORT.md", "requirements.json", "run-ref.txt"}, \
-            f"B must contain ONLY sealed files, got {got}"
+        # B carries EXACTLY ONE file: a verbatim copy of ledger A's terminal
+        # REPORT.md. The §4.6 需求溯源审计 (Intent→Requirement) provenance + §9
+        # Lessons live INSIDE that single report (rendered by cmd_run_report), so
+        # the old orphan sidecars (requirements.json machine-SRS + run-ref.txt
+        # back-pointer) are gone — a reviewer resolves everything from the ONE
+        # human-readable REPORT the ledger projects. Never a per-stage snapshot.
+        assert set(got) == {"REPORT.md"}, \
+            f"B must contain ONLY the projected REPORT.md, got {got}"
+        assert "requirements.json" not in got, \
+            "orphan requirements.json removed — provenance lives inside REPORT.md §4.6"
+        assert "run-ref.txt" not in got, \
+            "orphan run-ref.txt removed — a cross-machine reader cannot resolve its ledger path"
         assert "checkpoint-plan.json" not in got
         assert "METRICS.json" not in got
         assert "evaluation-20261012-art_x.json" not in got

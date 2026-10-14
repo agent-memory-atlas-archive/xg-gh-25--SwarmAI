@@ -197,13 +197,27 @@ def _compute_untrackable_source(
             continue  # error → treat as trackable (fail-safe)
     return out
 
-# Fields that `publish --stage` auto-records into a stage stub (see cmd_publish)
-# and that a subsequent `run-update --stage-json` finalize must NOT lose to the
-# full-record replace. ONLY artifact_id: it is the sole publish-set field that a
-# gate reads (the completion/advance artifact-link check). `status` is excluded
-# on purpose (finalize upgrades recorded→completed); `auto_recorded` is provenance
-# no gate reads. Widen this ONLY when a new publish-set, gate-read field is proven.
-_CARRY_FORWARD_FIELDS = frozenset({"artifact_id", "adversarial_review"})
+# Fields that an EARLIER stage-record write (publish stub OR a DELIVER-tail seed)
+# sets, and that a subsequent `run-update --stage-json` finalize must NOT lose to the
+# full-record replace. Each entry is a field that is (a) set by an earlier write and
+# (b) read by a gate, so losing it on finalize silently breaks that gate. Three:
+#   - artifact_id — the stub at cmd_publish sets it; without carry-forward finalizing
+#     wipes the artifact link → completion's artifact check silently skips.
+#   - adversarial_review — deliver-stage auto-aggregation reads it to BUILD the
+#     delivery artifact; a finalize omitting it wiped it → no delivery artifact.
+#   - lessons — the DELIVER "Pipeline Report" step SEEDS the reflect record's lessons
+#     EARLY (status="recorded") so the projected REPORT + its git-committed copy B carry
+#     §9 before run-commit. REFLECT later finalizes the SAME reflect record to completed,
+#     and its own guidance is "reuse the seeded lessons, do NOT re-extract" — i.e. the
+#     finalize payload legitimately OMITS lessons. Without carry-forward that omission
+#     WIPES the seeded lessons → the completion reflect-lessons-substantive gate BLOCKS
+#     AND A's completion-time re-render projects an empty §9 (re-opening A/B drift in the
+#     opposite direction). Carry-forward makes the preservation PROGRAMMATIC, not reliant
+#     on the agent re-sending lessons (SOUL P7: a structural guard beats a prose rule).
+# `status` is excluded on purpose (finalize upgrades recorded→completed); `auto_recorded`
+# is provenance no gate reads. An explicit value in the finalize always wins. Widen this
+# ONLY when a new earlier-set, gate-read field is proven.
+_CARRY_FORWARD_FIELDS = frozenset({"artifact_id", "adversarial_review", "lessons"})
 
 
 def _get_workspace() -> Path:
@@ -3071,26 +3085,29 @@ def _generate_review_deliverable(
 
     DUAL-STORE, ONE-WAY (A→B): the master ledger "A" (the daemon workspace
     ``.artifacts/runs/<run_id>/``) is NEVER touched here — B is a frozen,
-    DELIVER-time PROJECTION of A, a lossless subset, never a second writer. B =
-    the SEALED definition only (not every per-stage snapshot — §4.9 边界③):
+    DELIVER-time PROJECTION of A, never a second writer. B = EXACTLY ONE file:
 
-      - ``REPORT.md``        — a VERBATIM COPY of A's terminal REPORT.md. That report
-                               ALREADY carries the §4.6 需求溯源审计 (Intent→Requirement)
-                               section — cmd_run_report renders it into the report via
-                               render_audit_trail_md — so copying the report gives a
-                               reviewer the whole provenance (original intent → derivation
-                               → clarifications → leftover) in a SINGLE file, no separate
-                               REQUIREMENTS.md. The copy and A's report cannot drift: B IS
-                               A's report. (run_44a06138 is the known-good proof.)
-      - ``requirements.json``— the sealed evaluation ``requirements[]`` block (machine-readable SRS)
-      - ``run-ref.txt``      — a back-pointer to A's run_id (double-pointer: A's
-                               run.json gets ``published_to`` written by the caller)
+      - ``REPORT.md``        — a VERBATIM COPY of A's terminal REPORT.md. A is itself a
+                               deterministic projection of the ledger (run.json + stage
+                               artifacts) rendered by cmd_run_report, so this single file
+                               carries the WHOLE audit record a reviewer needs: the §4.6
+                               需求溯源审计 (Intent→Requirement provenance, via
+                               render_audit_trail_md), the §9 REFLECT lessons, files
+                               changed, gate verdicts — in ONE human-readable file, in the
+                               SAME commit as the code. The copy and A's report cannot
+                               drift: B IS A's report (same bytes, no second renderer).
+
+    The former sidecars (``requirements.json`` machine-SRS + ``run-ref.txt`` back-pointer)
+    were REMOVED: the SRS had zero code consumers and its content is already human-readable
+    inside REPORT.md §4.6; run-ref's ``ledger:`` path pointed into the daemon workspace (not
+    in git), so a cross-machine reviewer could never resolve it (R30#7 — a published
+    identifier the reader cannot follow). One projected REPORT.md, nothing else.
 
     GATE: B generates iff A has a terminal ``REPORT.md`` on disk — which IS satisfied
-    at run-commit time, because deliver.md generates REPORT.md (its "Pipeline Report"
-    step) BEFORE run-commit runs. No REPORT.md → nothing to copy → generate nothing
-    (defensive no-op). (The lessons/metrics the report also carries are fine in B — B
-    is the terminal report, the reviewer's full context; ledger A remains the audit root.)
+    at run-commit time, because deliver.md generates the FINAL REPORT.md (its "Pipeline
+    Report" step, which extracts this run's lessons into the reflect stage record THEN
+    calls run-report so A already carries §9) BEFORE run-commit runs. No REPORT.md →
+    nothing to copy → generate nothing (defensive no-op). Ledger A remains the audit root.
 
     Returns ``(created_paths, warnings)``. ``created_paths`` are ABSOLUTE paths the
     caller STAGES by extending ``by_repo[target_root]`` so the EXISTING per-repo
@@ -3140,25 +3157,6 @@ def _generate_review_deliverable(
             f"then re-run run-commit to produce the review deliverable."
         ]
 
-    # Resolve the sealed requirements[] too — NOT as the gate (the REPORT.md above is
-    # the gate), but as the source for the machine-readable requirements.json (3). Uses
-    # the HEAD _load_artifact_for_metrics 4-arg/LoadResult signature (a parallel session
-    # refactored it — R29, do NOT revert the signature). expected_type=None ON PURPOSE:
-    # run+id already locate the UNIQUE evaluate artifact, so a redundant type-check would
-    # SILENTLY reject a pre-schema manifest entry (entry.get("type")=None != "evaluation").
-    sealed_reqs = None
-    for s in run_state.get("stages", []):
-        if s.get("stage") == "evaluate" and s.get("artifact_id"):
-            _res = _load_artifact_for_metrics(project, run_id, s["artifact_id"], None)
-            art = _res.data
-            if isinstance(art, dict) and art.get("requirements"):
-                sealed_reqs = {
-                    "schema_version": art.get("schema_version"),
-                    "requirements": art.get("requirements"),
-                    "clarifications": art.get("clarifications", []),
-                }
-            break
-
     dest = Path(target_repo_root) / ".aidlc" / "deliverables" / run_id
 
     # §4.9 边界① gitignore conflict: if the target repo's .gitignore would EXCLUDE
@@ -3189,12 +3187,19 @@ def _generate_review_deliverable(
 
     created: list[str] = []
 
-    # (1) REPORT.md — a VERBATIM COPY of A's terminal REPORT.md. The §4.6 需求溯源审计
-    #     (Intent→Requirement) section a reviewer needs is ALREADY inside it (baked in
-    #     by cmd_run_report via render_audit_trail_md), so the copy carries the full
-    #     provenance — original intent → derivation → clarifications → leftover — PLUS
-    #     the TL;DR / files-changed / etc. a code-reviewer wants, in a SINGLE file. B IS
-    #     A's terminal report, so the two cannot drift (no separate renderer to diverge).
+    # B carries EXACTLY ONE file: a VERBATIM COPY of ledger A's terminal REPORT.md.
+    # A is itself a deterministic PROJECTION of the ledger (run.json + stage artifacts)
+    # rendered by cmd_run_report — the §4.6 需求溯源审计 (Intent→Requirement) provenance
+    # AND the §9 REFLECT lessons live INSIDE that single report. So a reviewer resolves
+    # EVERYTHING — original intent → derivation → clarifications → files changed →
+    # reflect sediment — from the ONE human-readable REPORT.md, in the SAME commit as the
+    # code. B IS A's terminal report (same bytes), so the two cannot drift: there is no
+    # second renderer and no sidecar. The former orphan sidecars were removed on purpose:
+    #   • requirements.json — a machine-readable SRS NO code consumer ever read; its
+    #     content is already human-readable inside REPORT.md §4.6.
+    #   • run-ref.txt — a back-pointer whose `ledger: .artifacts/runs/<id>/` path points
+    #     into the daemon WORKSPACE (not in git), so a cross-machine reviewer could never
+    #     resolve it — a published identifier the reader cannot follow (R30#7).
     try:
         (dest / "REPORT.md").write_text(
             report_src.read_text(encoding="utf-8"), encoding="utf-8"
@@ -3204,27 +3209,6 @@ def _generate_review_deliverable(
         # B is best-effort (ledger A is the durable truth) — a read/write/decode
         # failure on the terminal report warns + skips, never crashes run-commit.
         warnings.append(f"deliverable B: REPORT.md copy failed ({type(e).__name__}: {e})")
-
-    # (2) requirements.json — the SEALED evaluation requirements[] block (the SRS,
-    #     machine-readable). Resolved above (the B-generation gate); write it now.
-    if sealed_reqs:
-        try:
-            (dest / "requirements.json").write_text(
-                json.dumps(sealed_reqs, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
-            created.append(str(dest / "requirements.json"))
-        except OSError as e:
-            warnings.append(f"deliverable B: requirements.json write failed ({e})")
-
-    # (3) run-ref.txt — back-pointer to A (the double-pointer other half).
-    try:
-        (dest / "run-ref.txt").write_text(
-            f"run_id: {run_id}\nproject: {project}\nledger: .artifacts/runs/{run_id}/ (daemon workspace)\n",
-            encoding="utf-8",
-        )
-        created.append(str(dest / "run-ref.txt"))
-    except OSError as e:
-        warnings.append(f"deliverable B: run-ref.txt write failed ({e})")
 
     # §4.9 边界③ 隐私红线 (FR-4): B carries the user's VERBATIM original intent +
     # clarification Q&A, and is about to be checked into a repo that MAY be public

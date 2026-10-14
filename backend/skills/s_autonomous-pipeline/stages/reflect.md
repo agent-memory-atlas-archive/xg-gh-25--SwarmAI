@@ -43,7 +43,19 @@ Then continue with the Standard Methodology below, starting from Step 4
 > agent-discipline `[MUST]` — the cultivation/learn/report are real scripts the agent
 > invokes, not publish-blocking gates. "Do NOT skip" here means honor the discipline.
 
-1. Extract lessons from this pipeline run
+> **⚠️ Lessons were SEEDED in DELIVER — reuse them, do NOT re-extract.** The DELIVER
+> stage's "Pipeline Report" step already extracted this run's lessons and wrote them into
+> THIS reflect stage record's `lessons` field (that is what makes the git-committed audit
+> report carry §9 before run-commit — see deliver.md). So Step 1 below is a REUSE +
+> finalize, not a fresh extraction: read the lessons already in the reflect record, refine
+> only if REFLECT surfaces something genuinely new, and do NOT author a DIFFERENT set (two
+> sources of §9 re-introduces the drift this split removed). REFLECT's distinct job is
+> everything DELIVER did NOT do: the IMPROVEMENT.md/MEMORY.md writes (Steps 2-3), the ADR
+> gate (Step 5), DDD cultivation (Step 7), and finalizing the reflect record to
+> `completed` (Step 8).
+
+1. Reuse the lessons already seeded into the reflect stage record (by DELIVER); extract
+   additional ones ONLY if REFLECT genuinely surfaces new material
 2. Write to IMPROVEMENT.md: what worked, what failed, patterns discovered
 3. Update MEMORY.md if the lesson is cross-project
 4. **Checklist maintenance** -- if any post-pipeline review (E2E, external,
