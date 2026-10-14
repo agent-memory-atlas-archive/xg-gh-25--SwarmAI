@@ -369,15 +369,17 @@ git ls-files --others --exclude-standard
 >   the script). Rule of thumb: the reviewer must see the change ON DISK, not merely
 >   in the index.
 > - **`pending` is the WHOLE INDEX, not your run's files.** A parallel session's
->   staged file lands in `pending` too and therefore also demands coverage. Note
->   `run-commit` stages by explicit path but then runs a BARE `git commit -m`
->   (`artifact_cli.py`, no pathspec), so whatever else sits in the index is
->   committed as well. This is the one way "stage early" can hurt: it widens the
->   window during which your file shares an index with another session's. Before
->   spawning the review, run `git diff --cached --name-only` and unstage anything
->   that is not yours (`git restore --staged -- <path>`, R29). This is not
->   hypothetical: while this very note was being written, a parallel session's bare
->   `git commit` swept both of these files into ITS commit.
+>   staged file lands in `pending` too and therefore also demands coverage — so
+>   stage-early still widens the window during which your file shares an index with
+>   another session's, and the ADVERSARIAL GATE's `pending` set (whole index) will
+>   demand coverage for a foreign staged file. Before spawning the review, run
+>   `git diff --cached --name-only` and unstage anything that is not yours
+>   (`git restore --staged -- <path>`, R29). (Note: `run-commit` ITSELF no longer
+>   sweeps the index — its `git add` AND its `git commit` are both pathspec-scoped
+>   to this run's `files_touched` via `-- <files>` (`artifact_cli.py`, landed
+>   `12545357`), so a foreign pre-staged file stays staged-but-uncommitted rather
+>   than swept into this run's commit. The review-window concern above is about the
+>   GATE's coverage math, not run-commit sweeping.)
 > - **A positional pathspec is added to `pending` even if the path does not exist.**
 >   `git commit -m msg -- typo.txt` yields `pending = {…, typo.txt}`, which no review
 >   can ever cover → DENY on a typo. If a commit is refused for a path you do not
@@ -1134,11 +1136,14 @@ python backend/scripts/artifact_cli.py run-commit --project <PROJECT> --run-id <
 
 `run-commit` stages EXACTLY this run's `files_touched` (recorded during BUILD, see
 below) via `git add -- <path>` — NEVER `git add -A`, so it never *adds* a parallel
-session's in-flight edits (R29). ⚠️ But it then runs a BARE `git commit -m` with no
-pathspec, so anything ALREADY in the index — e.g. staged by a parallel session —
-is committed too. `git add` scoping is not commit scoping. Before completing, run
-`git diff --cached --name-only` and `git restore --staged -- <path>` anything that
-is not this run's. It commits locally in whichever repo
+session's in-flight edits (R29). The `git commit` is ALSO pathspec-scoped —
+`git commit -m <msg> -- <files>` (landed `12545357`), so a file a parallel session
+pre-staged stays staged-but-uncommitted rather than being swept into this run's
+commit. (Both the staged-detection `diff --cached` and the commit are scoped to
+`-- *real_files`; the commit message is machine-rendered from the run ledger, not
+hand-copied.) Still good hygiene before completing: run `git diff --cached
+--name-only` and `git restore --staged -- <path>` for anything not this run's, so a
+foreign file doesn't linger staged. It commits locally in whichever repo
 each file lives in (source repo and/or SwarmWS), and **NEVER pushes** (STEERING
 #5: 限制的是 auto-push,不是 local commit). It refuses if the deliver stage isn't
 push_ready or if `files_touched` is empty, and WARNS (listing them) if the working
