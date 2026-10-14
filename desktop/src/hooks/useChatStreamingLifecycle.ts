@@ -49,6 +49,7 @@ import type {
 } from '../types';
 import type { PendingQuestion } from '../pages/chat/types';
 import { queuedMessageFromRetryPayload, retryPayloadHasAttachments, shouldResurfaceQuestion, computeDrainRetirement, shouldArmSpinnerFromBackend, forceClearStreamVerdict, healGraceExpiryVerdict, desyncConvergeVerdict, nextReconcileDelay, type HealGraceVerdict } from './streaming-guards';
+import { errorFieldsFromEvent } from './errorFields';
 import { chatService } from '../services/chat';
 import { promptMetadataToCamelCase } from '../services/tscc';
 import { messageStoreRegistry } from '../stores/MessageStore';
@@ -3433,6 +3434,14 @@ export function useChatStreamingLifecycle(
             { type: 'text' as const, text: `⚠️ ${fullError}` },
           ];
 
+          // Carry the backend error CODE (+ detail + suggestedAction) onto the
+          // message so TabView → ChatErrorMessage can render the real coded label
+          // instead of the generic amber "Interrupted" fallback. A code-less event
+          // (genuine connection drop) yields errorCode=undefined → amber preserved
+          // (FR-2). Without this, a coded terminal like TOOL_CALL_LEAK_UNRECOVERED
+          // rendered identically to a connection drop (the whole bug).
+          const errorFields = errorFieldsFromEvent(event);
+
           // Helper: APPEND error to assistant message content (preserving
           // any tool_use / tool_result / text blocks already streamed).
           // If the exact assistantMessageId isn't found (race condition where
@@ -3444,7 +3453,7 @@ export function useChatStreamingLifecycle(
             if (found) {
               return prev.map((msg) =>
                 msg.id === assistantMessageId
-                  ? { ...msg, isError: true, content: [...msg.content, ...errorContent] }
+                  ? { ...msg, isError: true, ...errorFields, content: [...msg.content, ...errorContent] }
                   : msg,
               );
             }
@@ -3458,7 +3467,7 @@ export function useChatStreamingLifecycle(
               });
               return prev.map((msg) =>
                 msg === lastAssistant
-                  ? { ...msg, isError: true, content: [...msg.content, ...errorContent] }
+                  ? { ...msg, isError: true, ...errorFields, content: [...msg.content, ...errorContent] }
                   : msg,
               );
             }
@@ -3470,6 +3479,7 @@ export function useChatStreamingLifecycle(
                 role: 'assistant' as const,
                 content: errorContent,
                 isError: true,
+                ...errorFields,
                 timestamp: new Date().toISOString(),
               },
             ];

@@ -292,6 +292,16 @@ export interface Message {
   model?: string;
   /** When true, the message contains an error and should be visually distinguished (red border). */
   isError?: boolean;
+  /** Backend error `code` for an isError message (e.g. TOOL_CALL_LEAK_UNRECOVERED,
+   *  AGENT_TIMEOUT). Read by TabView → ChatErrorMessage to pick the coded label +
+   *  severity colour. ABSENT (undefined) → the amber "Interrupted" fallback. Set by
+   *  the SSE error-event handler via `errorFieldsFromEvent`; a code-less error (a
+   *  genuine connection drop) correctly leaves this undefined. */
+  errorCode?: string;
+  /** Backend-sanitized error detail for an isError message (rendered as muted text). */
+  errorDetail?: string;
+  /** Backend "suggested action" for an isError message (rendered as the yellow hint). */
+  suggestedAction?: string;
   /** Ephemeral — renders "Queued" badge. Never persisted to DB. */
   isQueued?: boolean;
   /** When set, this message represents an evolution SSE event and should be rendered with EvolutionMessage. */
