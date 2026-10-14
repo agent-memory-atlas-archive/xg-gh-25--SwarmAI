@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "requirements": [
+    {
+      "id": "FR-1",
+      "statement": "compact 通知在事件site直接 addToast,不经共享 React state",
+      "work_class": "bug",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG:根治单-slot竞态,选方案A直发"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "一次 compaction",
+          "when": "context_compacted 到达(active)或切回有pending的tab",
+          "then": "直接 addToast 一次,无共享state中转"
+        }
+      ]
+    },
+    {
+      "id": "FR-2",
+      "statement": "删除 compactionNotice React state 整条通路",
+      "work_class": "task",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG:净删代码"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "重构后",
+          "when": "grep compactionNotice state/setter/clear/useEffect",
+          "then": "0 命中(仅tabState per-tab字段保留)"
+        }
+      ]
+    }
+  ],
+  "clarifications": [
+    {
+      "qid": "Q1",
+      "question": "后台tab compact 直发还是切回发?",
+      "options": [
+        "A. 后台也直发(无tab归属,可能困惑)",
+        "B. 后台defer,切回直发(保留现行为)",
+        "X. Other"
+      ],
+      "answer": "B. 后台defer,切回直发(保留现行为)",
+      "answered_by": "self",
+      "resolution": "保留『后台不打扰、切回才告知』是现行正确行为;只把实现从 setState 换成直发,不改行为。"
+    }
+  ]
+}

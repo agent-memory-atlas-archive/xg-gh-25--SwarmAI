@@ -27,7 +27,7 @@ import { useTranslation } from 'react-i18next';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router-dom';
 import type { Message, ContentBlock, Agent, AgentCreateRequest, ChatSession } from '../types';
-import { MAX_ATTACHMENTS } from '../types';
+import { MAX_ATTACHMENTS, compactionToastPayload } from '../types';
 import { chatService } from '../services/chat';
 import { messageStoreRegistry } from '../stores/MessageStore';
 import { agentsService } from '../services/agents';
@@ -354,9 +354,6 @@ export default function ChatPage() {
     contextWarning,
     setContextWarning,
     clearContextWarning: _clearContextWarning,
-    compactionNotice,
-    setCompactionNotice,
-    clearCompactionNotice,
     promptMetadata,
     setPromptMetadata,
     isLikelyStalled,
@@ -996,10 +993,12 @@ export default function ChatPage() {
           // answerable on switch-back, not be silently cleared.
           setPendingQuestion(tabState.pendingQuestion ?? null);
           setContextWarning(tabState.contextWarning ?? null);
-          // CONSUME a pending background-tab compaction notice: fire the toast once
-          // on switch-back, then clear the slice so it does not re-fire on every switch.
+          // CONSUME a pending background-tab compaction notice: emit the toast DIRECTLY
+          // once on switch-back, then clear the slice so it does not re-fire. Direct
+          // addToast (not a shared React-state slot) — same single-emit path as the
+          // active-tab branch in the stream hook; no shared slot = no race.
           if (tabState.compactionNotice) {
-            setCompactionNotice(tabState.compactionNotice);
+            addToastRef.current(compactionToastPayload(tabState.compactionNotice.message));
             tabState.compactionNotice = null;
           }
           setPromptMetadata(tabState.promptMetadata ?? null);
@@ -1048,9 +1047,10 @@ export default function ChatPage() {
         setPendingQuestion(tabState.pendingQuestion);
         setPendingPermissionRequestId(tabState.pendingPermissionRequestId ?? null);
         setContextWarning(tabState.contextWarning ?? null);
-        // CONSUME a pending background-tab compaction notice (one-shot toast on switch-back).
+        // CONSUME a pending background-tab compaction notice: emit the toast DIRECTLY
+        // once on switch-back, then clear the slice (no shared React-state slot).
         if (tabState.compactionNotice) {
-          setCompactionNotice(tabState.compactionNotice);
+          addToastRef.current(compactionToastPayload(tabState.compactionNotice.message));
           tabState.compactionNotice = null;
         }
         setPromptMetadata(tabState.promptMetadata ?? null);
@@ -1779,26 +1779,9 @@ export default function ChatPage() {
     }
   }, [contextWarning, addToast]);
 
-  // CLI-native autocompact (approach A): surface the backend's one-shot
-  // context_compacted notice as an informational toast so the user knows the
-  // conversation was summarized and the agent is continuing. 'info' severity +
-  // autoDismiss — compaction is a normal, transient event (not an error), and
-  // the toast is the lightest signal per the UX "timer > toast > modal" ladder.
-  // The notice is cleared after showing so it fires exactly once per compaction.
-  useEffect(() => {
-    if (compactionNotice) {
-      addToast({
-        severity: 'info',
-        message: compactionNotice.message,
-        autoDismiss: true,
-        // No explicit id → ToastContext assigns a fresh crypto.randomUUID() per call
-        // (ToastContext.tsx:109), so two distinct compactions in quick succession STACK
-        // as separate toasts rather than same-id-replacing into one. A fixed id would
-        // dedup two real compaction events into a single visible toast.
-      });
-      clearCompactionNotice();
-    }
-  }, [compactionNotice, addToast, clearCompactionNotice]);
+  // (CLI-native autocompact notice is emitted directly via addToast — active tab in
+  //  the stream hook's context_compacted branch, background tab on tab-switch restore
+  //  above. No React-state slot + useEffect round-trip, so no shared-slot race.)
 
   // Push session metadata to TopBar via LayoutContext (pure reads, no new API calls).
   // Use primitive deps only to avoid re-firing on every render (selectedAgent is

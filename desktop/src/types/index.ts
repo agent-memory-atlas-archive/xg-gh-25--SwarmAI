@@ -491,6 +491,18 @@ export interface CompactionNotice {
   trigger: 'auto' | 'manual';
 }
 
+/**
+ * The toast payload for a compaction notice — a ONE-SHOT info toast emitted
+ * directly via addToast at the event site (active tab) or on tab-switch restore
+ * (background tab). No explicit id → ToastContext assigns a fresh UUID per call,
+ * so distinct compactions stack rather than same-id-replacing. Single builder so
+ * every emit site produces an identical payload (no drift). `severity`/`autoDismiss`
+ * are literals so the return type matches ToastOptions without an import cycle.
+ */
+export function compactionToastPayload(message: string) {
+  return { severity: 'info' as const, message, autoDismiss: true };
+}
+
 export interface StreamEvent {
   type: 'assistant' | 'tool_use' | 'tool_result' | 'result' | 'error' | 'reconnecting' | 'session_resuming' | 'ask_user_question' | 'session_start' | 'session_cleared' | 'cmd_permission_request' | 'cmd_permission_decision' | 'cmd_permission_acknowledged' | 'heartbeat' | 'agent_activity' | 'tool_invocation' | 'capability_activated' | 'sources_updated' | 'summary_updated' | 'context_warning' | 'context_compacted' | 'compaction_guard' | 'mcp_health_warning' | 'recovery_exhausted' | 'still_working' | (string & {});
   content?: ContentBlock[];

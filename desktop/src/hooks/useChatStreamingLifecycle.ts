@@ -48,6 +48,7 @@ import type {
   CompactionGuardEvent,
   CompactionNotice,
 } from '../types';
+import { compactionToastPayload } from '../types';
 import type { PendingQuestion } from '../pages/chat/types';
 import { queuedMessageFromRetryPayload, retryPayloadHasAttachments, shouldResurfaceQuestion, computeDrainRetirement, shouldArmSpinnerFromBackend, forceClearStreamVerdict, healGraceExpiryVerdict, desyncConvergeVerdict, nextReconcileDelay, type HealGraceVerdict } from './streaming-guards';
 import { chatService } from '../services/chat';
@@ -960,13 +961,8 @@ export interface ChatStreamingLifecycle {
   /** Set the compaction guard display mirror (used by tab switch restore). */
   setCompactionGuard: React.Dispatch<React.SetStateAction<CompactionGuardEvent | null>>;
 
-  // Compaction notice (delivered via SSE context_compacted event — CLI-native autocompact)
-  /** Non-null when the backend emits a context_compacted SSE event (one-shot "context was summarized" notice). */
-  compactionNotice: CompactionNotice | null;
-  /** Set the compaction notice (used by the stream handler + tests). */
-  setCompactionNotice: React.Dispatch<React.SetStateAction<CompactionNotice | null>>;
-  /** Dismiss the one-shot compaction notice (after the toast is shown). */
-  clearCompactionNotice: () => void;
+  // (Compaction notice has no hook-level state — it is emitted directly via addToast
+  //  at the event site; the per-tab deferred pending lives on tabState.compactionNotice.)
 
   // Hang detection — true when streaming but no real (non-heartbeat) SDK events for >60s
   /** True when the active stream has received only heartbeats for >60s. */
@@ -1731,11 +1727,8 @@ export function useChatStreamingLifecycle(
   // --- Compaction guard (delivered via SSE compaction_guard event) ---
   const [compactionGuard, setCompactionGuard] = useState<CompactionGuardEvent | null>(null);
 
-  // --- Compaction notice (delivered via SSE context_compacted event — CLI-native autocompact) ---
-  const [compactionNotice, setCompactionNotice] = useState<CompactionNotice | null>(null);
-  const clearCompactionNotice = useCallback(() => {
-    setCompactionNotice(null);
-  }, []);
+  // Compaction notice is emitted directly via addToast at the event site (see the
+  // context_compacted branch) — no React-state slot, so none is declared here.
 
   const clearContextWarning = useCallback(() => {
     const tabId = activeTabIdRef.current;
@@ -3644,21 +3637,21 @@ export function useChatStreamingLifecycle(
                 trigger: event.trigger === 'manual' ? 'manual' : 'auto',
               }
             : null;
+          // A compact notice is a ONE-SHOT toast (a fire-and-forget EVENT), NOT a
+          // persistent banner — so emit it DIRECTLY via addToast, never through a
+          // shared React-state slot (one slot fed by two writers + an async consumer
+          // was the last-write-wins race this design removed). ACTIVE tab → addToast
+          // now; BACKGROUND tab → defer via the per-tab slice (ChatPage's tab-switch
+          // restore emits it on switch-back). No shared slot = no race.
           if (capturedTabId === null || capturedTabId === activeTabIdRef.current) {
-            // ACTIVE tab: fire the one-shot toast NOW via React state. Do NOT also
-            // seed tabState.compactionNotice — unlike the stateful context_warning
-            // BANNER (correct to re-show on switch-back), this is a ONE-SHOT toast;
-            // seeding the per-tab slice here would make a switch-away-and-back re-fire
-            // the SAME compaction's toast (clearCompactionNotice clears only React
-            // state, not the slice). So the per-tab persist is BACKGROUND-ONLY below.
             setContextWarning(null);
             if (notice) {
-              setCompactionNotice(notice);
+              addToast(compactionToastPayload(notice.message));
             }
           } else if (tabState && notice) {
-            // BACKGROUND tab: persist to the originating tab's slice so the notice is
-            // not silently dropped — ChatPage's tab-switch restore consumes+clears it
-            // (one-shot toast on switch-back). Only the background path seeds the slice.
+            // BACKGROUND tab: defer — persist to the originating tab's slice so the
+            // notice is not silently dropped. Only the background path seeds the slice
+            // (the active path emits immediately), so there is no latent re-fire trigger.
             tabState.compactionNotice = notice;
           }
         }
@@ -4616,9 +4609,6 @@ export function useChatStreamingLifecycle(
     setPromptMetadata,
     compactionGuard,
     setCompactionGuard,
-    compactionNotice,
-    setCompactionNotice,
-    clearCompactionNotice,
     isLikelyStalled,
     isWaitingForBusy,
     cancelBusyWait,
