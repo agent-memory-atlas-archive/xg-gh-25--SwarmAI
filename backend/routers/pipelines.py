@@ -96,7 +96,7 @@ def _is_stale(state: dict) -> bool:
     consumers of on-disk run state agree: terminal runs are skipped, never
     re-labeled. Without this, the stale→failed presentation coercion in
     _to_response would flip delivered-but-crashed runs to "failed" (run_aad474c7:
-    9/9 stages completed must present as completed, not failed).
+    a run that completed all its profile's stages must present as completed, not failed).
     """
     if state.get("status") != "running":
         return False

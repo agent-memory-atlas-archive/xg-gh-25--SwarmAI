@@ -1138,11 +1138,16 @@ Reason: <why>
 
 ---
 
-## Progress Display — 3 Phases, 10 Stages, 3 Gates
+## Progress Display — 3 Phases, 10 Landmarks, 3 Gates
 
 > **Principle:** The pipeline execution IS the live demo. A user reading the chat
 > window should understand: which phase, which stage, what Gate 0 / Gate 1 / Gate 2
 > decided, and what each stage produced — without needing to read INSTRUCTIONS.md.
+>
+> **"10 landmarks", not a 4th stage-count.** The canonical architecture is **9 stages**
+> (the SSOT — see §Step 2 / `pipeline_profiles.py`); the circled-number display carries
+> 10 *landmarks* because Gate 1 gets its own ④ PRE-CHECK landmark (a gate, not a stage).
+> So: 10 landmarks = 9 stages + Gate-1's ④.
 >
 > **3 gates, 3 moments of truth:** Gate 0 guards the *framing* (inside EVALUATE),
 > Gate 1 guards the *plan* (after PLAN), Gate 2 guards the *code* (inside DELIVER).
