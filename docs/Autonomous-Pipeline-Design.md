@@ -30,6 +30,14 @@ status: current
 
 ---
 
+## The whole pipeline on one page
+
+![SwarmAI Autonomous Pipeline — one-page panorama (9 stages · 3 gates · 2 modes · 6 profiles · 16 review/adversarial roles)](https://github.com/xg-gh-25/SwarmAI/raw/main/docs/assets/discussions/2026-10-14-pipeline-panorama.png)
+
+> One requirement in → PR-ready delivery out. Intent → Frame → Plan → Build → Deliver → Reflect, sitting on the **DDD layer** it reads and writes (that's what closes the loop). The architecture, stated: **single-orchestrator with ephemeral adversarial sub-agents** — *not* multi-resident-agent collaboration. See [Discussion #111](https://github.com/xg-gh-25/SwarmAI/discussions/111) for the walkthrough.
+
+---
+
 ## 1. Executive Summary
 
 ### Vision
