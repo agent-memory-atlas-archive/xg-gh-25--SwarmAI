@@ -14,8 +14,10 @@ Methodology:
       the independent flag `_compact_notice_pending` is set, and clears it (fire-once).
     - Orthogonality: `_compact_notice_pending` and `_compacted` are independent
       (post_compact_injection resets only `_compacted`).
-    - Guard: task_budget constants unchanged; the deleted soft-compact symbol stays
-      dead.
+    - Guard: the deleted soft-compact symbol stays dead. (task_budget is NO LONGER
+      a fixed 800K literal — it is window-derived as of run_4f312c3c; the derivation
+      is asserted in test_compaction_tuning.py, and test_task_budget_desktop_window_derived
+      below guards that the old literal is gone.)
 
 Key invariants:
     - The notice text is a BACKEND CONSTANT (not agent-generated).
@@ -152,10 +154,17 @@ class TestSoftCompactStaysDeleted:
         assert "async def _check_context_soft_compact" not in src
         assert "def _check_context_soft_compact" not in src
 
-    def test_task_budget_desktop_unchanged(self):
+    def test_task_budget_desktop_window_derived(self):
+        # task_budget desktop is now DERIVED from the model context window
+        # (0.75 × window via _compute_desktop_task_budget), NOT the old 800K
+        # literal (run_4f312c3c, XG 2026-10-14). Channel keeps its 400K line.
+        from core.prompt_builder import _compute_desktop_task_budget
         src = (
             Path(__file__).resolve().parents[1] / "core" / "prompt_builder.py"
         ).read_text()
-        # task_budget desktop = 800K, channel = 400K must remain the live values.
-        assert re.search(r'"total":\s*800_000', src)
+        # the old hardcoded desktop literal must be GONE
+        assert not re.search(r'"total":\s*800_000', src)
+        # channel 400K unattended-safety line remains
         assert re.search(r'"total":\s*400_000', src)
+        # desktop derives from the window: 1M → 750K
+        assert _compute_desktop_task_budget(1_000_000) == 750_000

@@ -1203,7 +1203,15 @@ def create_post_compact_injection(
         if not ctx.get("_compacted"):
             return {}
 
-        # Build compact survival instructions
+        # Build compact survival instructions. Enriched with REAL session_context
+        # signal only (never fabricated) so the agent re-anchors on what it was
+        # DOING, not just which files it touched — the thin "files list only" block
+        # lost task goal / recent decisions across a compaction (XG 2026-10-14:
+        # "把 post_compact_injection 的续接内容做厚一点"). Each line is guarded: it
+        # appears ONLY when its signal is present, so a bare session gets just the
+        # base line (no invented continuity). This whole block rides the SDK
+        # additionalContext channel (hookSpecificOutput below) — it is NEVER glued
+        # onto the user prompt, so _classify_message_language (R19) cannot see it.
         files = sorted(ctx.get("_files_touched", set()))
         parts = [
             "[System: Context was just compacted. Key session state below.]",
@@ -1211,6 +1219,45 @@ def create_post_compact_injection(
         if files:
             file_list = ", ".join(files[:20])  # cap at 20 files
             parts.append(f"Files touched this session (re-read if needed): {file_list}")
+
+        # Recent activity — dominant tool + a few recent intents from the
+        # _observations ring (the SAME read pattern create_pre_compact_checkpoint
+        # uses; best-effort so a malformed ring never breaks the hook chain).
+        ring = ctx.get("_observations")
+        if ring is not None:
+            try:
+                completed = ring.all_completed()
+                if completed:
+                    from collections import Counter
+                    tool_counts = Counter(o.tool_name for o in completed)
+                    dominant, dom_n = tool_counts.most_common(1)[0]
+                    parts.append(
+                        f"Recent activity: {len(completed)} tool calls, "
+                        f"dominant={dominant} ({dom_n})."
+                    )
+                recent = ring.snapshot(last_n=3)
+                intents = [o.intent for o in recent if getattr(o, "intent", "")]
+                if intents:
+                    parts.append("Most recent steps: " + " | ".join(intents[-3:]) + ".")
+            except Exception:
+                pass  # enrichment is best-effort; never break the hook chain
+
+        # Test status — did this session run tests? (continuity: pick the thread back up)
+        if ctx.get("_ran_tests"):
+            parts.append("This session has run tests (re-check status if mid-TDD).")
+
+        # Corrections — how many user corrections landed (a signal the agent was
+        # being steered; worth re-reading the correction trail after a compaction).
+        corrections = ctx.get("_corrections_count", 0)
+        if corrections:
+            parts.append(f"User corrections this session: {corrections} (re-read the correction trail).")
+
+        # Active pipeline run — a compacted pipeline MUST keep its run thread.
+        run_id = ctx.get("_active_pipeline_run_id")
+        if run_id:
+            parts.append(
+                f"Active pipeline run: {run_id} — re-read its run.json/checkpoint to resume the correct stage."
+            )
 
         # Reset flag — fire once
         ctx["_compacted"] = False

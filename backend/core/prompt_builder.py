@@ -129,6 +129,32 @@ def strip_sensitive_mcps(mcp_servers: dict) -> dict:
 # TOKEN_CAP_PER_DAILY_FILE` importers keep working (run_72ca2a97).
 TRUNCATION_MARKER = "[Truncated: kept newest ~2000 tokens]"
 
+# ── Autocompact trigger threshold (NOT a cost cap — STEERING #2) ──────────────
+# task_budget is the per-interaction-chain token count at which the SDK CLI fires
+# autocompact (summarize earlier context + CONTINUE — it never truncates in-flight
+# work). It is DERIVED from the model's context window, not a frozen literal, so it
+# tracks the window and triggers EARLY: a smaller resident context means lower
+# per-turn prefill latency + cost, at the acceptable price of compacting a little
+# more often (compaction is auto, visible, and self-continuing — XG 2026-10-14:
+# "阀值只能比800k 小才合理 基本75% context window其实就应该触发").
+AUTOCOMPACT_WINDOW_FRACTION = 0.75
+# Floor so a hypothetical tiny-window model can never get a budget so small it
+# thrashes autocompact / effectively disables useful context. 128K was the old CLI
+# default (a known-workable lower bound); no current model is below it.
+AUTOCOMPACT_BUDGET_FLOOR = 128_000
+
+
+def _compute_desktop_task_budget(context_window: int) -> int:
+    """Desktop autocompact task_budget = max(FLOOR, 0.75 × context window).
+
+    Pure function of the window so it is unit-testable and model-agnostic:
+    a 1M-window model → 750_000; the 200K conservative/unknown default → 150_000
+    (still above the old 128K CLI default); a sub-171K window floors at 128K.
+    Returns an int (SDK task_budget["total"]). int() truncates — no spurious
+    rounding on an already-integer window × 0.75.
+    """
+    return max(AUTOCOMPACT_BUDGET_FLOOR, int(AUTOCOMPACT_WINDOW_FRACTION * context_window))
+
 
 def _truncate_daily_content(content: str, cap: int = TOKEN_CAP_PER_DAILY_FILE) -> str:
     """Truncate DailyActivity content to fit within a token budget.
@@ -2105,14 +2131,16 @@ class PromptBuilder:
         # unreachable (the original bug). See session_healing.py.
         # Evidence: run_bbe3f167 hit exactly 101 turns at pipeline stage 7/8.
         #
-        # Safety: task_budget (800K desktop / 400K channel) is the independent
-        # cost cap. User can always press Stop for true runaway scenarios.
+        # Safety: max_turns is an INDEPENDENT runaway cap, orthogonal to
+        # task_budget (which is the autocompact TRIGGER line — window-derived
+        # desktop / 400K channel — NOT a cost cap; see the Task budget block
+        # below). The user can always press Stop for true runaway scenarios.
         from .session_healing import CHANNEL_MAX_TURNS, DESKTOP_MAX_TURNS
 
         max_turns = agent_config.get("max_turns") or None
         if channel_context and (max_turns is None or max_turns > CHANNEL_MAX_TURNS):
             # Channel: generous limit for skill execution (was 15, too small).
-            # Real safety comes from task_budget=400K, not turn count.
+            # Channel's real safety comes from its 400K task_budget, not turn count.
             # 100 covers all skills (max observed: ~60 turns for complex research).
             max_turns = CHANNEL_MAX_TURNS
         elif not channel_context and max_turns is None:
@@ -2122,37 +2150,36 @@ class PromptBuilder:
             # Self-healing triggers at max_turns-20 for seamless refresh.
             max_turns = DESKTOP_MAX_TURNS
 
-        # ── Task budget: per-task token limit for CLI autocompact ─────
+        # ── Task budget: the CLI-autocompact TRIGGER line (NOT a cost cap) ─────
         #
-        # DISCOVERY (2026-06-01): CLI default task_budget = 128K tokens.
-        # When a single user→agent interaction chain (including all tool
-        # call results) exceeds 128K, CLI triggers autocompact mid-task,
-        # destroying accumulated context and causing the agent to "forget"
-        # what it just read.
+        # task_budget is the per-interaction-chain token count at which the SDK
+        # CLI fires autocompact — it SUMMARIZES earlier context and CONTINUES the
+        # turn; it never truncates in-flight work. So it is the autocompact TRIGGER
+        # line, NOT a cost cap (STEERING #2: a cost cap that truncated real work
+        # would be the banned O030 pattern — this is the opposite).
         #
-        # For 1M models this is absurdly conservative — deep code
-        # investigations routinely hit 200-400K in tool results alone.
-        # The 128K default makes complex tasks fail reliably.
+        # DISCOVERY (2026-06-01): the CLI default (128K) fired autocompact mid-task
+        # on 1M models (session 59b18ce8 compacted 3× at ~100-123K while reading a
+        # 3200-line file) — absurdly early. The first fix hardcoded 800K desktop /
+        # 400K channel.
         #
-        # FIX: Set 800K for desktop chat tabs (user present, can stop).
-        # Channel sessions get 400K (unattended but needs to read large
-        # docs; max_turns=100 is the independent safety cap for runaway).
+        # NOW (2026-10-14, XG directive): the desktop value is DERIVED from the
+        # model context window (0.75 × window via _compute_desktop_task_budget),
+        # not a frozen 800K literal. Lower + window-bound = context stays leaner →
+        # less per-turn prefill latency/cost, at the acceptable price of compacting
+        # a little more often (auto, visible, self-continuing). 1M window → 750K
+        # (250K headroom to the window, safer than the old 800K's 200K).
         #
-        # Evidence: session 59b18ce8 compacted 3 times at ~100-123K
-        # tokens while investigating a bug in a 3200-line file.
-        # Context window was 1M — compact threshold should be 987K.
-        # But task_budget (128K) fired first.
-        #
-        # Risk: Higher budget = more expensive runaway if agent loops.
-        # Mitigated by: max_turns=100 (channel), user stop (desktop),
-        # CompactionGuard (tool loop detection).
+        # Channel keeps a FIXED 400K: it is an unattended-safety line paired with
+        # max_turns=100 (a different rationale from desktop's prefill-tax tuning),
+        # and 400K is not a clean fraction of any standard window — leave it literal.
         if channel_context:
             # Channel: unattended but must handle large docs.
             # max_turns=100 caps total interaction length independently.
             task_budget = {"total": 400_000}
         else:
-            # Desktop chat: user is present, generous budget
-            task_budget = {"total": 800_000}
+            # Desktop chat: window-derived trigger (0.75 × context window, floored).
+            task_budget = {"total": _compute_desktop_task_budget(self.get_model_context_window(model))}
 
         return ClaudeAgentOptions(
             system_prompt=system_prompt_config,
