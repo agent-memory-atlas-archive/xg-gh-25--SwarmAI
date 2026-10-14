@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "requirements": [
+    {
+      "id": "FR-1",
+      "statement": "EVALUATE 后,requirements[]/clarifications[] 以结构化块在 streaming chat 流中对用户实时呈现,区分 AI 自答 vs 用户确认 vs 承重假设",
+      "work_class": "user-story",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG:『pipeline streaming response 里我看不到澄清的 message,我期望有』"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "一个 strict-profile pipeline run 跑完 EVALUATE 并产出 requirements[]",
+          "when": "用户看 streaming response",
+          "then": "看到结构化需求理解块,逐字来自 evaluation artifact,区分答者"
+        }
+      ]
+    },
+    {
+      "id": "FR-2",
+      "statement": "该呈现从 [MUST] 纯纪律升级为结构性可靠机制(消除『唯一靠手敲的 landmark 输出』这个例外),使其不因 F004 注意力衰减而消失",
+      "work_class": "enabler-story",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG 期望『都有』+ SOUL P7: prose 反复失守则上机制;IMPROVEMENT.md:1836 F004 先例(COMPLETE 消失的修法=消除例外,非提醒更狠)"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "agent 执行 EVALUATE",
+          "when": "到达呈现点",
+          "then": "呈现由机制保证产生/被捕获,而非仅靠 agent 记得"
+        }
+      ]
+    },
+    {
+      "id": "NFR-1",
+      "statement": "呈现与 REPORT §需求溯源审计 同源(同一 evaluation artifact),二者不 drift;不改数据结构/SSE schema",
+      "work_class": "task",
+      "source": {
+        "kind": "ddd-derived",
+        "ref": "cross_boundary=false:复用 agent streaming text 输出,不跨 SSE/schema/event-bus seam"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "呈现实现完成",
+          "when": "对比 streaming 块与 REPORT 审计块",
+          "then": "字段同源,REPORT 侧无回归"
+        }
+      ]
+    }
+  ],
+  "clarifications": [
+    {
+      "qid": "Q1",
+      "question": "呈现机制该走哪条路——后端在 publish 时自动 emit,还是 agent 执行层的机械渲染输出?",
+      "options": [
+        "A. 后端 publish 时 SSE 自动 emit",
+        "B. agent 执行层必经的机械渲染 chat 输出(复用 render 逻辑)",
+        "X. Other"
+      ],
+      "answer": "B. agent 执行层必经的机械渲染 chat 输出",
+      "answered_by": "self",
+      "resolution": "已 code-trace 验证:artifact_cli.py publish 是 agent 用 Bash 调的独立子进程、零 SSE 通道,SSE 事件全由 streaming_orchestrator 在 agent streaming 回合内 yield。A 方案走不通(publish 子进程够不到当前 session SSE 流)。故定 B——但具体『机械渲染如何做到结构性可靠而非又一条 [MUST]』留给 THINK 设计。"
+    },
+    {
+      "qid": "Q2",
+      "question": "REPORT 侧需要动吗?",
+      "options": [
+        "A. 需要补 section",
+        "B. 已满足,不动",
+        "X. Other"
+      ],
+      "answer": "B. 已满足,不动",
+      "answered_by": "self",
+      "resolution": "已验证 render_audit_trail_md(pipeline_validator.py:1345,由 artifact_cli.py cmd_run_report 调用)自动渲染 §需求溯源审计,全库 14 个 REPORT 均含;run_6010f022/REPORT.md:13 实读确认。REPORT 侧无 gap。"
+    }
+  ]
+}

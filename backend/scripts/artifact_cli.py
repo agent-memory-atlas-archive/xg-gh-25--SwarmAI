@@ -340,6 +340,13 @@ def cmd_publish(args, reg: ArtifactRegistry) -> None:
 
     With --stage: runs validate_artifact_data() from pipeline_validator
     (single source of truth). On failure, returns errors + expected template.
+
+    A NON-quiet ``--stage evaluate`` publish whose payload carries a structured
+    ``requirements[]`` + ``schema_version>=REQ_SCHEMA_VERSION`` also returns a
+    ``_display_block`` field: the CLI-rendered "需求理解" provenance block
+    (``render_audit_trail_md`` — same source as the run-end REPORT §4.6). It is
+    additive and best-effort (absent on render failure); the agent relays it into
+    the ① EVALUATE landmark instead of hand-typing. ``--quiet`` never carries it.
     """
     # --data accepts a raw JSON string OR "@PATH" (read a file) OR "@-" (stdin).
     # A JSON value never starts with '@' (object/array/string/number/bool/null),
@@ -618,6 +625,51 @@ def cmd_publish(args, reg: ArtifactRegistry) -> None:
                                "Record manually via run-update --stage-json.",
                     "stage": stage,
                     "detail": str(e),
+                }), file=sys.stderr)
+
+        # ── EVALUATE glass-box: hand the agent the rendered "需求理解" block ──
+        # The real-time inline emit (evaluate.md §4.6.4 / INSTRUCTIONS.md Phase-2)
+        # used to be a pure [MUST] telling the agent to HAND-TYPE a markdown block —
+        # F004 attention-decay meant it almost never appeared, unlike the run-end
+        # REPORT §4.6 audit which is mechanically rendered (artifact_cli.py cmd_run_report
+        # → render_audit_trail_md). Fix: publish --stage evaluate is a STRUCTURALLY
+        # mandatory step, so make IT return the same CLI-rendered block as a result
+        # FIELD. The agent relays a ready-made block instead of recalling-and-retyping
+        # (the F004 "eliminate the exception" form — chat stream has no CLI-ownable
+        # file analogue, publish is an SSE-less subprocess, so agent-relay is the
+        # architectural ceiling). The gate matches the REPORT side's condition
+        # EXACTLY (the §4.6 audit render, where _eval_art.get("requirements") is a
+        # BARE truthy check + isinstance(schema_version,int) >= REQ_SCHEMA_VERSION) —
+        # so preview and archive render on IDENTICAL inputs and cannot drift. Do NOT
+        # tighten the requirements check to isinstance(...,list): REPORT uses bare
+        # truthy, render_audit_trail_md itself degrades a non-list via _iter_requirements,
+        # and a stricter check here would render in REPORT but not here (the exact
+        # drift this mirror forbids — Gate-2 integration finding). Relaxed/legacy runs
+        # (no requirements[] / schema_version<1) get zero ceremony. It is a result KEY
+        # (not bare markdown appended after the JSON line) so stdout stays a SINGLE
+        # valid JSON object (Gate-1 skeptic BLOCK#3: a non-quiet publish example exists
+        # [evaluate.md] and the pipeline parse habit is json.load whole stdout
+        # [INSTRUCTIONS.md] — appending bare text would break both). Quiet is untouched
+        # (parse-proof single line). Best-effort: a render failure degrades VISIBLY
+        # (stderr note) and NEVER fails the publish.
+        if (
+            not getattr(args, "quiet", False)
+            and stage == "evaluate"
+            and data.get("requirements")
+            and isinstance(data.get("schema_version"), int)
+        ):
+            try:
+                from pipeline_validator import render_audit_trail_md, REQ_SCHEMA_VERSION
+                if data["schema_version"] >= REQ_SCHEMA_VERSION:
+                    result["_display_block"] = render_audit_trail_md(
+                        data.get("requirement", ""), data
+                    )
+            except Exception as _disp_err:
+                # VISIBLE degrade, never silent — but the publish itself still succeeds.
+                print(json.dumps({
+                    "warning": "evaluate _display_block render failed; "
+                               "the §4.6 audit still renders at run-end REPORT.",
+                    "detail": f"{type(_disp_err).__name__}: {_disp_err}",
                 }), file=sys.stderr)
 
         if getattr(args, "quiet", False):

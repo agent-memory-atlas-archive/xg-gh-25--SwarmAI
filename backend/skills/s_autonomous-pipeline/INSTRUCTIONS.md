@@ -1179,11 +1179,13 @@ PHASE C: DELIVERY    ⑧⑨⑩     — shared quality gate + knowledge loop
 ```
 
 **Real-time requirement emit (Phase 2 — ONLY after ① EVALUATE, when it produced a structured
-`requirements[]`).** Immediately after the ① EVALUATE landmark, emit a compact structured block
-rendered from the EVALUATE artifact's `requirements[]`/`clarifications[]` — so the user sees "what
-the AI understood + where it decided for me" in real time, not buried in the run-end REPORT (design
-§4.6.4). This is a desktop/direct emit; in a background/headless run it goes to the checkpoint +
-Pipeline card instead (never lost, just a different surface).
+`requirements[]`).** The user should see "what the AI understood + where it decided for me" right
+after the ① EVALUATE landmark — not buried in the run-end REPORT (design §4.6.4). **Do NOT hand-type
+it.** The mandatory `publish --stage evaluate` step returns the block already CLI-rendered as the
+`_display_block` field of its (non-`--quiet`) result JSON — relay that into your ① EVALUATE landmark.
+Its format is the REPORT §4.6 provenance-audit markdown (`## 需求溯源审计`: FR derivation table +
+👤/🧠 clarification Q&A + ⚠️ leftover), rendered from the same `requirements[]`/`clarifications[]` as
+the archive so the two cannot drift. The compact sketch is illustrative of the carried information:
 ```
 📋 需求理解(EVALUATE 产出 · 实时)
   FR-1 [👤 user-stated]   <statement>          ✅ confirmed
@@ -1191,11 +1193,12 @@ Pipeline card instead (never lost, just a different surface).
   ❓ 待你确认(若有 clarification-escalate):Q1 …(A/B/X.Other)
   ⚠️ 承重假设:FR-2 若错则 BUILD 返工 → 建议现在确认
 ```
-Rules: answerer-distinguished (`👤 user` vs `🧠 self-answered` MUST be visually distinct — the
+Rules: answerer-distinguished (`👤 user` vs `🧠 self-answered` are visually distinct — the
 self-answered rows are what the user most needs to audit); load-bearing assumptions carry the
-`← 建议现在确认` flag; render from the artifact (no hand-copy — same source as the run-end REPORT
-§4.6.1, so the preview and the archive cannot drift). Skip the inline-emit only when EVALUATE
-produced no structured `requirements[]` — i.e. a RELAXED-profile (trivial/docs/research) or a
+`← 建议现在确认` flag. The `_display_block` is returned ONLY on a non-`--quiet` publish (desktop/direct);
+a background/headless run publishes with `--quiet` → no block, the §4.6 audit surfaces at the run-end
+REPORT + Pipeline card instead (never lost, just a different surface). Skip the inline-emit only when
+EVALUATE produced no structured `requirements[]` — i.e. a RELAXED-profile (trivial/docs/research) or a
 legacy old-shape run; the free-text landmark alone is then sufficient. ⚠️ On a STRICT profile
 (full/bugfix/goal) EVALUATE is required to emit the structured block (evaluate.md §Structured
 Requirements `[MUST]`), so "no requirements[]" is NOT a legitimate skip there — produce it.
@@ -1607,6 +1610,13 @@ run-observe --project <P> --run-id <R> --event <E> [args]  # telemetry
 # {"artifact_id": "..."} (single line, parse-proof) to STDOUT. On validation
 # FAILURE it writes a SHORT {"validation_failed":true,"errors":[...]} to STDERR
 # and STDOUT IS EMPTY, exit code 1.
+#   ⚠️ ONE EXCEPTION — the EVALUATE publish on a desktop/direct run: publish it
+#   WITHOUT --quiet so the success JSON carries the `_display_block` 需求理解 preview
+#   you must relay into the ① EVALUATE landmark (see Phase-2 above). stdout stays a
+#   single valid JSON object either way (the block is an additive result KEY), so the
+#   OUT=$(... ) 2>err + json.load(['artifact_id']) pattern below still works — it just
+#   also has a `_display_block` key. In a background/headless run keep --quiet (no chat
+#   stream to relay into; the §4.6 audit still lands in the run-end REPORT).
 #
 # 🚫 FOOTGUN: never pipe stdout straight into json.load — on failure stdin is
 # EMPTY and you get an opaque `JSONDecodeError: Expecting value` with the real

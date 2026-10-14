@@ -813,9 +813,17 @@ artifact alongside the free-text `acceptance_criteria` (both coexist — strangl
   user-stated-but-not-confirmed requirement — `_check_clarifications`.
 
 **Real-time inline emit (§4.6.4) — show the user what you decided, immediately, don't wait for REPORT.**
-After you produce `requirements[]` and finish the self-answer round (and any MCQ), **emit a compact
-structured block into the chat stream NOW** (right after the EVALUATE landmark — this is the ①
-EVALUATE output carrying its requirement content), rendered from the same artifact (no hand-copy):
+After you produce `requirements[]` and finish the self-answer round (and any MCQ), the user must see a
+compact structured block in the chat stream NOW (right after the EVALUATE landmark — this is the ①
+EVALUATE output carrying its requirement content). **Do NOT hand-type this block from memory.** The
+`publish --stage evaluate` step below (structurally mandatory — you cannot advance without it) returns
+the block already rendered, as the `_display_block` field of its result JSON (CLI-rendered from this
+run's `requirements[]`/`clarifications[]` via `render_audit_trail_md` — the SAME source as the run-end
+REPORT §4.6, so preview and archive cannot drift). **Relay that `_display_block` into your ①
+EVALUATE landmark output** — you are transcribing a ready-made block, not regenerating one. Its actual
+format is the REPORT §4.6 provenance-audit markdown (`## 需求溯源审计` with the FR derivation table +
+👤/🧠 clarification Q&A + ⚠️ leftover). The compact sketch below is ILLUSTRATIVE of the information it
+carries (per-FR source + answerer + load-bearing flags), not the literal format:
 
 ```
 📋 需求理解(EVALUATE 产出 · 实时)
@@ -829,9 +837,10 @@ EVALUATE output carrying its requirement content), rendered from the same artifa
 Rules: (1) **answerer-distinguished** — `👤 user` vs `🧠 self-answered` MUST be visually distinct;
 the self-answered ones are what the user most needs to see ("where did the AI decide for me"). (2)
 **load-bearing assumptions** (`assumption_weight: load-bearing`, if present) carry the `← 建议现在确认`
-flag. (3) **background/headless has no chat stream** → the block goes to the checkpoint (free-text) +
-Pipeline card, never lost, just a different surface (there is no `awaiting-input` checkpoint state
-today — the Pipeline-card carrier is the current surface). (4) The run-end REPORT still
+flag. (3) **The `_display_block` is returned ONLY by a non-`--quiet` publish** (a desktop/direct run).
+In a background/headless run that publishes with `--quiet`, the result is the parse-proof single line
+with no block — the §4.6 audit then surfaces at the run-end REPORT + Pipeline card instead (never
+lost, just a different surface). (4) The run-end REPORT still
 carries the full §4.6.1 audit block — the inline emit is an incremental PREVIEW, the REPORT is the
 complete archive; both render from the same `requirements[]`/`clarifications[]` so they cannot drift.
 
