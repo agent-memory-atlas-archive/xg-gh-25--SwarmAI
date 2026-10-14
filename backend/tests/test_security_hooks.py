@@ -1362,3 +1362,179 @@ class TestGateFlagParsingGate2:
         gate = self._gate(audit, monkeypatch)
         r = await self._run(gate, repo, "git commit -m x a.py")  # cwd=repo root, pathspec a.py
         assert r.get("decision") == "approve"
+
+
+class TestGateQuoteAwareHeredocAndWrappers:
+    """run_68245424 (root ④): the commit gate must not fail-OPEN when a shell-QUOTED
+    `<<WORD` lives inside a -m message (the 0d6f6479 regression), and must recognize a
+    `timeout <dur> git commit` wrapper. These drive the REAL gate end-to-end against a
+    tmp git repo (NOT mocked — the actual parse under change)."""
+
+    def _repo(self, tmp_path, name="repo"):
+        import subprocess, os
+        d = tmp_path / name; d.mkdir()
+        e = {"GIT_AUTHOR_NAME":"t","GIT_AUTHOR_EMAIL":"t@t","GIT_COMMITTER_NAME":"t","GIT_COMMITTER_EMAIL":"t@t","HOME":str(d),"PATH":os.environ.get("PATH","")}
+        subprocess.run(["git","-C",str(d),"init","-q"],env=e,capture_output=True,check=True)
+        (d/"a.py").write_text("1\n")
+        subprocess.run(["git","-C",str(d),"add","-A"],env=e,capture_output=True,check=True)
+        subprocess.run(["git","-C",str(d),"commit","-q","-m","i"],env=e,capture_output=True,check=True)
+        return d, e
+
+    def _mk_marker(self, tmp_path, sid, reviewed):
+        import json
+        audit = tmp_path / "audit"; audit.mkdir(exist_ok=True)
+        (audit / f"session_{sid}_adv_1.marker").write_text(json.dumps(
+            {"adversarial": True, "session_id": sid, "reviewed_paths": reviewed}))
+        return audit
+
+    def _gate(self, audit, monkeypatch, sid="s"):
+        import core.security_hooks as sh
+        monkeypatch.setattr(sh, "_AGENT_AUDIT_DIR", audit)
+        return sh.create_adversarial_commit_gate({"sdk_session_id": sid})
+
+    async def _run(self, gate, cwd, cmd):
+        return await gate({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(cwd)}, None, None)
+
+    @pytest.mark.asyncio
+    async def test_quoted_heredoc_does_not_drop_pathspec_failopen(self, tmp_path, monkeypatch):
+        """THE 3-new fail-open: `git commit -m "<<A\\n" secret.py` — the quoted `<<A`
+        is a string literal, NOT a heredoc; bash commits secret.py as a positional
+        pathspec. The pending-path computation must INCLUDE secret.py → DENY.
+
+        ⚠️ The file is modified-but-NOT-staged and committed via the POSITIONAL
+        PATHSPEC — this is the real vector. (A STAGED file would be caught by the
+        `git diff --cached` sweep independent of pathspec parsing, so staging it would
+        make the test pass for the WRONG reason — it would not exercise the pre-strip
+        bug at all.) Pre-fix: the heredoc pre-strip mangles the command, `.split()`
+        fallback drops `secret.py`, pending = empty set → approve (fail-OPEN). Mutation
+        proof: revert the quote-aware normalization → pending drops secret.py → approve
+        (RED)."""
+        import subprocess, os
+        repo, e = self._repo(tmp_path)
+        # secret.py exists + committed at baseline, then MODIFIED but NOT staged.
+        (repo/"secret.py").write_text("v1\n")
+        subprocess.run(["git","-C",str(repo),"add","secret.py"],env=e,capture_output=True,check=True)
+        subprocess.run(["git","-C",str(repo),"commit","-q","-m","base"],env=e,capture_output=True,check=True)
+        (repo/"secret.py").write_text("UNREVIEWED CHANGE\n")  # modified, NOT staged
+        # only a.py reviewed — secret.py is NOT covered
+        audit = self._mk_marker(tmp_path, "s", [os.path.realpath(str(repo/"a.py"))])
+        gate = self._gate(audit, monkeypatch)
+        # The literal newline inside the quoted -m value is the attack vector; secret.py
+        # is a positional pathspec committing the modified-unstaged file.
+        r = await self._run(gate, repo, 'git commit -m "<<A\n" secret.py')
+        assert r.get("hookSpecificOutput", {}).get("permissionDecision") == "deny", (
+            f"fail-OPEN: unreviewed secret.py slipped past the gate: {r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_legit_multiline_quoted_message_not_broken(self, tmp_path, monkeypatch):
+        """A legit multiline -m message with a reviewed pathspec must still APPROVE —
+        the quote-aware fix must not over-strip a quoted newline into a false separator."""
+        import subprocess, os
+        repo, e = self._repo(tmp_path)
+        (repo/"a.py").write_text("2\n")
+        subprocess.run(["git","-C",str(repo),"add","a.py"],env=e,capture_output=True,check=True)
+        audit = self._mk_marker(tmp_path, "s", [os.path.realpath(str(repo/"a.py"))])
+        gate = self._gate(audit, monkeypatch)
+        r = await self._run(gate, repo, 'git commit -m "line1\nline2" a.py')
+        assert r.get("decision") == "approve", f"legit multiline msg false-DENIED: {r}"
+
+    @pytest.mark.asyncio
+    async def test_timeout_wrapper_commit_recognized(self, tmp_path, monkeypatch):
+        """`timeout 600 git commit` must be RECOGNIZED as a commit (the wrapper + its
+        duration arg both skipped) → an unreviewed staged file DENIES. Pre-fix:
+        _WRAPPERS lacked timeout → not recognized → gate skipped → fail-OPEN. A naive
+        add of only 'timeout' (without consuming the duration) ALSO fails (stops at the
+        '600' positional) — so this proves the duration-arg consumption too."""
+        import subprocess, os
+        repo, e = self._repo(tmp_path)
+        (repo/"secret.py").write_text("unreviewed\n")
+        subprocess.run(["git","-C",str(repo),"add","secret.py"],env=e,capture_output=True,check=True)
+        audit = self._mk_marker(tmp_path, "s", [os.path.realpath(str(repo/"a.py"))])
+        gate = self._gate(audit, monkeypatch)
+        r = await self._run(gate, repo, "timeout 600 git commit -m x")
+        assert r.get("hookSpecificOutput", {}).get("permissionDecision") == "deny", (
+            f"timeout-wrapped commit not recognized → fail-OPEN: {r}"
+        )
+
+    def test_command_has_git_commit_timeout_wrapper(self):
+        """Pure-fn check: _command_has_git_commit sees through `timeout <dur>`."""
+        from core.security_hooks import _command_has_git_commit
+        assert _command_has_git_commit("timeout 600 git commit -m m") is True
+        assert _command_has_git_commit("gtimeout 30 git commit -m m") is True
+        # negative control: timeout wrapping a NON-commit stays False
+        assert _command_has_git_commit("timeout 600 git status") is False
+
+    def test_timeout_value_opts_do_not_open_bypass(self):
+        """Gate-2 security finding (run_68245424): `timeout` value-taking options
+        (`-k`/--kill-after, `-s`/--signal) must consume their value so the DURATION is
+        found and the wrapped `git commit` stays recognized. A missing opt in the
+        value-taking set = the real duration shifts to tokens[0] → commit unrecognized →
+        fail-OPEN. Covers -k (the one that was missing), -s, both-together, =forms, and a
+        value-less long option."""
+        from core.security_hooks import _command_has_git_commit
+        assert _command_has_git_commit("timeout -k 5 600 git commit -m x") is True  # was False (bypass)
+        assert _command_has_git_commit("timeout --kill-after=5 600 git commit -m x") is True
+        assert _command_has_git_commit("timeout -s KILL -k 5 600 git commit -m x") is True
+        assert _command_has_git_commit("timeout --signal=TERM 600 git commit -m x") is True
+        assert _command_has_git_commit("timeout --preserve-status 600 git commit -m x") is True
+        # negative control: value-opt bypass must not FALSE-positive a non-commit
+        assert _command_has_git_commit("timeout -k 5 600 git status") is False
+
+    @pytest.mark.asyncio
+    async def test_odd_parity_backslash_quote_does_not_drop_pathspec_failopen(self, tmp_path, monkeypatch):
+        r"""Gate-2 red-team (run_68245424): a double-quoted -m message containing an ODD
+        number of backslash-escaped quotes (`\"`) + a real newline + a trailing positional
+        pathspec. bash+shlex keep `\"` INSIDE the double-quote (literal), so `secret.py` is
+        a positional pathspec → bash commits it. A naive quote-walker that treats `\"` as a
+        CLOSING quote inverts its state on odd counts → the in-message `\n` is mis-read as a
+        separator → the glued-`;` resplit splits the -m value → `secret.py` falls into a
+        NON-commit segment → dropped from pending → fail-OPEN. The fix: the walker honors
+        backslash-escape inside double-quotes. Mutation proof: revert the backslash handling
+        → secret.py drops from pending → approve (RED)."""
+        import subprocess, os
+        repo, e = self._repo(tmp_path)
+        (repo/"secret.py").write_text("v1\n")
+        subprocess.run(["git","-C",str(repo),"add","secret.py"],env=e,capture_output=True,check=True)
+        subprocess.run(["git","-C",str(repo),"commit","-q","-m","base"],env=e,capture_output=True,check=True)
+        (repo/"secret.py").write_text("UNREVIEWED\n")  # modified, NOT staged
+        audit = self._mk_marker(tmp_path, "s", [os.path.realpath(str(repo/"a.py"))])
+        gate = self._gate(audit, monkeypatch)
+        # odd count (one) of \" inside the "..." message, a real newline, then secret.py
+        r = await self._run(gate, repo, 'git commit -m "patch the \\" thing\nmore notes" secret.py')
+        assert r.get("hookSpecificOutput", {}).get("permissionDecision") == "deny", (
+            f"fail-OPEN: odd-parity backslash-quote dropped secret.py from pending: {r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_redirection_target_not_collected_as_false_pathspec(self, tmp_path, monkeypatch):
+        """Gate-2 correctness (run_68245424): `git commit -m x > out.log` — the redirect
+        TARGET `out.log` must NOT be collected as a positional pathspec, else a legitimately
+        reviewed commit is FALSE-DENIED. Only a.py is reviewed+staged; the redirect target
+        is not a committed path. Must APPROVE. (Pre-fix: operator skipped but operand
+        collected → pending had out.log → deny.)"""
+        import subprocess, os
+        repo, e = self._repo(tmp_path)
+        (repo/"a.py").write_text("2\n")
+        subprocess.run(["git","-C",str(repo),"add","a.py"],env=e,capture_output=True,check=True)
+        audit = self._mk_marker(tmp_path, "s", [os.path.realpath(str(repo/"a.py"))])
+        gate = self._gate(audit, monkeypatch)
+        r = await self._run(gate, repo, "git commit -m x a.py > /tmp/r4_commit_out.log 2>&1")
+        assert r.get("decision") == "approve", (
+            f"redirect target false-collected → legit commit DENIED: {r}"
+        )
+
+    def test_redir_regexes_do_not_match_real_filenames(self):
+        """The redirection regexes must match ONLY operator shapes, never a real pathspec —
+        a filename never starts with a bare `>`/`<`. Guards against over-skipping (fail-open)
+        and the Gate-2 false-DENY both."""
+        from core.security_hooks import _REDIR_BARE_OP_RE, _REDIR_SELF_CONTAINED_RE
+        # operators (must match → skipped)
+        for op in (">", ">>", "<", "&>", "2>", "1>>", ">&"):
+            assert _REDIR_BARE_OP_RE.match(op) or _REDIR_SELF_CONTAINED_RE.match(op), op
+        for sc in (">out.log", "2>&1", "<<EOF", "<<-EOF", "&>all.log"):
+            assert _REDIR_SELF_CONTAINED_RE.match(sc), sc
+        # real filenames (must NOT match → collected as pathspec)
+        for fn in ("secret.py", "a.py", "my>file.py", "config.yaml", "sub/dir/x.ts"):
+            assert not _REDIR_BARE_OP_RE.match(fn), fn
+            assert not _REDIR_SELF_CONTAINED_RE.match(fn), fn

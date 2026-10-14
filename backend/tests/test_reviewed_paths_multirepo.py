@@ -23,8 +23,8 @@ from pathlib import Path
 
 import pytest
 
-from backend.core.runtime_hooks import _reviewed_paths_at_head
-from backend.core.security_hooks import _pending_commit_paths
+from core.runtime_hooks import _reviewed_paths_at_head
+from core.security_hooks import _pending_commit_paths
 
 
 def _git(root: Path, *args: str) -> None:

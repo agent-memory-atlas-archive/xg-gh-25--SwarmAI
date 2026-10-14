@@ -1588,24 +1588,158 @@ async def pytest_command_guard(
 
 _AGENT_AUDIT_DIR = get_app_data_dir() / "state" / "pipeline_agent_audit"
 
+# Wrappers that take NO positional argument of their own before the wrapped command.
+_WRAPPERS_NOARG = {"sudo", "env", "command", "nice", "nohup", "time"}
+# Wrappers that REQUIRE a positional argument (a duration) before the wrapped command:
+# `timeout 600 git commit`. Adding only the wrapper NAME to the no-arg set would leave
+# the duration (`600`) as tokens[0] != "git" → the commit goes UNRECOGNIZED → fail-OPEN
+# (run_68245424 / Gate-1 catch). So these must also skip their following non-flag arg.
+_WRAPPERS_DURATION = {"timeout", "gtimeout"}
 
-def _segment_is_git_commit(tokens: list[str]) -> bool:
-    """True iff this ONE already-separator-split segment is a `git commit`.
 
-    Mirrors _segment_is_irreversible's wrapper/env-assignment strip + git global-option
-    skip so `env X=y git -C path commit`, `sudo git commit`, `git -c k=v commit` all
-    match. Only the `commit` subcommand — NOT add/status/log/diff/push."""
-    _WRAPPERS = {"sudo", "env", "command", "nice", "nohup", "time"}
+# GNU `timeout` options that CONSUME a following value token (space form). The =form
+# is self-contained. Missing one here is a FAIL-OPEN: its value would be mis-read as the
+# duration positional, the real duration shifts to tokens[0] != "git", and the wrapped
+# `git commit` goes UNRECOGNIZED → gate skipped (run_68245424 Gate-2 security finding:
+# `-k`/`--kill-after` was missing → `timeout -k 5 600 git commit` bypassed the gate).
+_TIMEOUT_VALUE_OPTS = {"-s", "--signal", "-k", "--kill-after"}
+
+# Shell redirection OPERATORS whose own token is NEVER a pathspec. Two shapes, handled
+# differently in the pathspec walk (run_68245424 Gate-2 correctness finding):
+#   • BARE operator (`>`, `>>`, `<`, `&>`, `2>`, `1>>`, `>&`, `&>>`): its OPERAND is a
+#     SEPARATE following token (`git commit -m x > out.log`) — BOTH the operator AND the
+#     operand must be skipped, else the operand (`out.log`) is collected as a FALSE
+#     pathspec → a legitimate reviewed commit is FALSE-DENIED.
+#   • SELF-CONTAINED (`>out.log`, `2>&1`, `<<EOF`, `<<-EOF`): operator+target are one
+#     token — skip just that one token.
+# Matching only these unambiguous shapes keeps a real filename (which never starts with a
+# redirection operator) from being skipped — fail-safe in BOTH directions.
+_REDIR_BARE_OP_RE = re.compile(r"^\d*(?:>>|<<<|>&|&>>|&>|>|<)$")       # operand is NEXT token
+_REDIR_SELF_CONTAINED_RE = re.compile(r"^\d*(?:>>|>|<)\S+$|^<<-?\S*$|^\d*>&\d+$|^&>\S+$")
+
+
+def _skip_leading_wrappers(tokens: list[str]) -> list[str]:
+    """Strip env-assignments and command wrappers from the FRONT of a segment, returning
+    the tokens starting at the real command word. Handles both no-arg wrappers
+    (`sudo`/`env`/…) and duration-arg wrappers (`timeout <dur>`/`gtimeout <dur>`), the
+    latter also skipping any leading options (`--foreground`, `-s SIG`, `-k DUR`, their
+    =forms) AND the mandatory DURATION positional, so `timeout -s KILL -k 5 600 git
+    commit` resolves to `git commit`.
+
+    FAIL-CLOSED duration handling: the duration positional is consumed ONLY if, after the
+    options, the next token is NOT already the wrapped command. If a malformed/novel
+    option layout leaves `git` as the next token, we do NOT swallow it as a duration —
+    the wrapped command stays visible (recognizing the commit = the safe direction for a
+    gate). Over-recognition (treating a non-commit as a commit) only adds a redundant
+    coverage check; under-recognition would fail-OPEN."""
     i = 0
     while i < len(tokens):
         t = tokens[i]
         if "=" in t and t.split("=", 1)[0].replace("_", "").isalnum() and not t.startswith("-"):
             i += 1
-        elif t in _WRAPPERS:
+        elif t in _WRAPPERS_NOARG:
             i += 1
+        elif t in _WRAPPERS_DURATION:
+            # Skip the wrapper + its own options (value-taking opts consume their value),
+            # then the DURATION positional — but never swallow the wrapped command itself.
+            i += 1
+            while i < len(tokens) and tokens[i].startswith("-"):
+                if tokens[i] in _TIMEOUT_VALUE_OPTS and i + 1 < len(tokens):
+                    i += 2  # option + its separate value token
+                else:
+                    i += 1  # =form / value-less option
+            # Consume the duration positional ONLY if it is not already the command.
+            # (A bare `timeout git commit` with no duration is malformed, but keeping
+            # `git` visible is the fail-CLOSED choice — recognize the commit.)
+            if i < len(tokens) and tokens[i] not in ("git",) and tokens[i] not in _WRAPPERS_NOARG and tokens[i] not in _WRAPPERS_DURATION:
+                i += 1  # the duration positional (e.g. 600, 5s, 1m)
         else:
             break
-    tokens = tokens[i:]
+    return tokens[i:]
+
+
+def _normalize_newlines_quote_aware(command: str) -> str:
+    """Replace command-separating newlines with ` ; `, but ONLY newlines OUTSIDE a
+    shell-quoted span. A newline INSIDE `'...'`/`"..."` is literal DATA (a multiline
+    -m message, a quoted heredoc-looking string), NOT a command separator.
+
+    This REPLACES the old `command.replace("\\n", " ; ")` + regex heredoc pre-strip,
+    which was the root of the run_68245424 fail-open: the blind replace turned a
+    newline inside a quoted `-m "<<A\\n"` value into a separator, which split the real
+    positional pathspec (`secret.py`) into a NON-commit segment → the pending-path set
+    missed it → unreviewed file committed (fail-OPEN). Deferring quote handling to this
+    pass (then letting shlex tokenize) means a quoted newline stays inside its token and
+    the pathspec stays in the commit segment. A REAL (unquoted) heredoc body still ends
+    up in its own `;`-split non-commit segments, so its lines never become false
+    pathspecs — no regex guessing on raw text (Gate-0 root).
+
+    Quote tracking mirrors POSIX shell quoting so it does NOT diverge from the shlex
+    split that runs next (a divergence is a fail-OPEN: run_68245424 Gate-2 found that a
+    naive walker treating `\\"` inside a double-quoted span as a CLOSING quote inverts the
+    quote state on odd `\\"` counts → an in-message newline is mis-read as a separator →
+    the glued-`;` resplit splits the `-m` value → a real positional pathspec falls into a
+    NON-commit segment → dropped from pending → unreviewed file committed). So:
+      • single-quote `'...'`: everything literal, only `'` ends it — backslash is NOT
+        special (POSIX single-quote rule);
+      • double-quote `"..."`: a backslash escapes the next char, so `\\"` stays INSIDE
+        the span (does not close it);
+      • unquoted: a backslash escapes the next char too, so `\\'`/`\\"` do NOT open a
+        span and a `\\<newline>` line-continuation is not treated as a separator.
+    This is a pre-tokenizer only — shlex does the authoritative split next. An UNCLOSED
+    quote leaves the tail unconverted, which can only MERGE segments → fewer separators →
+    over-collection downstream = fail-CLOSED, never fail-open."""
+    out: list[str] = []
+    q: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        c = command[i]
+        if q == "'":
+            # single-quote: literal; only `'` ends it (backslash NOT special in POSIX).
+            out.append(c)
+            if c == "'":
+                q = None
+            i += 1
+        elif q == '"':
+            # double-quote: backslash escapes the next char, so `\"` stays inside.
+            if c == "\\" and i + 1 < n:
+                out.append(c)
+                out.append(command[i + 1])
+                i += 2
+                continue
+            out.append(c)
+            if c == '"':
+                q = None
+            i += 1
+        else:
+            # unquoted: backslash escapes the next char (a `\'`/`\"` does NOT open a span,
+            # a `\<newline>` continuation is not a separator).
+            if c == "\\" and i + 1 < n:
+                out.append(c)
+                out.append(command[i + 1])
+                i += 2
+                continue
+            if c in ("'", '"'):
+                q = c
+                out.append(c)
+                i += 1
+            elif c in ("\n", "\r"):
+                out.append(" ; ")
+                i += 1
+            else:
+                out.append(c)
+                i += 1
+    return "".join(out)
+
+
+def _segment_is_git_commit(tokens: list[str]) -> bool:
+    """True iff this ONE already-separator-split segment is a `git commit`.
+
+    Mirrors _segment_is_irreversible's wrapper/env-assignment strip + git global-option
+    skip so `env X=y git -C path commit`, `sudo git commit`, `git -c k=v commit`,
+    `timeout 600 git commit` all match. Only the `commit` subcommand — NOT
+    add/status/log/diff/push."""
+    tokens = _skip_leading_wrappers(tokens)
     if not tokens or tokens[0] != "git":
         return False
     k = 1
@@ -1623,12 +1757,12 @@ def _segment_is_git_commit(tokens: list[str]) -> bool:
 
 
 def _command_has_git_commit(command: str) -> bool:
-    """True iff any shell segment of *command* is a `git commit`. Reuses the same
-    newline→';', glued-';' resplit, and separator-split normalization as
-    _is_irreversible_external_op so chained/multiline commits are seen. Fail-safe:
-    unparseable input → substring fallback (only a real `git commit` token pattern)."""
+    """True iff any shell segment of *command* is a `git commit`. Uses the QUOTE-AWARE
+    newline→';' normalization (so a newline inside a quoted `-m` value is NOT a false
+    separator), glued-';' resplit, and separator-split. Fail-safe: unparseable input →
+    substring fallback (only a real `git commit` token pattern)."""
     try:
-        all_tokens = shlex.split(command.replace("\n", " ; ").replace("\r", " ; "))
+        all_tokens = shlex.split(_normalize_newlines_quote_aware(command))
     except ValueError:
         return bool(re.search(r"\bgit\b[^;&|]*\bcommit\b", command))
     if not all_tokens:
@@ -1739,36 +1873,28 @@ def _pending_commit_paths(dir_path: str, command: str):
     if root is None:
         return None
 
-    # Isolate the `git commit` command's own argv BEFORE token-walking, reusing the
-    # SAME normalization the backgrounding/_command_has_git_commit gate already uses.
-    # Without this, a heredoc/`-F -` message body or OTHER commands in a multi-line
-    # Bash script leak their words as FALSE positional pathspecs → the gate computes a
-    # pending set full of garbage paths that no adversarial marker covers → a
-    # legitimately-reviewed commit is FALSE-DENIED (run_463715dc).
+    # Isolate the `git commit` command's own argv BEFORE token-walking. A heredoc/`-F -`
+    # message body or OTHER commands in a multi-line Bash script must NOT leak their words
+    # as FALSE positional pathspecs (false-DENY, run_463715dc), AND a real positional
+    # pathspec must NOT be dropped (fail-OPEN, run_68245424).
     #
-    # FAIL-SAFE direction: this can only ever SHRINK pending of FALSE paths, never drop
-    # a REAL one. A real positional pathspec is argv of the single `git commit` simple-
-    # command (inside its segment, on the opener line — never inside a heredoc BODY,
-    # which is stdin DATA, and never across a shell separator, which terminates the
-    # command). `-a`/`--cached` sweep paths come from `git diff` against `root` below,
-    # independent of this tokenization. So the gate's "reviewed ⊇ pending" invariant
-    # stays fail-CLOSED.
-    #
-    # (1) Strip heredoc BODIES first — W2: the regex is MULTILINE/DOTALL and anchors its
-    #     terminator to a real `\n`, so it MUST run on the raw command before any
-    #     newline→';' normalization. W1: substitute a SPACE (not ""), matching the proven
-    #     caller — "" could token-JOIN across the stripped body (`arg<<EOF…EOFnext`
-    #     → `argnext`). Guarded by the ReDoS cap (fail-safe: over the cap we skip the
-    #     strip, which can only ADD false paths → a stricter/false-DENY, never fail-open).
-    cmd = command
-    if command.count("<<") <= _HEREDOC_MAX_OPENERS:
-        cmd = _HEREDOC_BODY_RE.sub(" ", command)
-    # (2) Normalize newlines→';', shlex-split, resplit glued ';', then split into
-    #     separator-delimited segments — identical idiom to _command_has_git_commit.
+    # ROOT FIX (run_68245424 — replaces the old raw-text `_HEREDOC_BODY_RE` pre-strip):
+    # the pre-strip ran a MULTILINE/DOTALL regex on RAW command text with NO shell-quote
+    # context, so a shell-QUOTED `<<A` inside `-m "<<A\n"` was mis-read as a real heredoc;
+    # its phantom body swallowed the real `secret.py` pathspec → pending missed it →
+    # fail-OPEN (verified: bash commits secret.py, the gate did not see it). The fix is to
+    # stop guessing shell syntax on raw text: normalize newlines QUOTE-AWARELY (a newline
+    # inside a quoted span is literal data, not a separator), then let shlex tokenize.
+    #   • quoted `<<A\n` → stays inside the `-m` value token; `secret.py` stays a token in
+    #     the SAME commit segment → collected as a pathspec → covered-check sees it.
+    #   • a REAL (unquoted) heredoc body → its lines fall into their own `;`-split
+    #     NON-commit segments (`_segment_is_git_commit` rejects them) → never false paths.
+    # No regex, no heredoc guessing. An unclosed quote only MERGES segments (over-collect →
+    # fail-CLOSED). `-a`/`--cached` sweeps still come from `git diff` below, independent.
     try:
-        _all = _shlex.split(cmd.replace("\n", " ; ").replace("\r", " ; "))
+        _all = _shlex.split(_normalize_newlines_quote_aware(command))
     except ValueError:
-        _all = cmd.split()
+        _all = command.split()
     _resplit: list[str] = []
     for _tok in _all:
         if ";" in _tok and _tok != ";":
@@ -1866,6 +1992,21 @@ def _pending_commit_paths(dir_path: str, command: str):
         i = ci + 1
         while i < len(tokens):
             t = tokens[i]
+            # Shell REDIRECTION tokens are not pathspecs. Two shapes (run_68245424 Gate-2
+            # correctness finding — the earlier version skipped only the operator token
+            # and left `> out.log`'s OPERAND `out.log` to be collected as a FALSE pathspec
+            # → a reviewed commit false-DENIED):
+            #   • BARE operator (`>`,`>>`,`<`,`2>`,`&>`,`>&`…): operand is the NEXT token →
+            #     skip BOTH.
+            #   • SELF-CONTAINED (`>out.log`,`2>&1`,`<<EOF`,`<<-EOF`): one token → skip it.
+            # Only these unambiguous shapes match; a real filename never starts with a
+            # redirection operator, so nothing real is skipped (fail-safe both ways).
+            if _REDIR_BARE_OP_RE.match(t):
+                i += 2  # operator + its operand (the redirect target), both non-pathspec
+                continue
+            if _REDIR_SELF_CONTAINED_RE.match(t):
+                i += 1
+                continue
             if t == "--":
                 cwd_paths.extend(tokens[i + 1:]); break
             if t.startswith("--"):
