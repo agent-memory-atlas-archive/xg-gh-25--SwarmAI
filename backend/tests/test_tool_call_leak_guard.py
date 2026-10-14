@@ -229,6 +229,175 @@ def test_strip_against_real_corpus():
     )
 
 
+# ── 1b. Lossless masking (bug 2a) + persist==yield (bug 2d) ──────────────────
+#
+# These guard the run_719886ee refactor (root ①): the persist-side strip is the
+# SINGLE write chokepoint (Gate-1 confirmed memory_extractor/summarization inherit
+# it), so it is KEPT — but it must be LOSSLESS and must not fork UI vs DB.
+
+
+def test_strip_lossless_on_backtick_fence_and_leak():
+    """Bug 2a: a lone backtick must NOT pair across a fence sentinel and destroy
+    a code block or leave a NUL. Input mixes a lone backtick, a fenced code
+    block, a raw leak, and another lone backtick. The code block must survive
+    byte-for-byte and NO \\x00 may remain in the output.
+
+    Mutation proof: revert _mask_doc_contexts to the two-pass fence-then-inline
+    form → this test goes RED (code block dropped + \\x00 residue)."""
+    code_body = "important_code = 1"
+    text = (
+        "Don`t panic here is a raw leak <invoke name=\"Bash\"> and a block\n"
+        "```python\n" + code_body + "\n```\n"
+        "then that`s it"
+    )
+    out = strip_tool_call_leak(text)
+    # The fenced code block must be preserved verbatim.
+    assert code_body in out, f"code block lost: {out!r}"
+    assert "```python" in out, f"fence lost: {out!r}"
+    # No NUL sentinel may leak into the output.
+    assert "\x00" not in out, f"NUL residue in output: {out!r}"
+    # The raw leak IS removed (chokepoint still cleans).
+    assert '<invoke name="Bash">' not in out, f"leak not stripped: {out!r}"
+
+
+def test_strip_lossless_preserves_many_inline_and_fence_spans():
+    """Reinforce 2a: multiple inline-code spans with odd backtick counts around
+    a fence must all round-trip. Mutation proof: two-pass mask → RED."""
+    text = (
+        "Use `a` and `b` and a stray ` tick, then\n"
+        "```js\nconst x = `template`;\n```\n"
+        "and `c` after. Leak: <invoke name=\"X\">"
+    )
+    out = strip_tool_call_leak(text)
+    assert "\x00" not in out
+    assert "const x = `template`;" in out, f"fenced template lost: {out!r}"
+    assert "`a`" in out and "`b`" in out and "`c`" in out
+    assert '<invoke name="X">' not in out
+
+
+def test_mask_doc_contexts_round_trips_lone_backtick_with_fence():
+    """Directly exercise the mask/restore round-trip (the 2a locus). A lone
+    backtick + a fence must restore the fence span verbatim and leave no NUL.
+    Mutation proof: two-pass mask → the fence span is corrupted → RED."""
+    from core.session_utils import _mask_doc_contexts, _restore_doc_contexts
+
+    text = "a ` lone tick\n```py\nZZZ=9\n```\n tail `x`"
+    masked, spans = _mask_doc_contexts(text)
+    restored = _restore_doc_contexts(masked, spans)
+    assert "\x00" not in restored, f"NUL in restored: {restored!r}"
+    assert "ZZZ=9" in restored, f"fence body lost in round-trip: {restored!r}"
+    assert "```py" in restored
+
+
+def test_persist_strip_returns_cleaned_blocks_no_fork():
+    """Bug 2d (contract half): the persist-side clean must EXPOSE the cleaned
+    blocks so the caller can write them back into event['content'] — persist and
+    yield must carry the SAME bytes (no UI≠DB fork).
+
+    This asserts the mechanism Gate-1 required: _clean_blocks_for_persist is the
+    single clean that returns the cleaned list. Mutation proof: if the helper
+    returns the original blocks unchanged (fork reintroduced), the leak remains
+    in the 'persisted' copy → RED."""
+    from core.session_router import _clean_blocks_for_persist
+
+    blocks = [
+        {"type": "text", "text": "hi <invoke name=\"Bash\"> leak"},
+        {"type": "text", "text": "clean line"},
+    ]
+    cleaned = _clean_blocks_for_persist(blocks)
+    # cleaned is a NEW list with the leak removed from the first block.
+    assert '<invoke name="Bash">' not in cleaned[0]["text"], cleaned
+    assert cleaned[1]["text"] == "clean line"
+    # The SAME cleaned list is what both persist and yield must use — the caller
+    # writes it back to event['content']. Verify it is a usable blocks list.
+    assert all(isinstance(b, dict) and "text" in b for b in cleaned)
+
+
+def test_persist_strip_preserves_non_text_and_clean_blocks():
+    """2d contract: non-text blocks and already-clean text pass through
+    unchanged (clean must not corrupt clean content)."""
+    from core.session_router import _clean_blocks_for_persist
+
+    blocks = [
+        {"type": "text", "text": "just discussing it, no leak"},
+        {"type": "image", "source": {"x": 1}},
+        {"type": "text", "text": "code: ```py\nk=1\n``` done"},
+    ]
+    cleaned = _clean_blocks_for_persist(blocks)
+    assert cleaned[0]["text"] == "just discussing it, no leak"
+    assert cleaned[1] == {"type": "image", "source": {"x": 1}}
+    assert "k=1" in cleaned[2]["text"] and "\x00" not in cleaned[2]["text"]
+
+
+def test_persist_bytes_equal_yield_bytes_e2e():
+    """Layer-4 cross-boundary E2E (bug 2d seam = persist-writer bytes ==
+    stream-yield bytes). Drives the REAL SessionRouter._persist_assistant_blocks
+    (the actual write path — only the LEAF db.messages.put is mocked to capture
+    what hit the DB; the strip + return-contract are NOT mocked).
+
+    This test replicates the EXACT call-site pattern the 3 stream loops use:
+        event = {..., "content": <original>}
+        event["content"] = await self._persist_assistant_blocks(..., event["content"], ...)
+        yield event                      # the UI sees event["content"]
+    and asserts the YIELDED event["content"] (what the UI gets) == the content the
+    DB received. This is the real 2d seam — NOT a tautology on the method's own
+    return value.
+
+    Two mutation proofs this catches (both reproduced in the DELIVER adversarial
+    pass → RED):
+      (a) revert the contract to `return True` (bool) → the write-back sets
+          event["content"]=True while the DB got the cleaned list → yielded != DB.
+      (b) delete the `event["content"] = ` assignment at the call site (keep the
+          original) → event["content"] still holds the raw leak while the DB got
+          the cleaned list → yielded != DB. (The prior version of this test asserted
+          only the method's return and MISSED (b) — red-team finding, now fixed.)
+    """
+    import asyncio
+    from unittest.mock import patch
+    from core.session_router import SessionRouter
+
+    captured = {}
+
+    async def _fake_put(row):
+        # Deep-ish copy so a later in-place mutation of the blocks can't retro-
+        # change what we recorded as "what the DB received".
+        captured["content"] = [dict(b) for b in row["content"]]
+
+    fake_db = types.SimpleNamespace(messages=types.SimpleNamespace(put=_fake_put))
+
+    router = SessionRouter.__new__(SessionRouter)  # no __init__ — pure method call
+
+    # The event object exactly as the stream loop holds it, with a raw leak.
+    event = {
+        "type": "assistant",
+        "content": [
+            {"type": "text", "text": "answer <invoke name=\"Bash\"> leaked here"},
+            {"type": "text", "text": "and a clean trailing line"},
+        ],
+    }
+
+    async def _run():
+        with patch("database.db", fake_db):
+            # REPLICATE the real call-site write-back (session_router.py:3544/3790/3821).
+            event["content"] = await router._persist_assistant_blocks(
+                "sess-e2e", event["content"], "test-model", client_id="cid",
+            )
+            # `yield event` happens here in production — the UI reads event["content"].
+
+    asyncio.run(_run())
+
+    # DB actually received cleaned content (leak gone).
+    assert captured.get("content") is not None, "db.put was never called"
+    assert '<invoke name="Bash">' not in captured["content"][0]["text"]
+    # THE SEAM: what the UI gets (yielded event["content"]) == what the DB got.
+    # Catches both (a) bool-return reversion and (b) a deleted write-back.
+    assert event["content"] == captured["content"], (
+        "yielded event['content'] != persisted DB content — the 2d fork is back"
+    )
+    assert isinstance(event["content"], list), "event['content'] must stay a blocks list"
+    assert '<invoke name="Bash">' not in event["content"][0]["text"]
+
+
 # ── 2. Orchestrator guard (integration) ─────────────────────────────────────
 
 

@@ -52,7 +52,9 @@ class TestAssistantClientIdPersist:
                 model="m",
                 client_id="local-123-abc",
             )
-        assert ok is True
+        # Returns the cleaned blocks list (run_719886ee: bool→list[dict] so the
+        # caller can write it back to event['content'], closing the 2d fork).
+        assert ok == [{"type": "text", "text": "hi"}]
         mock_db.messages.put.assert_awaited_once()
         row = mock_db.messages.put.await_args.args[0]
         assert row["role"] == "assistant"
@@ -73,7 +75,7 @@ class TestAssistantClientIdPersist:
                 model="m",
                 client_id=None,
             )
-        assert ok is True
+        assert ok == [{"type": "text", "text": "hi"}]  # cleaned blocks list (run_719886ee)
         row = mock_db.messages.put.await_args.args[0]
         assert "metadata" not in row
 
@@ -87,19 +89,20 @@ class TestAssistantClientIdPersist:
                 [{"type": "text", "text": "hi"}],
                 model="m",
             )
-        assert ok is True
+        assert ok == [{"type": "text", "text": "hi"}]  # cleaned blocks list (run_719886ee)
         row = mock_db.messages.put.await_args.args[0]
         assert "metadata" not in row
 
     @pytest.mark.asyncio
     async def test_empty_blocks_short_circuit_unchanged(self):
-        """Empty blocks still short-circuit to True without a DB write."""
+        """Empty blocks still short-circuit without a DB write; returns the
+        (empty) input list — bool→list[dict] contract (run_719886ee)."""
         ctx, mock_db = _patch_db()
         with ctx:
             ok = await SessionRouter._persist_assistant_blocks(
                 "sess-1", [], model="m", client_id="local-1-a",
             )
-        assert ok is True
+        assert ok == []
         mock_db.messages.put.assert_not_awaited()
 
 
@@ -218,12 +221,16 @@ class TestPersistSideLeakClean:
                 [{"type": "text", "text": leak}],
                 model="m",
             )
-        assert ok is True
+        # bool→list[dict] (run_719886ee): returns the cleaned blocks the caller
+        # writes back to event['content']; here the leak is stripped out of it.
+        assert isinstance(ok, list) and "<invoke name=" not in ok[0]["text"]
         row = mock_db.messages.put.await_args.args[0]
         persisted = row["content"][0]["text"]
         assert "<invoke name=" not in persisted, (
             f"raw leak reached data.db: {persisted!r}"
         )
+        # 2d: the RETURN (→ event['content']) and the PERSISTED bytes are identical.
+        assert ok == row["content"]
 
     @pytest.mark.asyncio
     async def test_fenced_reference_preserved_and_tool_use_untouched(self):
@@ -283,8 +290,11 @@ class TestPersistSideLeakClean:
             ok = await SessionRouter._persist_assistant_blocks(
                 "sess-degrade", original, model="m",
             )
-        # persist MUST still succeed (crash-safe), content falls back to original
-        assert ok is True
+        # persist MUST still succeed (crash-safe), content falls back to original.
+        # bool→list[dict] (run_719886ee): the degrade path returns the ORIGINAL
+        # blocks — and that same list is what both the DB and event['content'] get,
+        # so persist==yield still holds even on the clean-exception path.
+        assert ok == original, "exception path must return original blocks (= persist==yield)"
         mock_db.messages.put.assert_awaited_once()
         row = mock_db.messages.put.await_args.args[0]
         assert row["content"] == original, "exception path must persist original blocks, not drop content"
@@ -315,7 +325,8 @@ class TestPersistSideLeakClean:
                 ok = await SessionRouter._persist_assistant_blocks(
                     "sess-callsite", [{"type": "text", "text": leak}], model="m", **kwargs,
                 )
-            assert ok is True, f"persist failed for call-site kwargs {kwargs}"
+            # bool→list[dict] (run_719886ee): returns cleaned blocks for the write-back.
+            assert isinstance(ok, list), f"persist should return blocks list for kwargs {kwargs}"
             persisted = mock_db.messages.put.await_args.args[0]["content"][0]["text"]
             assert "<invoke name=" not in persisted, (
                 f"raw leak reached data.db via call-site kwargs {kwargs}: {persisted!r}"

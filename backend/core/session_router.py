@@ -104,6 +104,44 @@ PREWARM_SESSION_PREFIX = "prewarm-"
 _recall_degraded_count: dict[str, int] = {}
 
 
+def _clean_blocks_for_persist(blocks: list) -> list:
+    """Return a NEW blocks list with raw tool-call leaks stripped from every text
+    block — the single write-side clean (run_2bdec5c0, re-homed run_719886ee).
+
+    This is the ONE place assistant content is cleaned before it enters data.db,
+    so all downstream content→model-prompt readers (context_injector resume,
+    session_recall, memory_extractor, summarization) inherit a clean DB for free
+    — Gate-1 (run_719886ee) confirmed memory_extractor/summarization read the
+    persisted content into a Bedrock prompt WITHOUT their own strip, so deleting
+    this chokepoint would re-open the re-induction loop for them. KEEP it.
+
+    Returns the cleaned list so the CALLER can write it back into the yielded
+    ``event['content']`` — this closes bug 2d (the former inline clean built a
+    cleaned list for the DB but the stream yielded the ORIGINAL ``event`` object,
+    so the UI showed the raw leak while a reload showed the cleaned text). With a
+    single returned list, persist AND yield carry identical bytes.
+
+    Best-effort: ANY exception degrades to returning the ORIGINAL blocks (+ a
+    warning upstream) — crash-safe persistence of partial content outranks
+    leak-cleaning (losing content is the worse harm). The strip itself is lossless
+    on clean text (run_719886ee fixed the 2a mask corruption), so a clean block is
+    returned byte-for-byte.
+    """
+    from .session_utils import strip_tool_call_leak
+
+    cleaned: list = []
+    for blk in blocks:
+        if (
+            isinstance(blk, dict)
+            and blk.get("type") == "text"
+            and isinstance(blk.get("text"), str)
+        ):
+            cleaned.append({**blk, "text": strip_tool_call_leak(blk["text"])})
+        else:
+            cleaned.append(blk)
+    return cleaned
+
+
 def _record_recall_degraded(reason: str) -> None:
     """Count a recall degradation by reason (loud-on-degradation observability)."""
     try:
@@ -1780,7 +1818,7 @@ class SessionRouter:
         model: str | None,
         label: str = "",
         client_id: str | None = None,
-    ) -> bool:
+    ) -> list[dict]:
         """Save accumulated assistant content blocks to DB.
 
         Called from ``finally`` blocks in streaming methods to ensure
@@ -1797,56 +1835,56 @@ class SessionRouter:
         turn-end reconcile backstop.
 
         The DB layer retries transient errors (SQLITE_BUSY) up to 3 times.
-        If all retries fail, logs at ERROR level and returns False so the
-        caller can notify the frontend.
+        If all retries fail, logs at ERROR level (content may be lost on resume).
 
         Returns:
-            True if persisted successfully, False on failure.
+            The CLEANED blocks list (leaks stripped) — the SAME bytes written to
+            data.db. The caller writes this back into the yielded
+            ``event['content']`` so the stream and the DB cannot diverge (bug 2d).
+            Returned even on a DB-write failure (the stream still shows the cleaned
+            bytes). Returns the input ``blocks`` unchanged when empty or when the
+            best-effort clean raised.
         """
         if not blocks:
-            return True
+            return blocks
         from database import db
-        # Persist-side tool-call-leak clean (run_2bdec5c0): strip raw <invoke>
-        # leak from each text block BEFORE it reaches data.db, so a persisted
-        # leak can never be spliced back into a resumed prompt by the
-        # session_recall read path (the re-induction loop the resume-side
-        # cleaner, run_da39669c, does not cover). This is the write-side single
-        # chokepoint — all 3 call sites funnel through here (TECH.md:3152/4151
-        # "move the invariant to the single write point"). It is DECOUPLED from
-        # the streaming kill decision (detect_tool_call_leak): cleaning only
-        # changes stored CONTENT, never whether the turn was killed. Cleaning is
-        # best-effort — ANY exception degrades to persisting the ORIGINAL blocks
-        # + a warning, because crash-safe persistence of partial content
-        # outranks leak-cleaning (losing content would be the worse harm).
+        # Persist-side tool-call-leak clean (run_2bdec5c0; re-homed run_719886ee):
+        # strip raw <invoke> leak from each text block BEFORE it reaches data.db,
+        # so a persisted leak can never be spliced back into a resumed prompt by
+        # ANY downstream content→model-prompt reader. This is the write-side SINGLE
+        # chokepoint — all 3 call sites funnel through here (TECH.md "move the
+        # invariant to the single write point"). It is DECOUPLED from the streaming
+        # kill decision (detect_tool_call_leak): cleaning only changes stored
+        # CONTENT, never whether the turn was killed.
         #
-        # DO NOT remove as "redundant": leak-cleaning is a 3-point topology and
-        # this point catches a case the others structurally miss. (1) The
-        # streaming_orchestrator TextBlock guard — which ALL send paths run
-        # through, incl. continue_with_answer/permission (they share
-        # _read_formatted_response) — gates its strip/kill on
-        # detect_tool_call_leak(). But detect returns FALSE on the TRUNCATED
-        # pure-leak form (`court\n<invoke name="Bash">` with no <parameter after,
-        # the a0f04b00 shape), so neither orchestrator branch fires and the raw
-        # text flows through to here. (2) context_injector cleans the resume READ
-        # path (incl. old pre-fix rows). This persist-side clean is UNCONDITIONAL
-        # (wide strip, no detect gate), so it is the backstop that closes the
-        # detect-missed truncated form at the single DB write chokepoint — and
-        # any future persist path / SDK shape change. Removing it re-opens
-        # raw-leak persistence for the truncated form the orchestrator skips.
+        # DO NOT remove as "redundant": Gate-1 (run_719886ee) verified that
+        # memory_extractor._format_conversation AND summarization._get_text_content
+        # BOTH read persisted content into a Bedrock prompt with NO strip of their
+        # own — deleting this chokepoint would re-open the re-induction loop for
+        # them. It also catches a case the orchestrator structurally misses: the
+        # streaming_orchestrator TextBlock guard gates its strip/kill on
+        # detect_tool_call_leak(), which returns FALSE on the TRUNCATED pure-leak
+        # form (`court\n<invoke name="Bash">` with no <parameter after, the a0f04b00
+        # shape) → that raw text flows through to here. context_injector cleans the
+        # resume READ path (incl. old pre-fix rows) as defense-in-depth.
+        #
+        # The clean is extracted to the module-level _clean_blocks_for_persist and
+        # run INLINE (NOT via asyncio.to_thread). It RETURNS the cleaned list, which
+        # this function also returns so the caller writes it back into the yielded
+        # event['content'] (bug 2d: persist and stream now carry identical bytes —
+        # no UI≠DB fork). Best-effort: ANY exception degrades to persisting the
+        # ORIGINAL blocks + a warning (crash-safe persistence outranks leak-cleaning).
+        #
+        # ⚠️ Deliberately INLINE, not asyncio.to_thread: strip_tool_call_leak is a
+        # pure-Python regex (~15ms worst case, measured — the "312KB→6.9s quadratic"
+        # claim was empirically refuted as ~linear). The GIL means to_thread buys
+        # ZERO parallelism for pure-Python CPU work, while offloading a sync-fast op
+        # to the SHARED default executor is the exact 16-worker-saturation anti-pattern
+        # COE run_b36c7880 fixed (see data_safety.py "run inline, NOT via to_thread" —
+        # that COE's rule explicitly covers the send/streaming hot path this runs on).
         blocks_to_persist = blocks
         try:
-            from .session_utils import strip_tool_call_leak
-            cleaned: list = []
-            for blk in blocks:
-                if (
-                    isinstance(blk, dict)
-                    and blk.get("type") == "text"
-                    and isinstance(blk.get("text"), str)
-                ):
-                    cleaned.append({**blk, "text": strip_tool_call_leak(blk["text"])})
-                else:
-                    cleaned.append(blk)
-            blocks_to_persist = cleaned
+            blocks_to_persist = _clean_blocks_for_persist(blocks)
         except Exception as exc:  # noqa: BLE001 — clean must never block persist
             logger.warning(
                 "Persist-side leak clean failed for session %s (%s: %s); "
@@ -1865,14 +1903,20 @@ class SessionRouter:
                 "created_at": datetime.now().isoformat(),
                 **({"metadata": _metadata} if _metadata else {}),
             })
-            return True
+            # Return the CLEANED blocks so the caller writes them back to the
+            # yielded event['content'] — persist and stream carry identical bytes
+            # (bug 2d). Returning the list (not a bool) is the Gate-1-required
+            # contract; no caller used the former bool return.
+            return blocks_to_persist
         except Exception as exc:
             logger.error(
                 "Failed to save assistant message%s for session %s: %s "
                 "(content may be lost on resume)",
                 f" ({label})" if label else "", session_id, exc,
             )
-            return False
+            # On DB failure, still hand back the cleaned blocks: the stream should
+            # show the same (cleaned) bytes even if the row did not persist.
+            return blocks_to_persist
 
     def get_unit(self, session_id: str) -> Optional[SessionUnit]:
         """Look up a SessionUnit by session_id."""
@@ -3499,7 +3543,10 @@ class SessionRouter:
                 # collide with the user placeholder in MessageStore._applyMerge,
                 # leaving the assistant placeholder unmatched → duplicate bubble.
                 if event.get("type") == "assistant" and event.get("content"):
-                    await self._persist_assistant_blocks(
+                    # Write the cleaned blocks back to event['content'] so the
+                    # yielded stream carries the SAME bytes persisted to the DB
+                    # (bug 2d — no UI≠DB fork).
+                    event["content"] = await self._persist_assistant_blocks(
                         session_id, event["content"], event.get("model"),
                         client_id=f"{client_id}-asst" if client_id else None,
                     )
@@ -3744,7 +3791,8 @@ class SessionRouter:
 
         async for event in unit.continue_with_answer(answer, tool_use_id=tool_use_id):
             if event.get("type") == "assistant" and event.get("content"):
-                await self._persist_assistant_blocks(
+                # Write cleaned blocks back → stream == DB bytes (bug 2d).
+                event["content"] = await self._persist_assistant_blocks(
                     session_id, event["content"], event.get("model"),
                     label="answer",
                     # Reuse the originating turn's client_id (stashed by
@@ -3774,7 +3822,8 @@ class SessionRouter:
 
         async for event in unit.continue_with_permission(request_id, allowed):
             if event.get("type") == "assistant" and event.get("content"):
-                await self._persist_assistant_blocks(
+                # Write cleaned blocks back → stream == DB bytes (bug 2d).
+                event["content"] = await self._persist_assistant_blocks(
                     session_id, event["content"], event.get("model"),
                     label="permission",
                     # Reuse the originating turn's client_id (stashed by

@@ -452,8 +452,26 @@ def _is_retriable_error(raw_error: str, tb_str: str = "") -> bool:
 #
 # The regex has no nested quantifiers (``[^"]+`` is bounded by ``"``; ``\s*`` is
 # bounded by literals) → no catastrophic backtracking.
-_TOOL_CALL_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
-_TOOL_CALL_INLINE_CODE_RE = re.compile(r"`[^`]*`")
+#
+# SINGLE-PASS mask (bug 2a fix, run_719886ee): fence and inline-code masking MUST
+# run as ONE alternation, fence branch FIRST, never two sequential ``.sub()`` calls.
+# Two passes corrupt text: the fence pass substitutes ``\x00N\x00`` sentinels, then
+# the inline pass runs ``[^`]*`` over text that now contains ``\x00`` — a lone
+# backtick in the remaining prose pairs ACROSS a sentinel, so the inline match
+# straddles (and destroys) a masked fence span → the fence is not restored and a
+# raw ``\x00`` leaks out (observed: ```` ```python…``` ```` → ``\x000\x00``). A single
+# alternation with the fence alternative first means the greedy ```` ``` ```` block is
+# matched and masked atomically before any inline ``` ` ``` can see it, and the already
+# emitted sentinels are literal text the regex engine never re-enters.
+#
+# The inline branch is ``[^`\n]*`` (NO newline): markdown inline code is
+# single-line, and forbidding newlines stops a LONE backtick in prose (e.g. the
+# apostrophe-like ``Don`t``) from pairing with a backtick on a LATER line — in
+# particular the opening backtick of a fenced block — which would otherwise mask
+# (and destroy) everything in between, INCLUDING a raw leak sitting on that line.
+# (``.*?`` on the fence branch still crosses newlines via DOTALL; only the inline
+# branch is newline-bounded.)
+_TOOL_CALL_CODE_SPAN_RE = re.compile(r"```.*?```|`[^`\n]*`", re.DOTALL)
 # Case-SENSITIVE on purpose: the harness emits lowercase <invoke>/<parameter>
 # literally. Prose discussing it may use other casing; matching only the exact
 # harness casing further narrows the false-positive surface. (\s spans the
@@ -514,8 +532,9 @@ def _mask_doc_contexts(text: str) -> tuple[str, list[str]]:
         spans.append(m.group(0))
         return f"{_MASK_OPEN}{len(spans) - 1}{_MASK_CLOSE}"
 
-    masked = _TOOL_CALL_FENCE_RE.sub(_stash, text)
-    masked = _TOOL_CALL_INLINE_CODE_RE.sub(_stash, masked)
+    # Single alternation pass (fence branch first) — see _TOOL_CALL_CODE_SPAN_RE.
+    # NEVER split this back into two sequential .sub() calls (bug 2a).
+    masked = _TOOL_CALL_CODE_SPAN_RE.sub(_stash, text)
     return masked, spans
 
 
