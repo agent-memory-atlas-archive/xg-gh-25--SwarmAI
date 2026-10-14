@@ -219,6 +219,61 @@ def _compute_untrackable_source(
 # ONLY when a new earlier-set, gate-read field is proven.
 _CARRY_FORWARD_FIELDS = frozenset({"artifact_id", "adversarial_review", "lessons"})
 
+# §9 "no lessons" placeholder — the string cmd_run_report emits when the reflect
+# record carries no lessons. It is RENDERER-ONLY: the B-copy gate
+# (_report_section9_is_degenerate) does NOT match this literal — it decides
+# degeneracy STRUCTURALLY (no "- " lesson bullet in the §9 slice), which is robust
+# even if this string drifts and also covers the other degenerate form
+# (**⏭ Skipped**). So this constant is a single home for the renderer's text, not a
+# shared predicate↔renderer contract. The real coupling that keeps the gate correct
+# is the "- "-bullet convention: the renderer emits every real lesson as "- {item}"
+# and ONLY real lessons as bullets — asserted by the renderer-agreement test. (run_7c30c517)
+_NO_LESSONS_PLACEHOLDER = "(REFLECT stage did not record lessons for this run)"
+
+
+def _report_section9_is_degenerate(report_md: str) -> bool:
+    """Is the §9 Lessons section of a projected REPORT.md DEGENERATE (carries no real
+    REFLECT lessons)?  This is the STRUCTURAL gate that turns the DELIVER ordering
+    invariant (seed-lessons → run-report → run-commit) from agent-discipline PROSE
+    into CODE: if a run calls run-commit BEFORE lessons are seeded, A/REPORT.md's §9
+    is degenerate and would be frozen verbatim into the git-committed deliverable B —
+    permanent A/B drift the completion gate (which inspects only ledger A) never sees.
+
+    §9 is produced by cmd_run_report with exactly one SUBSTANTIVE shape — one or more
+    ``- <lesson>`` bullet lines — and two DEGENERATE shapes:
+      • ``_NO_LESSONS_PLACEHOLDER``          (reflect record present but empty)
+      • ``**⏭ Skipped** — <reason>``         (reflect record ABSENT — the DEFAULT at a
+                                              pre-REFLECT run-commit)
+    Rather than match those two brittle literals (a third future form would slip, and
+    ``**⏭ Skipped**`` ALSO renders in §3/§8 so a whole-document match false-positives),
+    the test is structural: SLICE the §9 section (from the ``## 9. Lessons`` line to the
+    next ``## `` header) and return True iff that slice contains NO line beginning with
+    ``- `` (a lesson bullet). This covers both known degenerate forms (and any future
+    one) and is immune to ``⏭ Skipped`` in sibling sections because it inspects only §9.
+
+    Reads the RENDERED text, which is truthiness-consistent with cmd_run_report's
+    ``lessons_items`` by construction, so predicate and renderer cannot drift.
+    Returns True (degenerate) also when §9 is entirely absent — a report with no §9 is
+    not a report whose lessons we can trust. (run_7c30c517)
+    """
+    lines = report_md.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip() == "## 9. Lessons":
+            start = i
+            break
+    if start is None:
+        return True  # no §9 at all → cannot trust its lessons → degenerate
+    # Slice §9 body: from the line after the header to the next '## ' header (or EOF).
+    body = []
+    for line in lines[start + 1:]:
+        if line.startswith("## "):
+            break
+        body.append(line)
+    # SUBSTANTIVE iff at least one real lesson bullet ('- ' prefix) is present.
+    has_lesson_bullet = any(ln.startswith("- ") for ln in body)
+    return not has_lesson_bullet
+
 
 def _get_workspace() -> Path:
     """Resolve workspace root from environment or default."""
@@ -3103,11 +3158,15 @@ def _generate_review_deliverable(
     in git), so a cross-machine reviewer could never resolve it (R30#7 — a published
     identifier the reader cannot follow). One projected REPORT.md, nothing else.
 
-    GATE: B generates iff A has a terminal ``REPORT.md`` on disk — which IS satisfied
-    at run-commit time, because deliver.md generates the FINAL REPORT.md (its "Pipeline
-    Report" step, which extracts this run's lessons into the reflect stage record THEN
-    calls run-report so A already carries §9) BEFORE run-commit runs. No REPORT.md →
-    nothing to copy → generate nothing (defensive no-op). Ledger A remains the audit root.
+    GATE (TWO conditions — run_7c30c517): B generates iff A has a terminal ``REPORT.md``
+    on disk AND that report's §9 Lessons is SUBSTANTIVE (not a degenerate placeholder).
+    Both ARE satisfied at run-commit time when deliver.md's "Pipeline Report" step ran in
+    order (extract lessons into the reflect record → run-report so A carries a real §9 →
+    run-commit). If the ordering was violated (run-commit before lessons seeded), the §9
+    is degenerate and the second condition STRUCTURALLY skips B + warns — this is the code
+    enforcement of what used to be agent-discipline prose. No REPORT.md → nothing to copy →
+    generate nothing + WARN; degenerate §9 → skip B + WARN. Ledger A remains the audit root
+    (B is best-effort; a skip never blocks the code commit).
 
     Returns ``(created_paths, warnings)``. ``created_paths`` are ABSOLUTE paths the
     caller STAGES by extending ``by_repo[target_root]`` so the EXISTING per-repo
@@ -3139,11 +3198,12 @@ def _generate_review_deliverable(
     # report exists when this function is called. (run_44a06138 is the known-good
     # proof: its B is a verbatim copy of A's terminal REPORT.md, incl. §9 Lessons.)
     # No REPORT.md → nothing to copy → generate NOTHING, but WARN LOUDLY (not a
-    # silent no-op). The ordering that makes this gate pass — deliver.md's "Pipeline
-    # Report" step generating REPORT.md BEFORE run-commit — is agent-discipline prose,
-    # not a programmatic precondition; if a future run ever commits before the report
-    # exists, B would silently never generate (the exact "B never generates" bug this
-    # revert exists to prevent). A loud warning makes that ordering violation VISIBLE
+    # silent no-op). This is the FILE-EXISTENCE half of the ordering gate; the §9-
+    # SUBSTANTIVE half is enforced programmatically below (_report_section9_is_degenerate,
+    # run_7c30c517) — together they make the deliver.md ordering (seed lessons →
+    # run-report → run-commit) code-enforced, not agent-discipline prose. If a future
+    # run commits before the report exists, this warns; if it commits before §9 is
+    # seeded, the degenerate-§9 check below warns — either ordering violation is VISIBLE
     # in run-commit's WARN channel instead of invisible. The §4.6 需求溯源审计 section a
     # reviewer needs is ALREADY baked INTO that terminal REPORT.md by cmd_run_report —
     # so copying the report carries the provenance in a SINGLE file (no separate
@@ -3201,9 +3261,29 @@ def _generate_review_deliverable(
     #     into the daemon WORKSPACE (not in git), so a cross-machine reviewer could never
     #     resolve it — a published identifier the reader cannot follow (R30#7).
     try:
-        (dest / "REPORT.md").write_text(
-            report_src.read_text(encoding="utf-8"), encoding="utf-8"
-        )
+        report_content = report_src.read_text(encoding="utf-8")
+        # STRUCTURAL ORDERING GATE (run_7c30c517): refuse to freeze a DEGENERATE §9
+        # (no real REFLECT lessons) into the git-committed deliverable B. This turns
+        # the DELIVER ordering invariant (seed-lessons → run-report → run-commit) from
+        # agent-discipline PROSE into CODE — the completion gate inspects only ledger A
+        # (unconditionally re-rendered + reflect-lessons-substantive-checked), so A ends
+        # correct, but if run-commit ran BEFORE lessons were seeded, B would freeze A's
+        # placeholder §9 forever, undetected (permanent A/B drift). warn-skip, NOT a hard
+        # BLOCK: B is best-effort (ledger A is the durable truth), and run-commit commits
+        # SOURCE CODE + B together — a hard block would connect-block a legitimate code
+        # commit (O030: 容灾 escalated to a hard gate). So: skip B + WARN loudly (same
+        # channel as the no-REPORT guard above); fix the ordering + re-run run-commit.
+        if _report_section9_is_degenerate(report_content):
+            return [], [
+                f"deliverable B skipped: ledger A's REPORT.md §9 Lessons is a DEGENERATE "
+                f"placeholder (no real reflect lessons) at run-commit time — freezing it "
+                f"into git-committed B would be permanent A/B drift the completion gate "
+                f"cannot see. The DELIVER ordering (seed lessons into the reflect record "
+                f"→ run-report → run-commit) was violated: run-commit ran before §9 was "
+                f"populated. Seed the lessons, re-run run-report, then re-run run-commit "
+                f"to produce a correct review deliverable."
+            ]
+        (dest / "REPORT.md").write_text(report_content, encoding="utf-8")
         created.append(str(dest / "REPORT.md"))
     except (OSError, UnicodeDecodeError) as e:
         # B is best-effort (ledger A is the durable truth) — a read/write/decode
@@ -5175,7 +5255,7 @@ A stage with no published artifact cannot be timed and shows `-`."""
     elif "reflect" in skipped_stages:
         lessons_section += f"**⏭ Skipped** — {skipped_stages['reflect']}\n"
     else:
-        lessons_section += "(REFLECT stage did not record lessons for this run)\n"
+        lessons_section += f"{_NO_LESSONS_PLACEHOLDER}\n"
     sections.append(lessons_section)
 
     # 10. Known Gaps

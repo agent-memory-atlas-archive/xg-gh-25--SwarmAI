@@ -776,7 +776,11 @@ class TestReviewDeliverableCheckin:
             files_touched=[str(repo / "f.py")],
         )
         # deliver.md generates REPORT.md before run-commit → land one for the copy-gate.
-        (run_file.parent / "REPORT.md").write_text("# Report\n## 需求溯源审计\nFR-1\n")
+        # Must carry a SUBSTANTIVE §9 (a real cmd_run_report projection always does) or
+        # the §9-degenerate B-copy gate (run_7c30c517) correctly skips B — orthogonal to
+        # this test's point (type-less manifest irrelevant to B).
+        (run_file.parent / "REPORT.md").write_text(
+            "# Report\n## 需求溯源审计\nFR-1\n## 9. Lessons\n- [note] projected §9\n")
         _run_commit(workspace, run_id)
         capsys.readouterr()
         bdir = repo / ".aidlc" / "deliverables" / run_id

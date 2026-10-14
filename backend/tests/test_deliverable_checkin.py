@@ -36,8 +36,15 @@ def workspace(tmp_path):
     return tmp_path
 
 
-def _write_run_with_report(workspace, run_id, files_touched, *, report="# Report\n## Intent → Requirement 溯源\nFR-1\n",
+def _write_run_with_report(workspace, run_id, files_touched,
+                           *, report=("# Report\n## Intent → Requirement 溯源\nFR-1\n"
+                                      "## 9. Lessons\n- [note] a real projected report always carries §9\n"),
                            eval_artifact=None, requirements="default"):
+    # Default report carries a SUBSTANTIVE §9 (a '- ' lesson bullet) because a real
+    # cmd_run_report projection ALWAYS renders §9 — the §9-degenerate B-copy gate
+    # (run_7c30c517) would otherwise correctly skip B for a stub report missing §9,
+    # which is not what tests of OTHER contracts (sealed-only, content-safety) mean to
+    # exercise. Degeneracy is tested explicitly in TestSection9DegenerateGate.
     """Write a run with a terminal REPORT.md on disk (ledger A). Since B's content
     契约 is now the EVALUATE requirements[] (NOT the REPORT.md), B generation needs a
     RESOLVABLE evaluate artifact — so by default this also lands a real evaluate
@@ -275,6 +282,113 @@ class TestReportIsLedgerProjectionNotPlaceholder:
         assert "f.py" in head, "code commit must still proceed when B is skipped"
 
 
+class TestSection9DegenerateGate:
+    """run_7c30c517 — the structural gate that turns the DELIVER ordering invariant
+    (seed-lessons → run-report → run-commit) from agent-discipline PROSE into CODE.
+
+    The gap: B is copied from A/REPORT.md verbatim at run-commit. If a run calls
+    run-commit BEFORE seeding lessons, A's §9 is DEGENERATE (no real lesson bullets)
+    and B freezes it; the completion gate inspects only ledger A, never B → permanent
+    A/B drift undetected. §9 has TWO degenerate forms, both must be caught:
+      • 5178: '(REFLECT stage did not record lessons for this run)' — reflect empty
+      • 5176: '**⏭ Skipped** — …'                                  — reflect ABSENT (the
+        DEFAULT at a pre-REFLECT run-commit — Gate-1 caught v1 missing this one)
+    The check is §9-SLICE-scoped (not a whole-doc literal match), so §3/§8 '⏭ Skipped'
+    cannot false-positive, and a real lesson bullet in §9 passes."""
+
+    _DEGEN_5178 = (
+        "# Report\n## 需求溯源审计\nFR-1\n"
+        "## 9. Lessons\n(REFLECT stage did not record lessons for this run)\n"
+        "## 10. Known Gaps & Attention Flags\nNone identified.\n"
+    )
+    _DEGEN_5176 = (
+        "# Report\n## 需求溯源审计\nFR-1\n"
+        "## 9. Lessons\n**⏭ Skipped** — Not executed — pipeline completed before REFLECT\n"
+        "## 10. Known Gaps & Attention Flags\nNone identified.\n"
+    )
+    # Real §9 lessons, BUT §3/§8 legitimately carry '⏭ Skipped' — the whole-doc-match
+    # false-positive trap. §9-slice-scoping must let this through.
+    _REAL_WITH_SKIPPED_SIBLINGS = (
+        "# Report\n"
+        "## 3. Methodology\n**⏭ Skipped** — profile 'bugfix' uses direct fix path\n"
+        "## 8. Files Changed\n**⏭ Skipped** — profile omits build\n"
+        "## 9. Lessons\n- [pitfall] a real durable lesson that earns its place in §9\n"
+        "## 10. Known Gaps & Attention Flags\nNone identified.\n"
+    )
+
+    def test_degenerate_5178_no_lessons_skips_B_and_warns(self, workspace, tmp_path):
+        """§9 = the empty-reflect placeholder (5178) → B is NOT written + a LOUD
+        ordering warning is returned (the exact A/B drift this gate prevents)."""
+        from scripts.artifact_cli import _generate_review_deliverable
+        from unittest.mock import patch
+        repo = _src_repo(tmp_path, "degen5178")
+        _write_run_with_report(workspace, "run_d78", [str(repo / "f.py")],
+                               report=self._DEGEN_5178)
+        with patch("scripts.artifact_cli._get_workspace", return_value=workspace):
+            created, warnings = _generate_review_deliverable("TestProject", "run_d78", str(repo))
+        assert created == [], f"degenerate §9 → no B; got {created}"
+        assert not (repo / ".aidlc" / "deliverables" / "run_d78" / "REPORT.md").exists(), \
+            "a §9-placeholder REPORT.md must NEVER be written into git-committed B"
+        assert warnings and any("§9" in w or "lessons" in w.lower() for w in warnings), \
+            f"degenerate §9 must WARN loudly (ordering violation), got {warnings}"
+
+    def test_degenerate_5176_skipped_reflect_skips_B_and_warns(self, workspace, tmp_path):
+        """§9 = the reflect-SKIPPED form (5176) — the DEFAULT at a pre-REFLECT
+        run-commit, which v1 missed. Must ALSO skip B + warn."""
+        from scripts.artifact_cli import _generate_review_deliverable
+        from unittest.mock import patch
+        repo = _src_repo(tmp_path, "degen5176")
+        _write_run_with_report(workspace, "run_d76", [str(repo / "f.py")],
+                               report=self._DEGEN_5176)
+        with patch("scripts.artifact_cli._get_workspace", return_value=workspace):
+            created, warnings = _generate_review_deliverable("TestProject", "run_d76", str(repo))
+        assert created == [], f"skipped-reflect §9 → no B; got {created}"
+        assert warnings and any("§9" in w or "lessons" in w.lower() for w in warnings), \
+            f"skipped-reflect §9 must WARN loudly, got {warnings}"
+
+    def test_real_lessons_with_skipped_siblings_generates_B_no_false_positive(self, workspace, tmp_path):
+        """§9 carries a REAL lesson bullet while §3/§8 legitimately show '⏭ Skipped'
+        → B generates normally, NO ordering warning. Proves the check is §9-slice-
+        scoped, not a whole-document '⏭ Skipped' match (the false-positive trap)."""
+        from scripts.artifact_cli import _generate_review_deliverable
+        from unittest.mock import patch
+        repo = _src_repo(tmp_path, "realskip")
+        _write_run_with_report(workspace, "run_rsk", [str(repo / "f.py")],
+                               report=self._REAL_WITH_SKIPPED_SIBLINGS)
+        with patch("scripts.artifact_cli._get_workspace", return_value=workspace):
+            created, warnings = _generate_review_deliverable("TestProject", "run_rsk", str(repo))
+        assert created, f"real §9 lessons → B must generate even with §3/§8 skipped; got {warnings}"
+        body = Path(next(c for c in created if Path(c).name == "REPORT.md")).read_text()
+        assert "a real durable lesson" in body, "B must carry the real §9 lessons"
+        assert not any("§9" in w or "lesson" in w.lower() for w in warnings), \
+            f"a §9 WITH real lessons must NOT trigger the ordering warning, got {warnings}"
+
+    def test_predicate_calls_both_degenerate_forms_degenerate(self):
+        """AC3: the predicate catches BOTH degenerate §9 forms (empty-reflect 5178 +
+        reflect-skipped 5176) and passes a real-lessons §9 — regardless of §3/§8 skips."""
+        from scripts.artifact_cli import _report_section9_is_degenerate
+        assert _report_section9_is_degenerate(self._DEGEN_5178) is True
+        assert _report_section9_is_degenerate(self._DEGEN_5176) is True
+        assert _report_section9_is_degenerate(self._REAL_WITH_SKIPPED_SIBLINGS) is False
+
+    def test_degenerate_fixture_uses_renderer_constant_not_a_hardcoded_copy(self):
+        """AC3 anti-drift: the empty-§9 degenerate case is built from the renderer's OWN
+        constant `_NO_LESSONS_PLACEHOLDER` (not a hardcoded second copy of the string),
+        and the predicate STILL calls it degenerate. This is the honest form of the
+        'single source' claim: the renderer owns the string (one constant); the gate is
+        STRUCTURAL ('- '-bullet convention) so it catches degeneracy even if that string
+        drifts. If someone changes the renderer's placeholder, this test's fixture changes
+        with it and the structural predicate still fires — no silent drift (Gate-2 MED)."""
+        from scripts.artifact_cli import _report_section9_is_degenerate, _NO_LESSONS_PLACEHOLDER
+        report = f"# Report\n## 9. Lessons\n{_NO_LESSONS_PLACEHOLDER}\n## 10. Known Gaps\nNone.\n"
+        assert _report_section9_is_degenerate(report) is True, \
+            "a §9 carrying ONLY the renderer's no-lessons placeholder must be degenerate"
+        # And the renderer's placeholder is NOT itself a '- ' bullet (else the structural
+        # gate would false-pass it) — the convention the gate relies on.
+        assert not _NO_LESSONS_PLACEHOLDER.startswith("- "), \
+            "the no-lessons placeholder must not look like a real lesson bullet"
+
+
 class TestBoundary2NonGit:
     """边界②: a non-git project (STEERING #5: only SwarmAI DDD is in git) → the run's
     files resolve to NO git repo → B is NOT generated (deliver via ledger A), and the
@@ -374,7 +488,8 @@ class TestContentSafetyScan:
         _write_run_with_report(
             workspace, "run_sens", [str(repo / "f.py")],
             report=('# Report\n## 需求溯源审计\n### 原始意图\n'
-                    '> add retry; user pasted token = "hunter2secret" by mistake\n'),
+                    '> add retry; user pasted token = "hunter2secret" by mistake\n'
+                    '## 9. Lessons\n- [note] substantive §9 so the B-copy gate lets B through\n'),
         )
         with patch("scripts.artifact_cli._get_workspace", return_value=workspace):
             created, warnings = _generate_review_deliverable("TestProject", "run_sens", str(repo))
