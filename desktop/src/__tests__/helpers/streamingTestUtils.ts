@@ -78,7 +78,6 @@ export function initTestTab(tabId: string, initialMessages?: Message[]): void {
     hasReceivedData: false,
     attachments: [],
     compactionGuard: null,
-    compactionNotice: null,
     streamState: { ...INITIAL_STATE },
   });
   testActiveTabIdRef.current = tabId;

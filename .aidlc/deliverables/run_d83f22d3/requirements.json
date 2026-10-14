@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "requirements": [
+    {
+      "id": "FR-1",
+      "statement": "Render context_compacted as a persistent in-stream system message (via MessageStore single-writer), replacing the transient toast —留痕、可回看、不自动消失.",
+      "work_class": "user-story",
+      "source": {
+        "kind": "user-stated",
+        "ref": "XG: '我们不能用toast, 我们直接 streaming response ... 做完后显示 Conversation above has been summarized... 因为我们是针对当前session 做的 你不能用toast'"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "a context_compacted SSE event arrives for the active tab",
+          "when": "the handler processes it",
+          "then": "a role=system message with COMPACT_NOTICE_TEXT is appended to that tab's MessageStore and stays in the stream (no auto-dismiss)"
+        }
+      ]
+    },
+    {
+      "id": "FR-2",
+      "statement": "Background-tab compaction is deferred to the originating tab's stream (not toast, not shared scalar slot), appearing correctly on switch-back.",
+      "work_class": "task",
+      "source": {
+        "kind": "ddd-derived",
+        "ref": "existing per-tab isolation + MessageStore single-writer architecture (SELF/MEMORY); mirrors ChatPage restore pattern used today for background compactionNotice"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "a context_compacted event for a non-active tab",
+          "when": "user switches back to that tab",
+          "then": "the persistent compaction message is present in that tab's stream exactly once"
+        }
+      ]
+    },
+    {
+      "id": "FR-3",
+      "statement": "Dedup adjacent duplicate compaction notices (guard like resume-boundary's alreadyHasBoundary).",
+      "work_class": "task",
+      "source": {
+        "kind": "ddd-derived",
+        "ref": "resume-boundary dedup precedent useChatStreamingLifecycle.ts:3566 — multiple compactions could otherwise stack"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "two context_compacted events with no message between them",
+          "when": "both processed",
+          "then": "only one compaction system message is appended"
+        }
+      ]
+    },
+    {
+      "id": "NFR-1",
+      "statement": "Preserve the existing context_warning-clearing side effect on compact; keep MessageStore single-writer + per-tab isolation; no last-write-wins race.",
+      "work_class": "enabler-story",
+      "source": {
+        "kind": "ddd-derived",
+        "ref": "the toast used addToast precisely to avoid a shared React slot race (useChatStreamingLifecycle.ts:3640-3645 comment); the replacement must preserve that no-shared-slot property by writing to the store"
+      },
+      "status": "confirmed",
+      "acceptance": [
+        {
+          "given": "the new in-stream path",
+          "when": "events interleave across tabs",
+          "then": "each notice lands in its own tab's store, context_warning is cleared, no cross-tab bleed"
+        }
+      ]
+    }
+  ],
+  "clarifications": [
+    {
+      "qid": "Q1",
+      "question": "持久化范围:只 session 内留痕(store append,刷新/冷启动后消失),还是也要后端 DB 持久化(冷启动重载后仍可见,像 resume_boundary)?",
+      "options": [
+        "A. session-scoped frontend-only (store append, no DB row) — 像 refresh- 分隔线",
+        "B. backend-persisted DB row — 像 resume_boundary,冷启动后仍在",
+        "X. Other"
+      ],
+      "answer": "A. session-scoped frontend-only (store append, no DB row)",
+      "answered_by": "self",
+      "resolution": "XG said '针对当前 session 做的' — compaction 是当前 session 的上下文事件,session-scoped 留痕即满足'做完后在对话流里显示、可回看'的诉求。后端 compaction 本就不持久化(session_unit.py 只发 SSE),加 DB 持久化是更大改动(backend+migration+reconcile survival)且 XG 未要求。先做 A(THINK 会复核);若后续要冷启动可见再加 B。"
+    }
+  ]
+}

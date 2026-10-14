@@ -427,11 +427,14 @@ function TabViewImpl({
   );
 
   // Last resume boundary index — messages before this render dimmed (prior
-  // session). Only TRUE resume boundaries (id NOT starting with 'refresh-')
-  // trigger dimming; refresh separators are same-session context refreshes.
+  // session). Only TRUE resume boundaries trigger dimming; same-session
+  // separators do NOT dim prior context. Excluded prefixes: 'refresh-'
+  // (context refresh) and 'compact-' (autocompact notice — a current-session
+  // event, not a session boundary, so prior messages stay un-dimmed).
   const lastResumeBoundaryIdx = useMemo(
     () => messages.reduce((lastIdx, m, i) =>
-      m.role === 'system' && !m.id.startsWith('refresh-') ? i : lastIdx, -1),
+      m.role === 'system' && !m.id.startsWith('refresh-') && !m.id.startsWith('compact-')
+        ? i : lastIdx, -1),
     [messages],
   );
 
@@ -494,8 +497,30 @@ function TabViewImpl({
               />
             );
           }
-          // System messages (resume/refresh boundary) render as divider lines
+          // System messages render as divider lines. Three variants by id prefix:
+          //   'compact-' → autocompact notice: shows the full backend notice TEXT
+          //                (context was summarized) as a persistent, reviewable
+          //                in-stream marker — NOT a one-line label (XG 2026-10-14).
+          //   'refresh-' → 'Context Refreshed' (same-session context refresh)
+          //   else       → 'Session Resumed' (true resume boundary)
           if (msg.role === 'system') {
+            const isCompact = msg.id.startsWith('compact-');
+            if (isCompact) {
+              const textBlock = msg.content.find(b => b.type === 'text');
+              const noticeText = textBlock && 'text' in textBlock
+                ? textBlock.text
+                : 'Conversation above has been summarized';
+              return (
+                <div key={msg.id} className="flex items-start gap-3 py-3 px-4 select-none">
+                  <div className="flex-1 h-px bg-[var(--color-border)] mt-2" />
+                  <span className="text-xs text-[var(--color-text-muted)] max-w-md flex items-start gap-1.5 text-center">
+                    <span className="material-symbols-outlined" style={{ fontSize: '14px', marginTop: '1px' }}>compress</span>
+                    <span className="whitespace-pre-wrap text-left">{noticeText}</span>
+                  </span>
+                  <div className="flex-1 h-px bg-[var(--color-border)] mt-2" />
+                </div>
+              );
+            }
             const isRefresh = msg.id.startsWith('refresh-');
             const label = isRefresh ? 'Context Refreshed' : 'Session Resumed';
             return (

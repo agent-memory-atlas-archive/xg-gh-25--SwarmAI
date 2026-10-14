@@ -3860,19 +3860,26 @@ describe('TabStatusIndicator component', () => {
 
   // -------------------------------------------------------------------------
   // context_compacted — CLI-native autocompact user-visible notice.
-  // The compact notice is a one-shot TOAST (fire-and-forget EVENT), emitted
-  // DIRECTLY via addToast at the event site — NOT routed through a shared React
-  // state slot. ACTIVE tab → addToast now; BACKGROUND tab → defer via the per-tab
-  // tabState.compactionNotice slice (ChatPage restore emits on switch-back). This
-  // eliminates the shared-slot last-write-wins race (the single React slot that two
-  // writers fed is gone).
+  // The compact notice is a PERSISTENT in-stream system message (role=system,
+  // id prefix 'compact-'), appended to the ORIGINATING tab's MessageStore via
+  // the single-writer append() — NOT a transient toast, NOT a shared React slot.
+  // It stays in the conversation stream (reviewable later) and does not
+  // auto-dismiss. Same path for active + background tab (the message is already
+  // in that tab's store when the user switches back). XG directive 2026-10-14:
+  // "不能用toast ... 针对当前session 做的" → in-stream留痕, not a 5s toast.
   // -------------------------------------------------------------------------
-  describe('context_compacted compaction notice (direct addToast)', () => {
+  const COMPACT_MSG = 'Conversation above has been summarized\nThe conversation reached the agent context limit.';
+  const lastMsg = (tabId: string) => {
+    const msgs = messageStoreRegistry.getOrCreate(tabId).getSnapshot();
+    return msgs[msgs.length - 1];
+  };
+
+  describe('context_compacted compaction notice (in-stream persistent system message)', () => {
     beforeEach(() => {
       mockAddToast.mockClear();
     });
 
-    it('ACTIVE tab: emits the toast directly via addToast (no shared React state)', () => {
+    it('AC1/AC2 ACTIVE tab: appends a persistent compact- system message to the store (NOT a toast)', () => {
       const msgId = 'msg-compact';
       const { result } = renderHook(() =>
         useChatStreamingLifecycle(createMockDeps()),
@@ -3880,9 +3887,8 @@ describe('TabStatusIndicator component', () => {
       act(() => {
         initTestTab('tab-compact');
         result.current.setIsStreaming(true);
-        result.current.setMessages([
-          makeMessage({ id: msgId, role: 'assistant', content: [] }),
-        ]);
+        messageStoreRegistry.getOrCreate('tab-compact', { sessionId: 'sess-compact' })
+          .replace([makeMessage({ id: msgId, role: 'assistant', content: [] })]);
       });
       const handler = result.current.createStreamHandler(msgId, 'tab-compact');
       act(() => {
@@ -3890,15 +3896,18 @@ describe('TabStatusIndicator component', () => {
           type: 'context_compacted',
           sessionId: 'sess-compact',
           trigger: 'auto',
-          message: 'Conversation above has been summarized\nThe conversation…',
+          message: COMPACT_MSG,
         });
       });
-      // Toast emitted directly — once — with the event's message, info severity.
-      expect(mockAddToast).toHaveBeenCalledTimes(1);
-      const payload = mockAddToast.mock.calls[0][0];
-      expect(payload.severity).toBe('info');
-      expect(payload.message).toContain('summarized');
-      expect(payload.autoDismiss).toBe(true);
+      // NOT a toast — this is the whole point of the change.
+      expect(mockAddToast).not.toHaveBeenCalled();
+      // A persistent system message is appended to the tab's own store.
+      const last = lastMsg('tab-compact');
+      expect(last.role).toBe('system');
+      expect(last.id.startsWith('compact-')).toBe(true);
+      // Content is the backend event.message, verbatim.
+      const textBlock = last.content.find((b) => b.type === 'text') as { text: string } | undefined;
+      expect(textBlock?.text).toBe(COMPACT_MSG);
     });
 
     it('still clears an existing contextWarning on context_compacted (post-compact pct resets)', () => {
@@ -3915,9 +3924,8 @@ describe('TabStatusIndicator component', () => {
           tokensEst: 950000,
           message: 'Context 95% full',
         });
-        result.current.setMessages([
-          makeMessage({ id: msgId, role: 'assistant', content: [] }),
-        ]);
+        messageStoreRegistry.getOrCreate('tab-compact2', { sessionId: 'sess-compact2' })
+          .replace([makeMessage({ id: msgId, role: 'assistant', content: [] })]);
       });
       const handler = result.current.createStreamHandler(msgId, 'tab-compact2');
       act(() => {
@@ -3925,16 +3933,17 @@ describe('TabStatusIndicator component', () => {
           type: 'context_compacted',
           sessionId: 'sess-compact2',
           trigger: 'auto',
-          message: 'summarized',
+          message: COMPACT_MSG,
         });
       });
       // Existing behavior preserved: the warning banner clears after compaction.
       expect(result.current.contextWarning).toBeNull();
-      // New behavior: the toast fired directly.
-      expect(mockAddToast).toHaveBeenCalledTimes(1);
+      // New behavior: the message is in-stream, not a toast.
+      expect(mockAddToast).not.toHaveBeenCalled();
+      expect(lastMsg('tab-compact2').role).toBe('system');
     });
 
-    it('BACKGROUND tab: does NOT emit now — defers to the per-tab slice for switch-back', () => {
+    it('AC3 BACKGROUND tab: appends to the ORIGINATING tab store, no toast, no cross-tab bleed', () => {
       const msgId = 'msg-bg-compact';
       const { result } = renderHook(() =>
         useChatStreamingLifecycle(createMockDeps()),
@@ -3942,59 +3951,54 @@ describe('TabStatusIndicator component', () => {
       act(() => {
         initTestTab('tab-bg-A');
         initTestTab('tab-bg-B'); // B becomes active (last init)
-        result.current.setMessages([
-          makeMessage({ id: msgId, role: 'assistant', content: [] }),
-        ]);
+        messageStoreRegistry.getOrCreate('tab-bg-A', { sessionId: 'sess-bg-A' })
+          .replace([makeMessage({ id: msgId, role: 'assistant', content: [] })]);
+        messageStoreRegistry.getOrCreate('tab-bg-B', { sessionId: 'sess-bg-B' })
+          .replace([makeMessage({ id: 'msg-b', role: 'assistant', content: [] })]);
       });
       // Stream handler bound to the BACKGROUND tab A while B is active.
       const handler = result.current.createStreamHandler(msgId, 'tab-bg-A');
       act(() => {
         handler({
           type: 'context_compacted',
-          sessionId: 'sess-bg',
+          sessionId: 'sess-bg-A',
           trigger: 'auto',
-          message: 'summarized',
+          message: COMPACT_MSG,
         });
       });
-      // Background tab: NO toast now (don't interrupt the user on another tab)...
+      // Background tab: NO toast (don't interrupt the user on another tab)...
       expect(mockAddToast).not.toHaveBeenCalled();
-      // ...but the notice IS persisted to tab A's slice for ChatPage to emit on switch-back.
-      const tabA = testTabMap.get('tab-bg-A');
-      expect(tabA?.compactionNotice).not.toBeNull();
-      expect(tabA?.compactionNotice?.message).toContain('summarized');
+      // ...the message lands in tab A's OWN store (already there on switch-back)...
+      const lastA = lastMsg('tab-bg-A');
+      expect(lastA.role).toBe('system');
+      expect(lastA.id.startsWith('compact-')).toBe(true);
+      // ...and the ACTIVE tab B is untouched (per-tab isolation, no bleed).
+      expect(lastMsg('tab-bg-B').id).toBe('msg-b');
     });
 
-    it('ACTIVE tab: does NOT seed the per-tab slice (no latent re-fire on switch-back)', () => {
-      const msgId = 'msg-active-compact';
+    it('AC4 dedup: a second adjacent context_compacted does NOT append a duplicate', () => {
+      const msgId = 'msg-dedup';
       const { result } = renderHook(() =>
         useChatStreamingLifecycle(createMockDeps()),
       );
       act(() => {
-        initTestTab('tab-active'); // this is the active tab
-        result.current.setMessages([
-          makeMessage({ id: msgId, role: 'assistant', content: [] }),
-        ]);
+        initTestTab('tab-dedup');
+        result.current.setIsStreaming(true);
+        messageStoreRegistry.getOrCreate('tab-dedup', { sessionId: 'sess-dedup' })
+          .replace([makeMessage({ id: msgId, role: 'assistant', content: [] })]);
       });
-      const handler = result.current.createStreamHandler(msgId, 'tab-active');
+      const handler = result.current.createStreamHandler(msgId, 'tab-dedup');
       act(() => {
-        handler({
-          type: 'context_compacted',
-          sessionId: 'sess-active',
-          trigger: 'auto',
-          message: 'summarized',
-        });
+        handler({ type: 'context_compacted', sessionId: 'sess-dedup', trigger: 'auto', message: COMPACT_MSG });
+        handler({ type: 'context_compacted', sessionId: 'sess-dedup', trigger: 'auto', message: COMPACT_MSG });
       });
-      // Active tab emits directly; the per-tab slice stays null (only background seeds it),
-      // so there is no shared slot and no switch-back re-fire path.
-      expect(mockAddToast).toHaveBeenCalledTimes(1);
-      const tabActive = testTabMap.get('tab-active');
-      expect(tabActive?.compactionNotice ?? null).toBeNull();
+      const msgs = messageStoreRegistry.getOrCreate('tab-dedup').getSnapshot();
+      const compactCount = msgs.filter((m) => m.role === 'system' && m.id.startsWith('compact-')).length;
+      expect(compactCount).toBe(1);
     });
 
-    it('exposes NO compactionNotice React-state API (the shared slot is deleted — AC2/AC4)', () => {
-      // AC2/AC4: the shared React-state slot that two writers fed is gone. The hook
-      // must no longer expose compactionNotice / setCompactionNotice / clearCompactionNotice —
-      // their presence would mean a shared slot still exists (the race root).
+    it('AC6 exposes NO compactionNotice React-state API (no shared slot)', () => {
+      // No shared React-state slot — the message goes to the per-tab store.
       const { result } = renderHook(() =>
         useChatStreamingLifecycle(createMockDeps()),
       );

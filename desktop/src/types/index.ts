@@ -479,29 +479,14 @@ export interface CompactionGuardEvent {
   patternDescription?: string;
 }
 
-/**
- * One-shot "context was compacted" notice from the backend `context_compacted`
- * SSE event (CLI-native autocompact — approach A). The backend is the sole
- * judge (it owns the PreCompact flag); the frontend is a pure projection that
- * renders `message` once. Distinct from CompactionGuardEvent, which is the
- * amnesia-loop *detector* (a different trigger).
- */
-export interface CompactionNotice {
-  message: string;
-  trigger: 'auto' | 'manual';
-}
-
-/**
- * The toast payload for a compaction notice — a ONE-SHOT info toast emitted
- * directly via addToast at the event site (active tab) or on tab-switch restore
- * (background tab). No explicit id → ToastContext assigns a fresh UUID per call,
- * so distinct compactions stack rather than same-id-replacing. Single builder so
- * every emit site produces an identical payload (no drift). `severity`/`autoDismiss`
- * are literals so the return type matches ToastOptions without an import cycle.
- */
-export function compactionToastPayload(message: string) {
-  return { severity: 'info' as const, message, autoDismiss: true };
-}
+// NOTE: the `context_compacted` SSE event (CLI-native autocompact) is now rendered
+// as a PERSISTENT in-stream system message (role=system, id prefix 'compact-'),
+// appended to the per-tab MessageStore by useChatStreamingLifecycle and rendered as
+// an informational divider by TabView. The former transient-toast types
+// (`CompactionNotice` + `compactionToastPayload`) were removed 2026-10-14 — a 5s
+// auto-dismiss toast left no reviewable trace of a current-session state change
+// (XG: "不能用toast ... 针对当前session 做的"). `message` (COMPACT_NOTICE_TEXT) is a
+// fixed backend constant; the frontend is a pure projection of it.
 
 export interface StreamEvent {
   type: 'assistant' | 'tool_use' | 'tool_result' | 'result' | 'error' | 'reconnecting' | 'session_resuming' | 'ask_user_question' | 'session_start' | 'session_cleared' | 'cmd_permission_request' | 'cmd_permission_decision' | 'cmd_permission_acknowledged' | 'heartbeat' | 'agent_activity' | 'tool_invocation' | 'capability_activated' | 'sources_updated' | 'summary_updated' | 'context_warning' | 'context_compacted' | 'compaction_guard' | 'mcp_health_warning' | 'recovery_exhausted' | 'still_working' | (string & {});

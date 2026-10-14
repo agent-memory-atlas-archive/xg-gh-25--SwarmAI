@@ -46,9 +46,7 @@ import type {
   StreamEvent,
   SystemPromptMetadata,
   CompactionGuardEvent,
-  CompactionNotice,
 } from '../types';
-import { compactionToastPayload } from '../types';
 import type { PendingQuestion } from '../pages/chat/types';
 import { queuedMessageFromRetryPayload, retryPayloadHasAttachments, shouldResurfaceQuestion, computeDrainRetirement, shouldArmSpinnerFromBackend, forceClearStreamVerdict, healGraceExpiryVerdict, desyncConvergeVerdict, nextReconcileDelay, type HealGraceVerdict } from './streaming-guards';
 import { chatService } from '../services/chat';
@@ -961,8 +959,8 @@ export interface ChatStreamingLifecycle {
   /** Set the compaction guard display mirror (used by tab switch restore). */
   setCompactionGuard: React.Dispatch<React.SetStateAction<CompactionGuardEvent | null>>;
 
-  // (Compaction notice has no hook-level state — it is emitted directly via addToast
-  //  at the event site; the per-tab deferred pending lives on tabState.compactionNotice.)
+  // (Compaction notice has no hook-level state — it is appended as a persistent
+  //  system message to the per-tab MessageStore at the event site; no React slot.)
 
   // Hang detection — true when streaming but no real (non-heartbeat) SDK events for >60s
   /** True when the active stream has received only heartbeats for >60s. */
@@ -3621,9 +3619,17 @@ export function useChatStreamingLifecycle(
         // Context compacted — backend emits when the SDK compacts the context window
         // (either auto or manual trigger). Two effects:
         //   1. Clear the originating tab's stale context_warning (pct resets post-compact).
-        //   2. Surface a one-shot user-visible notice (CLI-native autocompact — approach A).
+        //   2. Append a PERSISTENT in-stream system message to the originating tab's
+        //      MessageStore (CLI-native autocompact — approach A). This is NOT a toast:
+        //      compaction is a state change ON THE CURRENT SESSION, so it must leave a
+        //      reviewable trace in the conversation (XG directive 2026-10-14: "不能用
+        //      toast ... 针对当前session 做的"). A 5s auto-dismiss toast disappeared before
+        //      the user could see it ("做没做、做完没有 都没有信息").
         //      The backend is the SOLE judge (it owns the PreCompact flag); this is a pure
         //      projection of event.message — no second source of truth, no front-end inference.
+        //      Mirrors the resume-boundary store-append path above (session-scoped: no DB
+        //      row — the message survives in-session reconcile via MessageStore._applyMerge
+        //      Pass 2, which preserves local-only synthetic system messages).
         else if (event.type === 'context_compacted') {
           const tabState = capturedTabId
             ? tabMapRef.current.get(capturedTabId)
@@ -3631,28 +3637,37 @@ export function useChatStreamingLifecycle(
           if (tabState) {
             tabState.contextWarning = null;
           }
-          const notice: CompactionNotice | null = event.message
-            ? {
-                message: event.message,
-                trigger: event.trigger === 'manual' ? 'manual' : 'auto',
-              }
-            : null;
-          // A compact notice is a ONE-SHOT toast (a fire-and-forget EVENT), NOT a
-          // persistent banner — so emit it DIRECTLY via addToast, never through a
-          // shared React-state slot (one slot fed by two writers + an async consumer
-          // was the last-write-wins race this design removed). ACTIVE tab → addToast
-          // now; BACKGROUND tab → defer via the per-tab slice (ChatPage's tab-switch
-          // restore emits it on switch-back). No shared slot = no race.
+          // Clear the active tab's warning banner mirror (pct resets post-compact).
           if (capturedTabId === null || capturedTabId === activeTabIdRef.current) {
             setContextWarning(null);
-            if (notice) {
-              addToast(compactionToastPayload(notice.message));
+          }
+          if (event.message && capturedTabId) {
+            // Append to the ORIGINATING tab's store — same for active AND background
+            // tab. A background-tab message is already in that tab's stream when the
+            // user switches back (no shared React slot, no restore-time re-emit, no
+            // last-write-wins race — the single-writer store IS the per-tab authority).
+            const compactStore = messageStoreRegistry.get(capturedTabId);
+            if (compactStore) {
+              // DEDUP: if the last message is already a compact boundary, skip —
+              // repeated/re-emitted compactions must not stack adjacent notices
+              // (mirrors the resume-boundary alreadyHasBoundary guard).
+              const existing = compactStore.messages;
+              const prev = existing[existing.length - 1];
+              const alreadyCompact =
+                prev?.role === 'system' && prev?.id?.startsWith('compact-');
+              if (!alreadyCompact) {
+                compactStore.append({
+                  // Suffix a random token so two same-millisecond compactions can
+                  // never collide to one id (which MessageStore would de-dup by id,
+                  // silently dropping the second) — matches the evolution-message
+                  // id scheme. The 'compact-' PREFIX is the contract TabView keys on.
+                  id: `compact-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                  role: 'system',
+                  content: [{ type: 'text', text: event.message }],
+                  timestamp: new Date().toISOString(),
+                } as Message);
+              }
             }
-          } else if (tabState && notice) {
-            // BACKGROUND tab: defer — persist to the originating tab's slice so the
-            // notice is not silently dropped. Only the background path seeds the slice
-            // (the active path emits immediately), so there is no latent re-fire trigger.
-            tabState.compactionNotice = notice;
           }
         }
         // Context window warning — backend emits context usage at all levels
