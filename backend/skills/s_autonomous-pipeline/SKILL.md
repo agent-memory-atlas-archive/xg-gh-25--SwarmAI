@@ -27,6 +27,10 @@ tier: lazy
 ---
 # Autonomous Pipeline
 
+![SwarmAI Autonomous Pipeline — one-page panorama (9 stages · 3 gates · 2 modes · 6 profiles · 16 review/adversarial roles)](https://github.com/xg-gh-25/SwarmAI/raw/main/docs/assets/discussions/2026-10-14-pipeline-panorama.png)
+
+> One requirement in → PR-ready delivery out, on a DDD layer the pipeline reads and writes. Walkthrough: [Discussion #111](https://github.com/xg-gh-25/SwarmAI/discussions/111) · design: [Autonomous-Pipeline-Design.md](../../../docs/Autonomous-Pipeline-Design.md).
+
 > This skill loads full instructions on activation. Read INSTRUCTIONS.md before proceeding.
 
 TRIGGER: "run pipeline", "autonomous pipeline", "pipeline for", "full pipeline",
