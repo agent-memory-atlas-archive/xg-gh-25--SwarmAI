@@ -1738,34 +1738,101 @@ def _pending_commit_paths(dir_path: str, command: str):
     root = _gate_repo_root_for(dir_path)
     if root is None:
         return None
+
+    # Isolate the `git commit` command's own argv BEFORE token-walking, reusing the
+    # SAME normalization the backgrounding/_command_has_git_commit gate already uses.
+    # Without this, a heredoc/`-F -` message body or OTHER commands in a multi-line
+    # Bash script leak their words as FALSE positional pathspecs → the gate computes a
+    # pending set full of garbage paths that no adversarial marker covers → a
+    # legitimately-reviewed commit is FALSE-DENIED (run_463715dc).
+    #
+    # FAIL-SAFE direction: this can only ever SHRINK pending of FALSE paths, never drop
+    # a REAL one. A real positional pathspec is argv of the single `git commit` simple-
+    # command (inside its segment, on the opener line — never inside a heredoc BODY,
+    # which is stdin DATA, and never across a shell separator, which terminates the
+    # command). `-a`/`--cached` sweep paths come from `git diff` against `root` below,
+    # independent of this tokenization. So the gate's "reviewed ⊇ pending" invariant
+    # stays fail-CLOSED.
+    #
+    # (1) Strip heredoc BODIES first — W2: the regex is MULTILINE/DOTALL and anchors its
+    #     terminator to a real `\n`, so it MUST run on the raw command before any
+    #     newline→';' normalization. W1: substitute a SPACE (not ""), matching the proven
+    #     caller — "" could token-JOIN across the stripped body (`arg<<EOF…EOFnext`
+    #     → `argnext`). Guarded by the ReDoS cap (fail-safe: over the cap we skip the
+    #     strip, which can only ADD false paths → a stricter/false-DENY, never fail-open).
+    cmd = command
+    if command.count("<<") <= _HEREDOC_MAX_OPENERS:
+        cmd = _HEREDOC_BODY_RE.sub(" ", command)
+    # (2) Normalize newlines→';', shlex-split, resplit glued ';', then split into
+    #     separator-delimited segments — identical idiom to _command_has_git_commit.
     try:
-        tokens = _shlex.split(command)
+        _all = _shlex.split(cmd.replace("\n", " ; ").replace("\r", " ; "))
     except ValueError:
-        tokens = command.split()
+        _all = cmd.split()
+    _resplit: list[str] = []
+    for _tok in _all:
+        if ";" in _tok and _tok != ";":
+            _parts = _tok.split(";")
+            for _idx, _p in enumerate(_parts):
+                if _p:
+                    _resplit.append(_p)
+                if _idx < len(_parts) - 1:
+                    _resplit.append(";")
+        else:
+            _resplit.append(_tok)
+    _all = _resplit
+    _SEP = {";", "&&", "||", "|", "&"}
+    _segments: list[list[str]] = []
+    _cur: list[str] = []
+    for _tok in _all:
+        if _tok in _SEP:
+            if _cur:
+                _segments.append(_cur)
+            _cur = []
+        else:
+            _cur.append(_tok)
+    if _cur:
+        _segments.append(_cur)
+    # (3) W3: select EVERY segment that is a `git commit` (via _segment_is_git_commit,
+    #     which strips wrappers/env-assignments/git global options) — NOT a bare
+    #     `"commit" in seg` (which would match a `-m "commit the fix"` message value).
+    #     ALL commit segments, not just the first: a chained `git commit A && git commit B`
+    #     is ONE PreToolUse command, and the gate computes pending ONCE for it — so a
+    #     SECOND commit's positional pathspec must enter pending too, or an unreviewed
+    #     path it commits (one NOT in `git diff --cached`, e.g. a modified-not-staged file
+    #     committed by a positional pathspec) silently sneaks past `pending ⊆ covered`
+    #     (Gate-2 HIGH fail-open, run_463715dc — the single-segment version I first shipped
+    #     had exactly this hole). Fall back to the whole token stream if NO segment matches
+    #     (defensive: over-collect rather than silently empty pending → never fail-open).
+    commit_segments = [seg for seg in _segments if _segment_is_git_commit(seg)]
+    if not commit_segments:
+        commit_segments = [_all]
 
     # GLOBAL options BEFORE `commit` retarget git: `-C <dir>` / `--git-dir=` /
     # `--work-tree=` can point at ANOTHER repo → the pending set computed against
     # dir_path would be wrong (Gate-2 HIGH bypass: `git -C /other commit` unreviewed).
     # If a retarget resolves to a DIFFERENT root, we cannot bind it → DENY sentinel.
-    try:
-        _ci = tokens.index("commit")
-    except ValueError:
-        _ci = len(tokens)
-    _g = 1  # skip tokens[0] == "git"
-    while _g < _ci:
-        gt = tokens[_g]
-        if gt in ("-C", "--git-dir", "--work-tree") and _g + 1 < _ci:
-            other = _gate_repo_root_for(tokens[_g + 1])
-            if other is not None and other != root:
-                return _PENDING_CROSS_REPO
-            _g += 2; continue
-        if gt.startswith(("--git-dir=", "--work-tree=")):
-            other = _gate_repo_root_for(gt.split("=", 1)[1])
-            if other is not None and other != root:
-                return _PENDING_CROSS_REPO
-        if gt == "-c" and _g + 1 < _ci:
-            _g += 2; continue  # -c key=val consumes a value
-        _g += 1
+    # Checked for EVERY commit segment — a retarget in ANY chained commit poisons the bind.
+    for _seg in commit_segments:
+        try:
+            _ci = _seg.index("commit")
+        except ValueError:
+            _ci = len(_seg)
+        _g = 1  # skip tokens[0] == "git"
+        while _g < _ci:
+            gt = _seg[_g]
+            if gt in ("-C", "--git-dir", "--work-tree") and _g + 1 < _ci:
+                other = _gate_repo_root_for(_seg[_g + 1])
+                if other is not None and other != root:
+                    return _PENDING_CROSS_REPO
+                _g += 2; continue
+            if gt.startswith(("--git-dir=", "--work-tree=")):
+                other = _gate_repo_root_for(gt.split("=", 1)[1])
+                if other is not None and other != root:
+                    return _PENDING_CROSS_REPO
+            if gt == "-c" and _g + 1 < _ci:
+                _g += 2; continue  # -c key=val consumes a value
+            _g += 1
 
     def _diff(*extra: str) -> list[str] | None:
         try:
@@ -1786,62 +1853,66 @@ def _pending_commit_paths(dir_path: str, command: str):
         return None  # git couldn't answer → uncomputable → caller fails open
     root_rels.update(staged)
 
-    # Decode the commit's flags/pathspec. Walk tokens AFTER the `commit` subcommand.
+    # Decode EACH commit segment's flags/pathspec. Walk tokens AFTER the `commit`
+    # subcommand, accumulating cwd_paths/dash_a across ALL commit segments (so a
+    # chained second commit's positional pathspec is captured, not dropped — see the
+    # per-segment rationale above).
     dash_a = False
-    try:
-        ci = tokens.index("commit")
-    except ValueError:
-        ci = 0
-    i = ci + 1
-    while i < len(tokens):
-        t = tokens[i]
-        if t == "--":
-            cwd_paths.extend(tokens[i + 1:]); break
-        if t.startswith("--"):
-            name, eq, inline_val = t.partition("=")
-            if name == "--all":
-                dash_a = True
-            elif name == "--only":
-                if eq:
-                    cwd_paths.append(inline_val)               # --only=path
-                elif i + 1 < len(tokens):
-                    cwd_paths.append(tokens[i + 1]); i += 1    # --only path
-            elif name in ("--message", "--author", "--date", "--reuse-message",
-                          "--reedit-message", "--fixup", "--squash", "--template",
-                          "--cleanup", "--file", "--pathspec-from-file"):
-                if not eq and i + 1 < len(tokens):
-                    i += 1  # space form consumes next token (equals form does not)
-            # --gpg-sign[=keyid] / --amend / --no-edit / --signoff → no path arg
-        elif t.startswith("-") and len(t) > 1:
-            # Decode a short-flag cluster. VALUE flags whose value is a SEPARATE token
-            # when trailing: -m -C -c -F -o -t -u. NOT -S (its keyid is OPTIONAL and
-            # must be STUCK, -Skey) and NOT -s (--signoff, no value) — consuming a next
-            # token for either would swallow a real pathspec (Gate-2 MED: -S secret.py).
-            cluster = t[1:]
-            j = 0
-            consumed_next = False
-            while j < len(cluster):
-                c = cluster[j]
-                if c == "a":
-                    dash_a = True; j += 1; continue
-                if c in ("m", "C", "c", "F", "o", "t", "u"):
-                    inline = cluster[j + 1:]  # rest of cluster is this flag's value
-                    if c == "o":  # -o <path> is a pathspec restriction we must track
-                        if inline:
-                            cwd_paths.append(inline)
-                        elif i + 1 < len(tokens):
-                            cwd_paths.append(tokens[i + 1]); consumed_next = True
-                    else:
-                        if not inline and i + 1 < len(tokens):
-                            consumed_next = True  # value is the next token; skip it
-                    break  # rest of cluster (if any) was this flag's value
-                # value-less / optional-stuck-value short flag (-q -v -e -s -S…) → skip
-                j += 1
-            if consumed_next:
-                i += 1
-        else:
-            cwd_paths.append(t)  # positional pathspec (cwd-relative in git)
-        i += 1
+    for tokens in commit_segments:
+        try:
+            ci = tokens.index("commit")
+        except ValueError:
+            ci = 0
+        i = ci + 1
+        while i < len(tokens):
+            t = tokens[i]
+            if t == "--":
+                cwd_paths.extend(tokens[i + 1:]); break
+            if t.startswith("--"):
+                name, eq, inline_val = t.partition("=")
+                if name == "--all":
+                    dash_a = True
+                elif name == "--only":
+                    if eq:
+                        cwd_paths.append(inline_val)               # --only=path
+                    elif i + 1 < len(tokens):
+                        cwd_paths.append(tokens[i + 1]); i += 1    # --only path
+                elif name in ("--message", "--author", "--date", "--reuse-message",
+                              "--reedit-message", "--fixup", "--squash", "--template",
+                              "--cleanup", "--file", "--pathspec-from-file"):
+                    if not eq and i + 1 < len(tokens):
+                        i += 1  # space form consumes next token (equals form does not)
+                # --gpg-sign[=keyid] / --amend / --no-edit / --signoff → no path arg
+            elif t.startswith("-") and len(t) > 1:
+                # Decode a short-flag cluster. VALUE flags whose value is a SEPARATE token
+                # when trailing: -m -C -c -F -o -t -u. NOT -S (its keyid is OPTIONAL and
+                # must be STUCK, -Skey) and NOT -s (--signoff, no value) — consuming a next
+                # token for either would swallow a real pathspec (Gate-2 MED: -S secret.py).
+                cluster = t[1:]
+                j = 0
+                consumed_next = False
+                while j < len(cluster):
+                    c = cluster[j]
+                    if c == "a":
+                        dash_a = True; j += 1; continue
+                    if c in ("m", "C", "c", "F", "o", "t", "u"):
+                        inline = cluster[j + 1:]  # rest of cluster is this flag's value
+                        if c == "o":  # -o <path> is a pathspec restriction we must track
+                            if inline:
+                                cwd_paths.append(inline)
+                            elif i + 1 < len(tokens):
+                                cwd_paths.append(tokens[i + 1]); consumed_next = True
+                        else:
+                            if not inline and i + 1 < len(tokens):
+                                consumed_next = True  # value is the next token; skip it
+                        break  # rest of cluster (if any) was this flag's value
+                    # value-less / optional-stuck-value short flag (-q -v -e -s -S…) → skip
+                    j += 1
+                if consumed_next:
+                    i += 1
+            else:
+                cwd_paths.append(t)  # positional pathspec (cwd-relative in git)
+            i += 1
 
     if dash_a:
         wt = _diff()  # tracked working-tree modifications -a will sweep
