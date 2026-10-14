@@ -71,8 +71,11 @@ Public symbols:
                                       to strip a legacy block, not to generate one)
 """
 
+import hashlib
 import re
 import logging
+import threading
+from collections import OrderedDict
 from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
@@ -264,6 +267,144 @@ def _bm25_tokenize(text: str) -> list[str]:
     return out
 
 
+# ── Doc-tokenize cache ───────────────────────────────────────────────────────
+# `_bm25_scores` re-tokenizes EVERY doc on EVERY call (line below), but doc
+# tokenization is a pure function of the doc CONTENT — query-independent. On the
+# recall hot path (ddd leg: whole DDD corpus, ~260K tokens, CJK bigram expansion
+# ≈376ms) that query-independent work was redone on every first-message recall.
+# Cache it, keyed on the doc TEXT itself, so a repeated corpus is tokenized once.
+#
+# Content-keyed (not path/mtime): a doc whose text changes gets a DIFFERENT key →
+# a fresh tokenization, so recall can never serve stale tokens (the "no stale
+# recall" guarantee). Bounded (OrderedDict, LRU-evict oldest past the cap) — the
+# cap is a MEMORY bound only; an evicted entry simply recomputes on next access,
+# so eviction changes cache-hit rate, NEVER a result (the opposite of a
+# STEERING #2 cost cap — it never truncates in-flight recall work).
+#
+# The QUERY tokenization in `_bm25_scores` (`q_terms = _bm25_tokenize(query)`)
+# stays UNCACHED on purpose: the query varies every call and is short/cheap, so
+# caching it would only grow the cache for zero reuse.
+#
+# ⚠️ CAP SIZING (learned the hard way): a single ddd-leg recall
+# tokenizes the WHOLE DDD corpus split into sections + entries — ~2.7K distinct
+# fragments for SwarmAI's own DDD today. The cap MUST exceed one recall's fragment
+# working set, or the LRU evicts fragments from run N before run N+1 can reuse them
+# → the cache thrashes and delivers ~0 speedup (an early 512 cap did exactly that:
+# 8% instead of 65%). 16384 holds several recalls' worth with headroom for a
+# growing corpus; each entry is a small token list, so the memory cost is modest
+# (a few MB worst case). If a future corpus pushes a single recall's working set
+# near this cap, RAISE it (it is a memory bound, never a correctness or
+# recall-completeness bound — eviction only recomputes).
+#
+# RETENTION CONTRACT (Gate-2 security, LOW/defense-in-depth): this is a
+# process-GLOBAL cache that retains the TOKENIZED content of whatever docs recall
+# scored (DDD / MEMORY / Knowledge). Before this change those tokens were transient
+# (GC'd after each `_bm25_scores` call); now they persist for the daemon's life,
+# displaced only by LRU pressure or process exit — there is NO session-end/privacy
+# hook that clears them (`_reset_doc_token_cache` is a test/manual hook). This
+# deliberately matches the pre-existing `_session_recall_cache` precedent below (also
+# process-lifetime, never auto-cleared), so it introduces no NEW privacy contract —
+# but if a session-teardown clear is ever added for that cache, clear THIS one in the
+# same place. It stores only tokenized text and is content-addressed (a caller can
+# only get tokens back by already supplying the identical source text), so there is
+# no cross-session READ path — the concern is in-memory retention, not an in-band leak.
+_DOC_TOKEN_CACHE_MAX = 16384
+_DOC_TOKEN_CACHE: "OrderedDict[str, list[str]]" = OrderedDict()
+
+
+# Thrash-signal state: the cache delivers ~0 speedup if a SINGLE recall's working
+# set exceeds the cap (it evicts fragments before the next run reuses them — the
+# measured 512-cap failure). That regression is otherwise SILENT. `_doc_cache_saturated`
+# latches on the first at-cap eviction so we WARN once per saturation episode (not per
+# evict — that would spam), and re-arms when the cache drains back below cap.
+_doc_cache_saturated = False
+
+# Recall runs CONCURRENTLY from multiple threads — the io-worker pool
+# (`executors.run_in("io", _unified_recall_body / _recall_for_query / ...)`) and
+# `asyncio.to_thread` (library-overlay / ddd-brain recall). The cache's
+# read-modify-write (`get` → `move_to_end` → insert → `popitem`) and the
+# `_doc_cache_saturated` flag are check-then-act sequences spanning several
+# bytecodes, so the GIL does NOT make them atomic: two threads can both pass the
+# at-cap check and both `popitem` (second raises on an under-margin dict), or a
+# `move_to_end(key)` can race a `popitem` of that same key → KeyError into the
+# recall path. We guard the dict/flag mutations with a module `threading.Lock`,
+# mirroring `recall_metrics._LOCK` (adopted for this exact dual-context recall
+# concurrency). The expensive `_bm25_tokenize` stays OUTSIDE the lock so
+# tokenization still runs in parallel; the lock covers only the O(1) structural ops.
+_DOC_TOKEN_CACHE_LOCK = threading.Lock()
+
+
+def _reset_doc_token_cache() -> None:
+    """Clear the doc-tokenize cache (test hook; also safe to call at runtime)."""
+    global _doc_cache_saturated
+    with _DOC_TOKEN_CACHE_LOCK:
+        _DOC_TOKEN_CACHE.clear()
+        _doc_cache_saturated = False
+
+
+def _bm25_tokenize_doc(text: str) -> list[str]:
+    """Cached, content-keyed wrapper over `_bm25_tokenize` for DOC bodies.
+
+    Returns EXACTLY what `_bm25_tokenize(text)` returns — this is a memoization
+    layer over the same pure function, never a different tokenizer. The key is
+    the doc content (``len`` prefix + blake2b digest — the length prefix makes a
+    digest collision additionally require an equal-length text, driving the
+    false-hit probability to negligible). Returns a COPY of the cached list every
+    call, so a caller that mutates the result (e.g. ``.append``) cannot corrupt
+    the stored tokens for the next reader (Gate-1 aliasing guard).
+
+    Thread-safe: the dict/flag mutations are guarded by `_DOC_TOKEN_CACHE_LOCK`
+    (recall runs from several io-pool / to_thread threads concurrently). The
+    tokenize call on a miss is done OUTSIDE the lock to preserve parallelism — a
+    rare duplicate tokenize of the same new text is harmless (pure function,
+    identical result), whereas holding the lock across tokenize would serialize
+    every recall leg.
+    """
+    global _doc_cache_saturated
+    key = f"{len(text)}:{hashlib.blake2b(text.encode('utf-8'), digest_size=16).hexdigest()}"
+    with _DOC_TOKEN_CACHE_LOCK:
+        cached = _DOC_TOKEN_CACHE.get(key)
+        if cached is not None:
+            _DOC_TOKEN_CACHE.move_to_end(key)   # LRU: mark most-recently-used
+            return list(cached)                 # copy — never hand out the shared list
+    # Miss: tokenize OUTSIDE the lock (expensive; pure function → safe to race).
+    toks = _bm25_tokenize(text)
+    warn_saturated = False
+    with _DOC_TOKEN_CACHE_LOCK:
+        # Re-check: a concurrent miss on the same key may have inserted already.
+        existing = _DOC_TOKEN_CACHE.get(key)
+        if existing is not None:
+            _DOC_TOKEN_CACHE.move_to_end(key)
+            # Return the CANONICAL stored list, not our redundantly-computed `toks`.
+            # They are equal today (`_bm25_tokenize` is pure), but returning the
+            # stored value keeps the memoization layer correct even if the tokenizer
+            # ever became nondeterministic — the cache's job is to hand back the one
+            # value under the key.
+            toks = existing
+        else:
+            _DOC_TOKEN_CACHE[key] = toks
+            if len(_DOC_TOKEN_CACHE) > _DOC_TOKEN_CACHE_MAX:
+                _DOC_TOKEN_CACHE.popitem(last=False)  # evict oldest (memory bound only)
+                if not _doc_cache_saturated:
+                    _doc_cache_saturated = True
+                    warn_saturated = True  # emit the WARN after releasing the lock
+            elif _doc_cache_saturated and len(_DOC_TOKEN_CACHE) < _DOC_TOKEN_CACHE_MAX:
+                _doc_cache_saturated = False  # drained back below cap — re-arm the warning
+    if warn_saturated:
+        # Observability only — NOT a cap on work (STEERING #2): we never refuse
+        # to tokenize, we only warn that the cache is churning so its speedup has
+        # collapsed. The fix is to RAISE _DOC_TOKEN_CACHE_MAX (see cap-sizing note).
+        # Logged outside the lock so logging I/O never serializes recall threads.
+        logger.warning(
+            "doc-tokenize cache saturated at %d entries and now evicting — "
+            "a single recall's working set likely exceeds the cap, so the "
+            "cache speedup has collapsed to ~0 (thrash). Raise "
+            "_DOC_TOKEN_CACHE_MAX above one recall's fragment count.",
+            _DOC_TOKEN_CACHE_MAX,
+        )
+    return list(toks)
+
+
 def _bm25_scores(query: str, docs: dict[str, str]) -> dict[str, float]:
     """Score each doc against the query with Okapi-BM25 + corpus-relative IDF.
 
@@ -287,7 +428,9 @@ def _bm25_scores(query: str, docs: dict[str, str]) -> dict[str, float]:
     if not q_terms:
         return {}
 
-    doc_tokens = {k: _bm25_tokenize(text) for k, text in docs.items()}
+    # DOC tokenization is query-independent → cache it. The QUERY
+    # tokenization above stays on the bare, UNcached `_bm25_tokenize`.
+    doc_tokens = {k: _bm25_tokenize_doc(text) for k, text in docs.items()}
     doc_len = {k: len(toks) for k, toks in doc_tokens.items()}
     n_docs = len(docs)
     avgdl = (sum(doc_len.values()) / n_docs) if n_docs else 0.0
