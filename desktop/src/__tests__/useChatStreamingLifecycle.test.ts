@@ -4008,4 +4008,84 @@ describe('TabStatusIndicator component', () => {
       expect('clearCompactionNotice' in api).toBe(false);
     });
   });
+
+  // ── reconnecting event → soft spinner (run_2a68732b) ──────────────────────
+  // Layer-4 cross-boundary seam: the backend emits {type:'reconnecting'} on the
+  // tool_call_leak 1st-recovery path to fill the ~8-9s kill→respawn info-vacuum.
+  // These drive the REAL createStreamHandler (seam NOT mocked) and assert the
+  // event sets isReconnecting (→ TabView 'Reconnecting…' spinner) and that the
+  // respawned stream's first data event CLEARS it (no stuck spinner).
+  describe('reconnecting event drives the soft recovery spinner', () => {
+    it('a reconnecting event sets tabState.isReconnecting (so the spinner shows)', () => {
+      const { result } = renderHook(() =>
+        useChatStreamingLifecycle(createMockDeps()),
+      );
+      act(() => { initTestTab('tab-reconn'); });
+      // precondition: not reconnecting yet
+      expect(testTabMap.get('tab-reconn')?.isReconnecting).toBeFalsy();
+
+      const handler = result.current.createStreamHandler('m-reconn', 'tab-reconn');
+      act(() => { handler({ type: 'reconnecting' } as StreamEvent); });
+
+      expect(testTabMap.get('tab-reconn')?.isReconnecting).toBe(true);
+    });
+
+    it('the respawned stream\'s first data event CLEARS isReconnecting (no stuck spinner)', () => {
+      const { result } = renderHook(() =>
+        useChatStreamingLifecycle(createMockDeps()),
+      );
+      act(() => {
+        initTestTab('tab-reconn2');
+        result.current.setMessages([
+          makeMessage({ id: 'm-reconn2', role: 'assistant', content: [] }),
+        ]);
+      });
+      const handler = result.current.createStreamHandler('m-reconn2', 'tab-reconn2');
+
+      // 1) reconnecting → spinner on
+      act(() => { handler({ type: 'reconnecting' } as StreamEvent); });
+      expect(testTabMap.get('tab-reconn2')?.isReconnecting).toBe(true);
+
+      // 2) respawned stream yields its first real data → spinner clears
+      mockAddToast.mockClear();
+      act(() => {
+        handler({ type: 'assistant', content: [{ type: 'text', text: 'back' }] } as StreamEvent);
+      });
+      expect(testTabMap.get('tab-reconn2')?.isReconnecting).toBe(false);
+      // leak-recovery (reconnectionAttempt stayed 0) is a silent self-heal —
+      // NO "Stream reconnected successfully" toast (that is only for a genuine
+      // network reconnect, which sets reconnectionAttempt > 0).
+      const reconnectToasts = mockAddToast.mock.calls.filter(
+        (c) => String((c[0] as { id?: string })?.id ?? '').startsWith('reconnect-success'),
+      );
+      expect(reconnectToasts.length).toBe(0);
+    });
+
+    it('a GENUINE network reconnect (reconnectionAttempt>0) still fires the success toast', () => {
+      const { result } = renderHook(() =>
+        useChatStreamingLifecycle(createMockDeps()),
+      );
+      act(() => {
+        initTestTab('tab-reconn3');
+        result.current.setMessages([
+          makeMessage({ id: 'm-reconn3', role: 'assistant', content: [] }),
+        ]);
+      });
+      // Simulate a genuine disconnect-reconnect: isReconnecting set WITH an attempt.
+      const ts = testTabMap.get('tab-reconn3')!;
+      ts.isReconnecting = true;
+      ts.reconnectionAttempt = 1;
+
+      const handler = result.current.createStreamHandler('m-reconn3', 'tab-reconn3');
+      mockAddToast.mockClear();
+      act(() => {
+        handler({ type: 'assistant', content: [{ type: 'text', text: 'back' }] } as StreamEvent);
+      });
+      expect(testTabMap.get('tab-reconn3')?.isReconnecting).toBe(false);
+      const reconnectToasts = mockAddToast.mock.calls.filter(
+        (c) => String((c[0] as { id?: string })?.id ?? '').startsWith('reconnect-success'),
+      );
+      expect(reconnectToasts.length).toBe(1);
+    });
+  });
 });

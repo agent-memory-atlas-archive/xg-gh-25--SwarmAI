@@ -2486,17 +2486,22 @@ export function useChatStreamingLifecycle(
 
         // Mark that we've received data — used by reconnection logic AND the
         // post-stop silent-retry to distinguish connection-phase vs mid-stream
-        // failures. Control/lifecycle events (session_start, session_resuming),
-        // error events, AND heartbeats do NOT count as "data": otherwise a
-        // connection-phase error that arrives right AFTER session_start (e.g.
-        // the backend pipe-flush from a Stop kills the freshly-spawned
-        // subprocess on the next send) would flip hasReceivedData=true and
-        // defeat the silent-retry, surfacing a spurious "Connection interrupted
-        // — send again" and forcing a manual resend after every Stop. Heartbeat
-        // is excluded for the same reason: it now reaches this handler (to reset
-        // the watchdog) but it is liveness, not real stream content.
+        // failures. Control/lifecycle events (session_start, session_resuming,
+        // reconnecting), error events, AND heartbeats do NOT count as "data":
+        // otherwise a connection-phase error that arrives right AFTER
+        // session_start (e.g. the backend pipe-flush from a Stop kills the
+        // freshly-spawned subprocess on the next send) would flip
+        // hasReceivedData=true and defeat the silent-retry, surfacing a spurious
+        // "Connection interrupted — send again" and forcing a manual resend
+        // after every Stop. Heartbeat is excluded for the same reason: it now
+        // reaches this handler (to reset the watchdog) but it is liveness, not
+        // real stream content. `reconnecting` is excluded for a 2nd reason too:
+        // it is the leak-recovery soft signal — if it counted as data it would
+        // set hasReceivedData BEFORE the respawned stream's first real token,
+        // defeating the isReconnecting clear below (the spinner would stick).
         const isDataEvent = event.type !== 'session_start'
           && event.type !== 'session_resuming'
+          && event.type !== 'reconnecting'
           && event.type !== 'error'
           && event.type !== 'heartbeat';
         if (tabState && !tabState.hasReceivedData && isDataEvent) {
@@ -2515,6 +2520,14 @@ export function useChatStreamingLifecycle(
           // Clear reconnection state and fire a success toast.
           if (tabState.isReconnecting) {
             console.log(`[Reconnect] Tab ${capturedTabId}: reconnection succeeded`);
+            // Distinguish a GENUINE network reconnect (disconnect-catch path,
+            // which sets reconnectionAttempt > 0) from a backend-initiated
+            // leak-recovery (the `reconnecting` SSE event, which leaves
+            // reconnectionAttempt at 0). The genuine reconnect earns a success
+            // toast; the leak-recovery is a silent system self-heal the user did
+            // not initiate — the spinner appearing then clearing is feedback
+            // enough, a toast per leak would just trade one annoyance for another.
+            const wasGenuineReconnect = (tabState.reconnectionAttempt ?? 0) > 0;
             tabState.isReconnecting = false;
             tabState.reconnectionAttempt = 0;
             // Clear disconnect timeout — recovery happened before it fired
@@ -2522,11 +2535,13 @@ export function useChatStreamingLifecycle(
               clearTimeout(tabState._disconnectTimeoutId);
               tabState._disconnectTimeoutId = undefined;
             }
-            addToast({
-              severity: 'info',
-              message: 'Stream reconnected successfully.',
-              id: `reconnect-success-${capturedTabId}`,
-            });
+            if (wasGenuineReconnect) {
+              addToast({
+                severity: 'info',
+                message: 'Stream reconnected successfully.',
+                id: `reconnect-success-${capturedTabId}`,
+              });
+            }
           }
           // Clear "Resuming session..." indicator once data arrives
           if (tabState.isResuming) {
@@ -3524,6 +3539,18 @@ export function useChatStreamingLifecycle(
         // the SAME SSE connection, so we need to re-enter streaming state.
         else if (event.type === 'reconnecting') {
           setIsStreaming(true, capturedTabId ?? undefined);
+          // Set isReconnecting so TabView renders the soft "Reconnecting…"
+          // spinner during the gap. Without this the handler sets only
+          // isStreaming → the generic "Thinking…" shows, not "Reconnecting…"
+          // (the spinner reads isReconnecting). Mirrors the disconnect path's
+          // flag-set. Backend emits this on the tool_call_leak 1st-recovery
+          // path to fill the ~8-9s kill→respawn information vacuum; the flag is
+          // cleared automatically when the respawned stream's first data event
+          // arrives (the data-arrival clear in the message-processing path).
+          const reconnTab = capturedTabId ? tabMapRef.current.get(capturedTabId) : undefined;
+          if (reconnTab) {
+            reconnTab.isReconnecting = true;
+          }
           if (capturedTabId) {
             updateTabStatus(capturedTabId, 'streaming');
           }

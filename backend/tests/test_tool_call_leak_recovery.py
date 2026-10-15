@@ -407,3 +407,84 @@ async def test_send_intercept_recovered_returns_without_retry():
     assert retry_called["v"] is False, (
         "a recovered leak must end the turn (return), NOT fall through to retry"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# AC1 (run_2a68732b) — 1st leak yields a soft `reconnecting` event BEFORE the
+# kill→respawn gap, so the frontend can show a "Reconnecting…" spinner instead
+# of a frozen stale partial + silence (the information-vacuum fix).
+# ─────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_first_leak_yields_reconnecting_before_respawn_gap():
+    """AC1/AC4: `_handle_tool_call_leak` MUST yield {"type":"reconnecting"} BEFORE
+    it kills the subprocess (`_crash_to_cold_async`) — the signal has to reach the
+    still-open SSE stream ahead of the ~8-9s respawn silence. RED until the emit
+    is added. Ordering is load-bearing: a reconnecting yielded AFTER the kill would
+    arrive after the gap it exists to cover."""
+    u = _unit()
+    u._sdk_session_id = "sdk-poisoned"
+
+    timeline = []  # records the ORDER of (crash, reconnecting-yield, stream)
+
+    async def _fake_crash(*a, **k):
+        timeline.append("crash")
+        u.state = SessionState.COLD
+
+    async def _fake_spawn(*a, **k):
+        timeline.append("spawn")
+        u.state = SessionState.STREAMING
+
+    async def _fake_stream(query):
+        timeline.append("stream")
+        return
+        yield  # make async-gen
+
+    u._crash_to_cold_async = _fake_crash
+    u._spawn = _fake_spawn
+    u._streaming_orchestrator.stream_query = _fake_stream
+
+    events = []
+    async for ev in u._handle_tool_call_leak("do it", _opts(), None, LEAK_ERROR):
+        if isinstance(ev, dict) and ev.get("type") == "reconnecting":
+            timeline.append("reconnecting")
+        events.append(ev)
+
+    # The reconnecting event must have been yielded...
+    reconnecting = [e for e in events if isinstance(e, dict) and e.get("type") == "reconnecting"]
+    assert len(reconnecting) == 1, (
+        f"expected exactly one reconnecting event on the 1st-leak path, got {len(reconnecting)}"
+    )
+    # ...and BEFORE the kill (crash), so it reaches the UI ahead of the gap.
+    assert "reconnecting" in timeline and "crash" in timeline, timeline
+    assert timeline.index("reconnecting") < timeline.index("crash"), (
+        f"reconnecting MUST be yielded before _crash_to_cold_async (the gap). timeline={timeline}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_second_leak_terminal_does_not_yield_reconnecting():
+    """AC4: the 2nd-consecutive-leak terminal path keeps its coded error and must
+    NOT emit a reconnecting spinner. Drive the dispatcher with the recovery flag
+    already True (= 2nd leak) and assert no reconnecting event appears."""
+    u = _unit()
+    u._sdk_session_id = "sdk-poisoned"
+    u._tool_call_leak_recovery = True  # simulate: 1st leak already happened
+
+    async def _fake_crash(*a, **k):
+        u.state = SessionState.COLD
+
+    u._crash_to_cold_async = _fake_crash
+
+    events = []
+    async for ev in u._dispatch_leak_recovery(LEAK_ERROR, "q", _opts(), None):
+        events.append(ev)
+
+    reconnecting = [e for e in events if isinstance(e, dict) and e.get("type") == "reconnecting"]
+    assert len(reconnecting) == 0, (
+        f"2nd-leak terminal must NOT emit reconnecting (it has a coded error), got {reconnecting}"
+    )
+    # sanity: the terminal DID emit its coded error
+    coded = [e for e in events if isinstance(e, dict) and e.get("code") == "TOOL_CALL_LEAK_UNRECOVERED"]
+    assert len(coded) == 1, f"expected the coded terminal error, got events={events}"

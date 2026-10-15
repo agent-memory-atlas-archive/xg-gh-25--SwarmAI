@@ -204,6 +204,17 @@ class RetryManager:
         # see the flag True so the dispatcher routes it to the clean terminal, not
         # back into this handler — otherwise the bound is lost (Gate-1 check #1/#3).
         self._parent._tool_call_leak_recovery = True
+        # Fill the information vacuum: the kill+respawn below is a ~8-9s silent
+        # gap on an SSE connection that STAYS OPEN (heartbeats continue, no EOF),
+        # so without a signal the user sees a frozen stale partial then silence
+        # then a fresh response pops in — the "mysterious interrupt". Emit a soft
+        # `reconnecting` event BEFORE the kill so the frontend shows a
+        # "Reconnecting…" spinner for the gap (cleared automatically when the
+        # respawned stream's first event arrives). Emitted ONLY here on the
+        # 1st-leak path — the 2nd-consecutive-leak terminal keeps its coded error.
+        # Must be yielded BEFORE _crash_to_cold_async(), or it arrives after the
+        # gap it exists to cover (ordering is load-bearing — Gate-1 verified).
+        yield {"type": "reconnecting"}
         resume_sid = self._parent._sdk_session_id
         await self._parent._crash_to_cold_async()  # keep identity → --resume
 
