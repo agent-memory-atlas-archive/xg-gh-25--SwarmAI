@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 from claude_agent_sdk import HookMatcher
 
 from .security_hooks import (
-    pre_tool_logger,
+    create_pre_tool_logger,
     create_dangerous_command_gate,
     create_external_approval_gate,
     background_command_guard,
@@ -291,9 +291,23 @@ async def build_hooks(
     """
     registry = HookRegistry()
 
-    # ── PreToolUse: tool logger ──────────────────────────────
+    # Session identity — resolved ONCE here (closure source for every hook that
+    # needs 归属). The SDK hands hooks an empty context ({"signal": None}), so a hook
+    # can ONLY learn its session via this closure, never via its context arg.
+    agent_id = agent_config.get("id", "default")
+    session_key = resume_session_id or agent_id or "unknown"
+    hook_session_context = (
+        session_context if session_context is not None
+        else {"sdk_session_id": resume_session_id or agent_id}
+    )
+
+    # ── PreToolUse: tool logger (+ durable SEL audit, closure-attributed) ──
     if agent_config.get("enable_tool_logging", True):
-        registry.register("PreToolUse", pre_tool_logger, "pre_tool_logger")
+        registry.register(
+            "PreToolUse",
+            create_pre_tool_logger(session_key, hook_session_context),
+            "pre_tool_logger",
+        )
 
     # ── PreToolUse: background-command guard (Bash-scoped) ──
     # Default-deny backgrounding (run_in_background / trailing &/nohup/setsid)
@@ -367,14 +381,8 @@ async def build_hooks(
     )
 
     # ── PreToolUse: dangerous command gate (Bash-scoped) ─────
-    agent_id = agent_config.get("id", "default")
-    session_key = resume_session_id or agent_id or "unknown"
+    # session_key / hook_session_context resolved once at the top of this function.
     enable_human_approval = agent_config.get("enable_human_approval", True)
-
-    hook_session_context = (
-        session_context if session_context is not None
-        else {"sdk_session_id": resume_session_id or agent_id}
-    )
     gate = create_dangerous_command_gate(
         hook_session_context, session_key, permission_manager,
         enable_human_approval=enable_human_approval,

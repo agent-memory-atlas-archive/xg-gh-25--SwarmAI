@@ -6,7 +6,7 @@ Claude Agent SDK's hook system via HookMatcher configurations.
 
 Public symbols
 --------------
-- ``pre_tool_logger``                        — logs every tool invocation
+- ``create_pre_tool_logger``                 — factory: logs every tool invocation + durable SEL audit
 - ``DEFAULT_DANGEROUS_PATTERNS``             — default glob patterns for dangerous commands
 - ``load_dangerous_patterns``                — load patterns from ~/.swarm-ai/dangerous_commands.json
 - ``create_dangerous_command_gate``          — single PreToolUse gate for Bash commands
@@ -44,16 +44,68 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-async def pre_tool_logger(
-    input_data: dict[str, Any],
-    tool_use_id: str | None,
-    context: Any
-) -> dict[str, Any]:
-    """Log tool usage before execution."""
-    tool_name = input_data.get('tool_name', 'unknown')
-    tool_input = input_data.get('tool_input', {})
-    logger.info(f"[PRE-TOOL] Tool: {tool_name}, Input keys: {list(tool_input.keys())}")
-    return {"decision": "approve"}
+def create_pre_tool_logger(
+    session_key: str = "unknown",
+    session_context: dict[str, Any] | None = None,
+):
+    """Factory for the pre-tool logger hook, closing over the session identity.
+
+    Why a factory (Gate-2 HIGH, run_7ada39d6): the SDK invokes every hook callback
+    with a HARDCODED ``context={"signal": None}`` (claude_agent_sdk query.py:448 —
+    ``HookContext`` carries only a reserved ``signal`` field). So a bare hook CANNOT
+    read session identity from its ``context`` arg — it is always empty. Every other
+    gate in this module (dangerous/external/…) gets identity via a factory CLOSURE
+    (``session_key`` passed by ``build_hooks``), NOT from the SDK context. The SEL
+    ``caller`` must do the same, or it is permanently ``"unknown"`` and the audit's
+    whole purpose (归属 — which session ran which tool) is defeated.
+    """
+    # Resolve the durable identity ONCE at build time (closure). This deliberately
+    # SNAPSHOTS, unlike create_dangerous_command_gate which re-reads session_context
+    # per-call — safe because hooks are rebuilt per-send AND the app session_id is
+    # immutable per unit (session_router.py's single writer always writes the same
+    # stable app id). Resolution expression matches the gate's for consistency.
+    resolved_caller = session_key or "unknown"
+    if session_context:
+        resolved_caller = str(
+            session_context.get("sdk_session_id") or session_key or "unknown"
+        )
+
+    async def pre_tool_logger(
+        input_data: dict[str, Any],
+        tool_use_id: str | None,
+        context: Any,
+    ) -> dict[str, Any]:
+        """Log tool usage before execution + append a persistent SEL audit event.
+
+        The ``logger.info`` line is transient (daemon log rotates at 20MB — the C050
+        追溯 gap). The SEL append is the DURABLE record: it survives log rotation and a
+        data.db wipe because it lives OUTSIDE both. This hook always approves, so the
+        SEL outcome here is always ``allow`` — it is the "which tool was invoked when"
+        audit stream; downstream gate denies are a Phase-2 埋点. SEL is fail-soft, so
+        this never blocks tool execution even if the audit write fails.
+        """
+        tool_name = input_data.get('tool_name', 'unknown')
+        tool_input = input_data.get('tool_input', {})
+        logger.info(f"[PRE-TOOL] Tool: {tool_name}, Input keys: {list(tool_input.keys())}")
+
+        # Durable audit — fail-soft (append_event swallows its own errors; the extra
+        # guard here protects against an import-time failure of the sel module itself).
+        try:
+            from .verdict import Disposition
+            from . import sel
+            sel.append_event(
+                event_type="tool_invocation",
+                caller=resolved_caller,  # closure-resolved identity, NOT the empty SDK context
+                operation=str(tool_name),
+                outcome=Disposition.ALLOW.name.lower(),
+                resource=sel.summarize_resource(tool_input),  # keys+sizes only, never values
+            )
+        except Exception as exc:  # pragma: no cover - defensive; append_event is already fail-soft
+            logger.warning("pre_tool_logger: SEL append skipped (non-fatal): %s", exc)
+
+        return {"decision": "approve"}
+
+    return pre_tool_logger
 
 
 # ---------------------------------------------------------------------------
