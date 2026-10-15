@@ -36,6 +36,7 @@ from .security_hooks import (
     create_skill_access_checker,
 )
 from .design_hooks import design_lint_guard
+from .verdict import Disposition, from_sdk, to_sdk
 from .ask_question_manager import ask_question_manager
 from .permission_manager import PERMISSION_ANSWER_TIMEOUT_SECONDS
 from .agent_defaults import expand_allowed_skills_with_plugins
@@ -147,10 +148,24 @@ class HookRegistry:
     ) -> HookCallback:
         """Build a chained hook from multiple hooks.
 
-        Execution: sequential, first 'block' wins, 5s timeout per hook —
-        EXCEPT hooks registered with ``no_timeout=True`` (long-blocking HITL
-        gates), which are awaited directly (their own internal bound applies).
-        Results are merged: last non-empty additionalContext wins.
+        Execution: sequential, first TERMINAL verdict (deny/hitl) wins, 5s timeout
+        per hook — EXCEPT hooks registered with ``no_timeout=True`` (long-blocking
+        HITL gates), which are awaited directly (their own internal bound applies).
+        Non-terminal (allow/warn) results merge: hookSpecificOutput later-overrides,
+        additionalContext accumulates.
+
+        Phase 1 refactor (verdict.py): the "what is terminal / which decision wins"
+        judgement is now expressed on the ordered ``Disposition`` scale via
+        ``from_sdk`` — ``Disposition >= HITL`` (decision=block / permissionDecision
+        deny / ask / defer) is terminal and short-circuits, returning the gate's ORIGINAL
+        dict verbatim (``to_sdk`` passthrough, so reason/systemMessage/
+        permissionDecisionReason bypass fields survive — the lossless invariant). The
+        field-ACCUMULATION for non-terminal results is kept as explicit dict merging:
+        two allow hooks must BOTH contribute (one carries additionalContext, another
+        updatedInput), which a single-winner ``merge_verdicts`` could not express — so
+        Verdict governs the terminal/severity decision, dict-merge governs
+        accumulation. This preserves every observable output of the legacy chain
+        (pinned by the back-to-back equivalence tests in test_hook_builder.py).
         """
 
         async def chained(input_data: Any, tool_use_id: Any, context: Any) -> dict:
@@ -174,24 +189,21 @@ class HookRegistry:
                     if not result:
                         continue
 
-                    # Short-circuit on block decision
-                    if result.get("decision") == "block":
-                        return result
-
-                    # Short-circuit on a TERMINAL permissionDecision (run_7da67105).
-                    # deny/ask/defer are terminal — the CLI resolves the tool right
-                    # there — so they must NOT be merged-then-overwritten by a later
-                    # hook. Without this, the .update() below lets any later
-                    # allow-emitting hook silently clobber an earlier guard's deny
-                    # (the CRITICAL found by Gate-2 in run_6af22b0d). Only "allow"
-                    # is non-terminal (it carries updatedInput / additionalContext),
-                    # so allow keeps merging below. No hook emits ask/defer today,
-                    # but including them closes the same clobber gap pre-emptively.
-                    hso = result.get("hookSpecificOutput")
-                    if isinstance(hso, dict) and hso.get("permissionDecision") in (
-                        "deny", "ask", "defer",
-                    ):
-                        return result
+                    # Short-circuit on a TERMINAL verdict (Disposition >= HITL):
+                    # decision=block / permissionDecision∈{deny,ask,defer}.
+                    # Terminal means the CLI resolves the tool right
+                    # there, so it must NOT be merged-then-overwritten by a later
+                    # hook — without this a later allow-emitting hook silently
+                    # clobbers an earlier guard's deny (the CRITICAL from Gate-2 in
+                    # run_6af22b0d; deny/ask/defer terminality from run_7da67105).
+                    # Returning to_sdk(verdict) hands back the ORIGINAL dict verbatim
+                    # (verdict.sdk_payload passthrough), identical to the legacy
+                    # `return result` — bypass fields (reason / systemMessage /
+                    # permissionDecisionReason) are preserved. Only allow/warn are
+                    # non-terminal and keep merging below.
+                    verdict = from_sdk(result)
+                    if verdict.disposition >= Disposition.HITL:
+                        return to_sdk(verdict)
 
                     # Merge hookSpecificOutput — later hooks override earlier
                     if "hookSpecificOutput" in result:

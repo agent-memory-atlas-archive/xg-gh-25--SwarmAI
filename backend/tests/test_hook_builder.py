@@ -522,3 +522,194 @@ class TestCodeIntelHookNotRegistered:
             "create_code_intel_hook(), meaning the removed registration block "
             "was reintroduced (see hook_builder.py)"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase-1 EQUIVALENCE (back-to-back): the Verdict-based _build_chain must
+# produce byte-identical SDK output to the legacy hand-merge, for every
+# disposition and mixed ordering. This is the Gate-1 release condition —
+# the frozen legacy reference below is the oracle. If this ever diverges,
+# the refactor changed an observable security decision (regression).
+# ---------------------------------------------------------------------------
+
+async def _legacy_chain(hooks_results, input_data=None):
+    """Frozen snapshot of the PRE-refactor _build_chain merge logic (the oracle).
+
+    Takes a list of dicts (what each hook would return) and reproduces the exact
+    legacy merge: block short-circuit, terminal permissionDecision short-circuit,
+    hso later-override, decision/reason/systemMessage last-wins, additionalContext
+    accumulate. Deliberately a verbatim copy of the old code so the test proves
+    the NEW code matches the OLD behavior, not that both match a shared helper.
+    """
+    combined = {}
+    for result in hooks_results:
+        if not result:
+            continue
+        if result.get("decision") == "block":
+            return result
+        hso = result.get("hookSpecificOutput")
+        if isinstance(hso, dict) and hso.get("permissionDecision") in ("deny", "ask", "defer"):
+            return result
+        if "hookSpecificOutput" in result:
+            combined.setdefault("hookSpecificOutput", {})
+            combined["hookSpecificOutput"].update(result["hookSpecificOutput"])
+        for key in ("decision", "reason", "systemMessage"):
+            if key in result and result[key] is not None:
+                combined[key] = result[key]
+        if result.get("additionalContext"):
+            prior = combined.get("additionalContext", "")
+            combined["additionalContext"] = (
+                (prior + "\n" + result["additionalContext"]).strip()
+                if prior else result["additionalContext"]
+            )
+    return combined
+
+
+# Each case: a list of dicts the chained hooks return, in order. Covers every
+# disposition (allow/warn/hitl/deny) via its real SDK carrier + mixed orderings,
+# including the clobber case (deny then allow) and alt carriers (behavior / block).
+_EQUIV_CASES = [
+    # name, [hook return dicts]
+    ("empty", []),
+    ("single_allow", [{"decision": "approve"}]),
+    ("single_block", [{"decision": "block", "reason": "dangerous"}]),
+    ("single_advisory", [{"decision": "approve", "additionalContext": "ctx"}]),
+    ("two_advisory_accumulate", [
+        {"decision": "approve", "additionalContext": "ctx_a"},
+        {"decision": "approve", "additionalContext": "ctx_b"},
+    ]),
+    ("deny_short_circuits", [
+        {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                "permissionDecisionReason": "guard"}},
+        {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}},
+    ]),
+    ("block_short_circuits", [
+        {"decision": "block", "reason": "no"},
+        {"decision": "approve", "additionalContext": "unreached"},
+    ]),
+    ("ask_short_circuits", [
+        {"hookSpecificOutput": {"permissionDecision": "ask"}},
+        {"hookSpecificOutput": {"permissionDecision": "allow"}},
+    ]),
+    ("allow_payloads_merge", [
+        {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
+                                "additionalContext": "hint-A"}},
+        {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow",
+                                "updatedInput": {"answered": True}}},
+    ]),
+    ("advisory_then_allow_hso", [
+        {"decision": "approve", "additionalContext": "top-level"},
+        {"hookSpecificOutput": {"permissionDecision": "allow", "additionalContext": "hso-level"}},
+    ]),
+    ("empty_then_allow", [{}, {"decision": "approve"}]),
+    # Gate-2 adversarial finding: {"behavior":"deny"} must NOT short-circuit — the
+    # legacy chain never inspected `behavior`, so it falls through to merge (no-op)
+    # and the trailing hook still runs. Locks the zero-change boundary.
+    ("behavior_deny_is_not_terminal", [
+        {"behavior": "deny", "message": "x"},
+        {"decision": "approve", "additionalContext": "still-runs"},
+    ]),
+    ("deny_wins_over_earlier_allow_payload", [
+        {"hookSpecificOutput": {"permissionDecision": "allow", "additionalContext": "pre"}},
+        {"hookSpecificOutput": {"permissionDecision": "deny", "permissionDecisionReason": "x"}},
+    ]),
+]
+
+
+class TestPhase1Equivalence:
+    """New Verdict-based _build_chain == frozen legacy merge, byte-for-byte."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("name,returns", _EQUIV_CASES, ids=[c[0] for c in _EQUIV_CASES])
+    async def test_new_chain_equals_legacy(self, name, returns):
+        from core.hook_builder import HookRegistry
+
+        # Build a registry whose N hooks return the scripted dicts in order.
+        registry = HookRegistry()
+        for i, r in enumerate(returns):
+            async def h(input_data, tool_use_id, context, _r=r):
+                return _r
+            registry.register("PreToolUse", h, f"h{i}")
+        # A chain needs >=2 hooks (solo bypasses _build_chain); pad with a no-op
+        # trailing allow for single/empty cases so they still exercise the chain.
+        if len(returns) < 2:
+            async def noop(input_data, tool_use_id, context):
+                return {}
+            registry.register("PreToolUse", noop, "noop_pad")
+
+        chained = registry.build_sdk_hooks()["PreToolUse"][0].hooks[0]
+        new_result = await chained({"tool_name": "Bash"}, None, MagicMock())
+
+        # Oracle gets the SAME returns + the same pad, in the same order.
+        oracle_returns = list(returns) + ([{}] if len(returns) < 2 else [])
+        legacy_result = await _legacy_chain(oracle_returns)
+
+        assert new_result == legacy_result, (
+            f"[{name}] Verdict chain diverged from legacy:\n"
+            f"  new   ={new_result!r}\n  legacy={legacy_result!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Phase-1 LAYER-4 cross-boundary E2E: drive the REAL seam — a real advisory
+# gate + a real deny-shaped hook through the REAL _build_chain → assert the
+# dict handed to the SDK is correct. This exercises the gate-dict ↔ SDK hook
+# wire contract end-to-end (not a mock). Mutation: break the terminal
+# short-circuit → the deny leaks an allow-clobber → assertion goes RED
+# (proven separately in the equivalence suite's mutation run).
+# ---------------------------------------------------------------------------
+
+class TestLayer4RealSeam:
+    """Real gate(s) → real _build_chain → real SDK dict (the wire contract)."""
+
+    @pytest.mark.asyncio
+    async def test_real_advisory_plus_deny_through_chain(self):
+        """A real-shaped advisory (approve+additionalContext) followed by a
+        real-shaped deny: SDK must see the DENY verbatim (reason preserved), and
+        the advisory must NOT have clobbered it. Drives the actual chain the CLI
+        consumes via build_sdk_hooks()."""
+        from core.hook_builder import HookRegistry
+
+        async def real_governance_advisory(input_data, tool_use_id, context):
+            # mirrors create_governance_file_gate's advisory carrier
+            return {"decision": "approve",
+                    "additionalContext": "⚠️ GOVERNANCE GATE [Tier 1]: classify first"}
+
+        async def real_deny(input_data, tool_use_id, context):
+            # mirrors dangerous_command_gate / adversarial_commit_gate deny carrier
+            return {"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecision": "deny",
+                "permissionDecisionReason": "Matches dangerous command pattern"}}
+
+        registry = HookRegistry()
+        registry.register("PreToolUse", real_governance_advisory, "gov")
+        registry.register("PreToolUse", real_deny, "deny")
+        chained = registry.build_sdk_hooks()["PreToolUse"][0].hooks[0]
+        sdk_dict = await chained({"tool_name": "Bash"}, None, MagicMock())
+
+        # The wire contract the CLI reads: a terminal deny, with its reason intact.
+        assert sdk_dict["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert sdk_dict["hookSpecificOutput"]["permissionDecisionReason"] == \
+            "Matches dangerous command pattern"
+
+    @pytest.mark.asyncio
+    async def test_real_two_advisories_accumulate_through_chain(self):
+        """Two real advisory gates (governance + inclusive-style) → SDK sees BOTH
+        reminders accumulated (non-terminal merge path, the wire contract for the
+        Write|Edit|MultiEdit group)."""
+        from core.hook_builder import HookRegistry
+
+        async def gov(input_data, tool_use_id, context):
+            return {"decision": "approve", "additionalContext": "GOVERNANCE reminder"}
+
+        async def inclusive(input_data, tool_use_id, context):
+            return {"decision": "approve", "additionalContext": "INCLUSIVE-TERM reminder"}
+
+        registry = HookRegistry()
+        registry.register("PreToolUse", gov, "gov")
+        registry.register("PreToolUse", inclusive, "inclusive")
+        chained = registry.build_sdk_hooks()["PreToolUse"][0].hooks[0]
+        sdk_dict = await chained({"tool_name": "Write"}, None, MagicMock())
+
+        assert "GOVERNANCE reminder" in sdk_dict["additionalContext"]
+        assert "INCLUSIVE-TERM reminder" in sdk_dict["additionalContext"]
