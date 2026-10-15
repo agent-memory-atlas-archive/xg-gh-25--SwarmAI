@@ -154,12 +154,16 @@ system prompt on every session start. Priority = both injection order AND trunca
 Key behaviors:
 - `ContextDirectoryLoader.ensure_directory()` runs at session start — two-mode copy
   (system files overwrite; user/agent files preserve).
-- Dynamic token budget: **100K for ≥500K** models, 50K for ≥200K, 30K for ≥64K, instance
-  default for <64K (L0 compact path). On 1M-context models everything fits — truncation
-  rarely triggers.
+- Dynamic token budget: **150K for ≥500K** models, 50K for ≥200K, 30K for ≥64K, instance
+  default for <64K (L0 compact path). The read-line NEVER truncates — on budget overshoot it
+  only emits an `over_budget` WARNING and returns full content (`_truncate_section` was
+  deleted 2026-08-14). Size is bounded UPSTREAM by the write-side valve (MEMORY distillation +
+  size-valve archival), not by injection-time truncation.
 - L1 cache with budget-tier validation (`<!-- budget:NNNNN -->` header) and git-first
   freshness check.
-- MEMORY.md truncates from head (keeps newest); all others truncate from tail.
+- Truncation DIRECTION metadata (MEMORY/EVOLUTION keep newest via head, others via tail) is
+  retained as a safety-net ordering, but is inert on the current read-line (never fires on
+  1M-context models).
 - DailyActivity: today + yesterday loaded ephemerally (2K token cap per file, disk never
   modified).
 - `locked_write.py`: fcntl.flock for safe MEMORY.md modification by skills.
