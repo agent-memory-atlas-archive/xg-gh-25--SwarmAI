@@ -605,6 +605,68 @@ class TestFormatTtftLine:
         # The old misleading residual (ttft-slot-recall = 2500) must NOT appear.
         assert "spawn+infer" not in line, f"old contradictory residual removed: {line}"
 
+    # ── spawn split (run_8149838f) — cold-turn SDK handshake attribution ──
+    # On a COLD turn the SDK __aenter__ spawn (~13-20s, measured) runs INSIDE
+    # unit.send(), AFTER the pre_send measurement point — so without this split
+    # the spawn time silently inflates send+infer and reads as "Bedrock is slow".
+    # spawn_ms is relayed from session_unit._last_turn_spawn_ms (set only when a
+    # cold spawn actually ran; None on a warm turn). This isolates the handshake
+    # cost so send+infer reflects ONLY Bedrock prefill + first token.
+
+    def test_spawn_segment_present_on_cold_turn(self):
+        """AC1: when spawn_ms is measured (cold turn), the line MUST carry a
+        distinct spawn= segment — the handshake cost is no longer hidden."""
+        line = self._call(
+            event_type="text_delta", ttft_ms=20000.0, slot_ms=0.0,
+            recall_ms=None, recall_ran_this_turn=False,
+            sw_overhead_ms=300.0, spawn_ms=12000.0,
+        )
+        assert line is not None
+        assert "spawn=12000" in line, f"spawn segment must appear on cold turn: {line}"
+
+    def test_spawn_subtracted_from_send_infer(self):
+        """AC2: send+infer == ttft - pre_send - spawn (all directly measured).
+        ttft=20000, pre_send=300, spawn=12000 → send+infer=7700. The whole point:
+        the 12s handshake no longer counts as Bedrock inference."""
+        line = self._call(ttft_ms=20000.0, sw_overhead_ms=300.0, spawn_ms=12000.0)
+        assert "pre_send=300ms" in line, line
+        assert "spawn=12000ms" in line, line
+        assert "send+infer=7700ms" in line, f"20000-300-12000=7700 must appear: {line}"
+
+    def test_spawn_none_is_backward_compatible_warm_turn(self):
+        """AC3: spawn_ms=None (warm turn — no spawn ran) → NO spawn segment, and
+        send+infer = ttft - pre_send (legacy formula, byte-identical to before).
+        Guarantees the new arg does not perturb the dominant warm-turn path."""
+        line = self._call(ttft_ms=2000.0, sw_overhead_ms=300.0, spawn_ms=None)
+        assert line is not None
+        assert "spawn=" not in line, f"no spawn segment on warm turn: {line}"
+        assert "send+infer=1700ms" in line, f"2000-300=1700 (spawn absent): {line}"
+
+    def test_spawn_zero_omitted(self):
+        """AC3 edge: a measured-but-zero spawn (defensive) emits no noise segment
+        and does not alter send+infer — only a real (>0) handshake surfaces."""
+        line = self._call(ttft_ms=2000.0, sw_overhead_ms=300.0, spawn_ms=0.0)
+        assert "spawn=" not in line, f"zero spawn must not add a segment: {line}"
+        assert "send+infer=1700ms" in line, line
+
+    def test_spawn_not_subtracted_on_retried_turn(self):
+        """Gate-2 (run_8149838f): on a RETRIED turn (retry_count>0) ttft spans
+        multiple failed spawns + backoff, but _last_turn_spawn_ms holds only the
+        LAST spawn — subtracting it would over-attribute and could render NEGATIVE.
+        So the spawn segment is DELIBERATELY skipped and send+infer = ttft - pre_send
+        (the retries= segment already flags the raw ttft as meaningless). Guards
+        against both the over-attribution wart AND the negative-render case."""
+        # A pathological retry: last spawn (12000) + pre_send (300) > ttft (8000) →
+        # the pre-fix formula would print send+infer=-4300ms. With the retry gate,
+        # spawn is not subtracted so send+infer=7700 and the retries= caveat shows.
+        line = self._call(
+            ttft_ms=8000.0, sw_overhead_ms=300.0, spawn_ms=12000.0, retry_count=2,
+        )
+        assert "spawn=" not in line, f"retried turn must NOT emit a spawn segment: {line}"
+        assert "send+infer=7700ms" in line, f"8000-300 (spawn NOT subtracted): {line}"
+        assert "-" not in line.split("send+infer=")[1][:8], f"no negative render: {line}"
+        assert "retries=2" in line, line
+
 
 class TestWarmReuseComplement:
     """阶段二 AC5/AC6: _is_warm_reuse is the single source of the warm-reuse

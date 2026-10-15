@@ -534,6 +534,13 @@ class SessionUnit:
         # be followed by a proactive self-heal kill/respawn (that defeats Stop).
         self._user_stopped_current_turn: bool = False
         self._retry_count: int = 0
+        # Per-turn SDK spawn (__aenter__ handshake) wall time in ms, for the TTFT
+        # probe to attribute cold-start cost away from send+infer (run_8149838f).
+        # Set ONLY by _spawn (i.e. only when a cold spawn actually ran); reset to
+        # None at the single new-turn admission point in send(), so a warm turn
+        # (no spawn) relays None and a prior cold turn's value can never leak into
+        # a later turn's log. Pure observability — never read by control flow.
+        self._last_turn_spawn_ms: Optional[float] = None
         self._model_name: Optional[str] = None
 
         # ── Recall injection (G3: post-first-message) ─────────────
@@ -2168,6 +2175,11 @@ class SessionUnit:
         # each new user message should get a fresh recovery attempt
         # if it triggers a different buffer overflow.
         self._retry_count = 0
+        # Clear last turn's spawn timing at the single new-turn admission point
+        # (same lifecycle as the per-turn fields around it). A warm turn never
+        # reaches _spawn, so this reset is what guarantees it relays None — not a
+        # stale cold-turn value — to the TTFT probe (run_8149838f).
+        self._last_turn_spawn_ms = None
         # _interrupted already cleared in Layer 0 above
         self._buffer_overflow_recovery = False
         self._tool_call_leak_recovery = False  # per-message: fresh leak-recovery budget
@@ -3441,6 +3453,12 @@ class SessionUnit:
             self.session_id, _lock_wait_ms, _configure_ms,
             _wrapper_aenter_ms, _total_ms,
         )
+        # Relay the cold-spawn wall time to the TTFT probe so it can attribute the
+        # handshake cost away from send+infer (run_8149838f). Set here = set ONLY on
+        # a cold spawn; a warm turn resets this to None at send() admission, so the
+        # probe never mistakes a prior turn's spawn for this turn's inference. Pure
+        # observability — nothing in the control flow reads this field.
+        self._last_turn_spawn_ms = _total_ms
 
         # ── Publish TSCC prompt metadata AT DELIVERY ──────────────────
         # This is the ONLY place options.system_prompt reaches the CLI: send()

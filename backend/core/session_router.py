@@ -1386,6 +1386,7 @@ def _format_ttft_line(
     recall_ran_this_turn: bool,
     retry_count: int,
     sw_overhead_ms: Optional[float] = None,
+    spawn_ms: Optional[float] = None,
 ) -> Optional[str]:
     """Pure decision + formatter for the end-to-end TTFT probe (observability-only).
 
@@ -1407,14 +1408,30 @@ def _format_ttft_line(
         t0 to just before ``unit.send()`` — i.e. ALL router-side per-turn work:
         slot-acquire, user-message DB persist, cold-resume DB reads, prompt
         assembly (``build_options``), multimodal conversion, and recall injection.
-        ``send+infer = ttft − pre_send`` is then the SDK-send + spawn (cold turns)
-        + Bedrock first-token span. Emitted on EVERY turn (incl. warm ``recall=n/a``)
+        On a clean single-spawn turn (``retry_count == 0``)
+        ``send+infer = ttft − pre_send − spawn`` is then the SDK-send + Bedrock
+        first-token span. Emitted on EVERY turn (incl. warm ``recall=n/a``)
         whenever ``sw_overhead_ms`` was measured — the case the old recall-only
         residual left opaque. It is a DIRECT measurement, not the old
         ``ttft − slot − recall`` computed residual (that lumped prompt-build+DB into
         the model span and contradicted itself on recall-ran turns — Gate-1 BLOCK).
         ``sw_overhead_ms=None`` (not measured) → the split is omitted (legacy shape,
         backward-compatible with callers that don't pass it).
+      - ``spawn`` (run_8149838f) — the SDK ``__aenter__`` subprocess handshake
+        (~13-20s measured), relayed from ``session_unit._last_turn_spawn_ms``. On a
+        COLD turn the spawn runs INSIDE ``unit.send()`` — AFTER the ``pre_send``
+        boundary — so without this subtraction it silently inflated ``send+infer``
+        and read as "Bedrock is slow" (TECH.md S2: spawn is the SDK handshake, NOT
+        model inference). Surfaced as its own ``spawn=<ms>`` segment ONLY when
+        ``spawn_ms`` is a real (>0) measurement AND ``retry_count == 0``; a warm
+        turn passes ``None`` (no spawn ran) → no segment, and ``send+infer`` reverts
+        to ``ttft − pre_send``. On a RETRIED turn (``retry_count > 0``) the spawn
+        subtraction is DELIBERATELY skipped: ``ttft`` then spans multiple failed
+        spawns + backoff sleeps but ``_last_turn_spawn_ms`` holds only the LAST
+        spawn, so subtracting it would over-attribute (and could render negative) —
+        the ``retries=`` segment already flags that turn's raw ttft as meaningless,
+        and ``send+infer`` inherits that caveat rather than making a false
+        single-spawn claim (Gate-2, run_8149838f).
       - ``retries``  — surfaced ONLY when >0: a retried turn's ttft_ms includes
         5-15s backoff + ``--resume`` respawn, so the raw number is meaningless
         without this note (Gate-1).
@@ -1426,12 +1443,24 @@ def _format_ttft_line(
     else:
         recall_seg = "recall=n/a"  # did not run this turn — NOT a real 0ms
     if sw_overhead_ms is not None:
-        # Direct-measured router/model split. send+infer is the residual of a
-        # SINGLE measured boundary (pre_send), so there is exactly one residual —
-        # nothing can contradict it.
+        # Direct-measured router/model split. On a clean single-spawn turn
+        # send+infer is the residual of measured boundaries (pre_send, and spawn on
+        # a cold turn), reflecting the SDK-send + Bedrock first-token span.
+        # spawn is subtracted ONLY when a real (>0) handshake was measured (cold
+        # turn) AND retry_count == 0: on a retried turn ttft spans multiple failed
+        # spawns + backoff but _last_turn_spawn_ms holds only the LAST, so
+        # subtracting it would over-attribute / render negative (Gate-2). A warm
+        # turn (spawn_ms None/0) also leaves send+infer = ttft − pre_send.
+        _spawn = (
+            spawn_ms
+            if (spawn_ms is not None and spawn_ms > 0 and not retry_count)
+            else 0.0
+        )
+        spawn_seg = f" spawn={_spawn:.0f}ms" if _spawn > 0 else ""
         split_seg = (
             f" pre_send={sw_overhead_ms:.0f}ms"
-            f" send+infer={ttft_ms - sw_overhead_ms:.0f}ms"
+            f"{spawn_seg}"
+            f" send+infer={ttft_ms - sw_overhead_ms - _spawn:.0f}ms"
         )
     else:
         split_seg = ""
@@ -3535,6 +3564,7 @@ class SessionRouter:
                             recall_ran_this_turn=_ttft_recall_ms is not None,
                             retry_count=getattr(unit, "_retry_count", 0) or 0,
                             sw_overhead_ms=_ttft_presend_ms,
+                            spawn_ms=getattr(unit, "_last_turn_spawn_ms", None),
                         )
                         if _ttft_line is not None:
                             _ttft_recorded = True
