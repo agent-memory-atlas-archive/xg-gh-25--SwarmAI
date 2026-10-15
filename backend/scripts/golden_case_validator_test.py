@@ -34,6 +34,28 @@ def test_schema_fails_missing_required():
     ok, errs = gate_schema({"id": "X"})
     assert not ok and any("affected_by" in e or "evaluators" in e for e in errs)
 
+def test_schema_allows_missing_tier():
+    """tier is optional (defaults to 'active' downstream) — a case without a tier
+    field must still pass schema (behavior preservation)."""
+    c = _ok_case()
+    c.pop("tier", None)
+    ok, errs = gate_schema(c)
+    assert ok, errs
+
+def test_schema_allows_known_tiers():
+    """Every tier the system actually uses must pass the enum, including 'live'
+    """
+    for t in ("active", "stable", "draft", "archived", "behavior", "live"):
+        ok, errs = gate_schema(_ok_case(tier=t))
+        assert ok, f"tier={t} should be valid: {errs}"
+
+def test_schema_rejects_unknown_tier():
+    """Fail-closed: a typo'd / unknown tier is a schema error. Without this, a
+    mis-spelled tier (e.g. 'lives') would silently become a non-gate tier (the
+    allowlist excludes anything unknown) — a case that looks gated but isn't."""
+    ok, errs = gate_schema(_ok_case(tier="bogus"))
+    assert not ok and any("tier" in e for e in errs), errs
+
 
 # ── G2 duplicate (structural) ──
 def test_duplicate_detects_same_verification():
@@ -103,6 +125,19 @@ def test_redline_true_empty_evaluators_rejected():
 def test_redline_false_not_validated_as_redline():
     # redline: false with a junk evaluator is fine — it's not a red-line.
     ok, errs = gate_redline(_ok_case(redline=False, evaluators=["nonexistent_evaluator"]))
+    assert ok, errs
+
+def test_redline_true_on_live_tier_rejected():
+    # P8/tier isolation: compute_redline is deliberately tier-blind (any redline
+    # fail/error vetoes a release). A live-tier case is runtime-state-dependent
+    # and WILL flap — it must never be a release red-line, or it re-enters the
+    # gate it was created to escape. gate_redline refuses the combination.
+    ok, errs = gate_redline(_ok_case(redline=True, tier="live", evaluators=["file_contains"]))
+    assert not ok and "live" in " ".join(errs).lower()
+
+def test_redline_true_on_active_tier_still_ok():
+    # Guard against over-reach: a normal (non-live) red-line stays valid.
+    ok, errs = gate_redline(_ok_case(redline=True, tier="active", evaluators=["file_contains"]))
     assert ok, errs
 
 def test_validate_case_wires_gate_redline():

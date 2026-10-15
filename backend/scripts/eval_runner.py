@@ -120,17 +120,38 @@ _GATE_CODE_PATHS = [
 # slower — bounded by a per-case timeout. The gate reads the COMMITTED report
 # (ci_eval_gate), not the per-session canary, so a generous timeout never flakes
 # the gate. MUST mirror golden_case_validator._GATE_ELIGIBLE_EVALUATORS.
+LIVE_TIER = "live"
+# A deterministic case whose verification depends on RUNTIME STATE (a built
+# code_intel.db, a live workspace) rather than being self-verifiable in a bare
+# git checkout — e.g. GS_COD010 (route-query over the live code graph). Such a
+# case is a legitimate corpus member (get_golden_set returns it, so it runs
+# post-deploy / manually), but it must NOT gate a release: a transient
+# runtime-state miss (an index-rebuild window) would otherwise flap the BVT gate
+# red with no code regression. So LIVE_TIER is deliberately ABSENT from
+# _GATE_TIERS (the fail-closed allowlist excludes it for free) AND present in the
+# promote-exclusion set below (a passing live case must never auto-promote to
+# 'stable', which IS gate-eligible — that would silently re-admit it to the gate).
+
 _GATE_TIERS = frozenset({"active", "stable"})
 # The ONLY tiers the regression gate trusts. Fail-closed ALLOWLIST (not a
 # denylist of draft/archived): a future tier wired to a gate-eligible evaluator
 # must be added here DELIBERATELY, never admitted by default. active = standard
 # trusted case; stable = promote()-proven case (still returned by get_golden_set
-# as an active gate member). draft (not yet trustworthy) and archived (soft-
-# deleted) are absent by construction, as is any unknown/experimental tier.
+# as an active gate member). draft (not yet trustworthy), archived (soft-
+# deleted) and live (runtime-state-dependent, non-gate) are absent by
+# construction, as is any unknown/experimental tier.
 # NOTE: the 3-4 other tier-set sites in eval_service (get_golden_set excludes
 # only archived; affected_by excludes archived+stable; promote excludes
-# archived+stable+draft) encode DIFFERENT intents and are deliberately NOT
+# archived+stable+draft+live) encode DIFFERENT intents and are deliberately NOT
 # unified with this constant.
+
+# Tiers that promote_stable_cases (eval_service) must NEVER auto-promote to
+# 'stable'. SSOT consumed cross-module (eval_service imports it) so the live-tier
+# invariant — a passing live case must not slip into the gate via promotion —
+# lives in exactly one place. archived/stable/draft were already non-promotable;
+# live joins them: 'stable' is gate-eligible, so promoting a live case would
+# silently re-admit a runtime-state-dependent case to the release gate.
+_NON_PROMOTABLE_TIERS = frozenset({"archived", "stable", "draft", LIVE_TIER})
 _GATE_ELIGIBLE_EVALUATORS = frozenset(
     {"file_contains", "keyword_match", "trajectory_exact",
      "trajectory_in_order", "trajectory_any_order", "canary_pass",

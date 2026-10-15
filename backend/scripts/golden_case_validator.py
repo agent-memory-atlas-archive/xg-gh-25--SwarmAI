@@ -32,6 +32,27 @@ from pathlib import Path
 
 _REQUIRED = ("id", "category", "dimension", "eval_method", "affected_by", "evaluators")
 
+# Allowlist of valid tier values (fail-closed). A PRESENT tier must be one of
+# these; an ABSENT tier is valid (defaults to 'active' downstream). Without this
+# enum a typo'd tier (e.g. 'lives') silently becomes a non-gate tier — the gate's
+# fail-closed allowlist excludes anything unknown, so the case LOOKS gated but is
+# not. 'live' = runtime-state-dependent, non-gate; 'behavior' =
+# llm/trajectory cases; draft/archived = lifecycle; active/stable = gate-eligible.
+# Mirrors the tier vocabulary used across eval_runner._GATE_TIERS +
+# eval_service (get_golden_set/promote/affected_by).
+_VALID_TIERS = frozenset({"active", "stable", "draft", "archived", "behavior", "live"})
+
+# Tiers that may NEVER carry redline:true. eval_runner.compute_redline is
+# deliberately tier-BLIND (any redline fail/error vetoes a release, by Gate-1
+# design) — so the only place to keep a flap-prone 'live' case OUT of the
+# release red-line is HERE, at admission. A live case is runtime-state-dependent
+# and WILL flap in an index-rebuild window; letting it be a red-line would
+# re-admit it to the very release gate the live tier exists to escape (via the
+# tier-blind redline path, not promote/_GATE_TIERS). Keeps both designs pure:
+# redline stays tier-blind at runtime; live stays non-gating by never qualifying
+# as a red-line. (Gate-2 adversarial MED: compute_redline tier-blindness.)
+_NON_REDLINE_TIERS = frozenset({"live"})
+
 # Fields excluded from the content-bound stamp. _origin is injected by
 # eval_service on load + stripped on write; validated_by_4gate is the stamp
 # itself (circularity); tags/notes/promoted_from are eval_service
@@ -129,6 +150,11 @@ def gate_schema(case: dict) -> tuple[bool, list[str]]:
         errs.append("affected_by must be a list")
     if case.get("evaluators") is not None and not isinstance(case.get("evaluators"), list):
         errs.append("evaluators must be a list")
+    # tier is optional (absent → 'active' downstream); a PRESENT tier must be a
+    # known value (fail-closed enum — a typo'd tier silently becomes non-gate).
+    tier = case.get("tier")
+    if tier is not None and tier not in _VALID_TIERS:
+        errs.append(f"unknown tier {tier!r} (valid: {sorted(_VALID_TIERS)})")
     return (not errs, errs)
 
 
@@ -192,6 +218,12 @@ def gate_redline(case: dict) -> tuple[bool, list[str]]:
     if not isinstance(rl, bool):
         return False, [f"redline: must be a boolean (got {type(rl).__name__} {rl!r})"]
     if rl is True:
+        tier = case.get("tier")
+        if tier in _NON_REDLINE_TIERS:
+            return False, [f"redline: a {tier!r}-tier case may not be a red-line — "
+                           "it is runtime-state-dependent and would flap the release "
+                           "veto (compute_redline is tier-blind by design). Keep it "
+                           "non-gating: remove redline:true or move it off the live tier."]
         evs = case.get("evaluators") or []
         if not (set(evs) & _RUNNABLE_EVALUATORS):
             return False, ["redline: a zero-tolerance case must declare at least one "

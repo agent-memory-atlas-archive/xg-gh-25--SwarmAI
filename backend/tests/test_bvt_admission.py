@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.eval_runner import compute_bvt, _GATE_ELIGIBLE_EVALUATORS  # noqa: E402
+from scripts.eval_runner import compute_bvt, _GATE_ELIGIBLE_EVALUATORS, LIVE_TIER  # noqa: E402
 from scripts.golden_case_validator import compute_case_stamp  # noqa: E402
 
 
@@ -88,6 +88,23 @@ def test_unknown_tier_fail_closed():
     c = _stamped(id="GS_CANARY", tier="canary")
     bvt = compute_bvt([c], [_result("GS_CANARY")])
     assert bvt["total"] == 0
+
+
+def test_live_tier_excluded_from_gate():
+    """The 'live' tier marks a deterministic case that depends on
+    runtime state (a built code_intel.db / live workspace) rather than being
+    self-verifiable in a bare git checkout — e.g. GS_COD010. Such a case must stay
+    in the corpus (get_golden_set returns it, so it runs post-deploy/manually) but
+    must NOT enter the BVT release gate: a transient runtime-state miss (index
+    rebuild window) would otherwise flap the gate red. LIVE_TIER is NOT in
+    _GATE_TIERS, so compute_bvt excludes it — proven here with a FAILING live case
+    that must not count toward (or redden) the gate."""
+    live = _stamped(id="GS_LIVE", tier=LIVE_TIER)
+    active = _stamped(id="GS_ACTIVE")
+    # live case FAILS, active case passes
+    bvt = compute_bvt([live, active], [_result("GS_LIVE", "failed"), _result("GS_ACTIVE")])
+    assert bvt["total"] == 1, "only the active case is gated; live is excluded"
+    assert bvt["passed"] == 1 and bvt["green"], "a failing live case must NOT redden the gate"
 
 
 def test_missing_tier_defaults_to_counted():

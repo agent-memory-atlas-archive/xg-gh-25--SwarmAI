@@ -831,13 +831,21 @@ class EvalService:
         behavior case declaring affected_by:[AGENT.md] would silently spawn
         agents from a PostToolUse hook on every governance edit (adversarial
         Gate-2 MED, run_75b656c1).
+
+        Also excludes 'live'-tier cases: they depend on runtime state (a built
+        index / live workspace) and WILL flap in a rebuild window. Auto-firing
+        one from the change-trigger hook on an ordinary edit would surface a
+        transient runtime-state miss as a spurious canary failure — the exact
+        flap the live tier exists to prevent. This is a tier-set site (P8):
+        'live' is non-auto-triggerable here, same as it is non-gate-eligible in
+        compute_bvt and non-promotable in promote_stable_cases.
         """
         # Normalize: strip paths, keep filename only
         filenames = {f.split("/")[-1] for f in changed_files}
 
         return [
             c for c in self._cases
-            if c.get("tier") not in ("archived", "stable")
+            if c.get("tier") not in ("archived", "stable", "live")
             and c.get("eval_method") != "behavior"
             and any(af in filenames for af in c.get("affected_by", []))
         ]
@@ -849,9 +857,14 @@ class EvalService:
         """
         promoted = []
 
+        # SSOT: the non-promotable tier set lives in eval_runner (imported here so
+        # the live-tier invariant — a passing 'live' case must never auto-promote
+        # into gate-eligible 'stable' — is defined in exactly one place).
+        from scripts.eval_runner import _NON_PROMOTABLE_TIERS
+
         with self._data_lock:
             for case in self._cases:
-                if case.get("tier") in ("archived", "stable", "draft"):
+                if case.get("tier") in _NON_PROMOTABLE_TIERS:
                     continue
 
                 case_id = case["id"]
