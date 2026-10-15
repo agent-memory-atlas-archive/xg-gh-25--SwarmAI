@@ -229,10 +229,23 @@ def _payload_json(user_message: str | None, content: list[dict] | None) -> str:
     ``messages_fts`` then indexes escape tokens instead of Chinese (run_a7587134).
     """
     from database.sqlite import dumps_json
+    from .session_utils import strip_tool_call_leak
 
+    # Strip raw tool-call leaks before persisting (this is the SECOND user-content
+    # write door — the raw INSERT below bypasses SQLiteMessagesTable.put, so the
+    # assistant path's _clean_blocks_for_persist does NOT run here). Without this a
+    # user who re-feeds a prior turn's on-screen leak remnant persists a raw
+    # <invoke> body that resume then splices back into the prompt, re-inducing the
+    # leak. strip is lossless on clean text + preserves fenced/inline discussion.
     if content is not None:
-        return dumps_json(content)
-    return dumps_json([{"type": "text", "text": user_message or ""}])
+        cleaned = [
+            {**b, "text": strip_tool_call_leak(b["text"])}
+            if isinstance(b, dict) and isinstance(b.get("text"), str)
+            else b
+            for b in content
+        ]
+        return dumps_json(cleaned)
+    return dumps_json([{"type": "text", "text": strip_tool_call_leak(user_message or "")}])
 
 
 # ---------------------------------------------------------------------------

@@ -642,3 +642,77 @@ def test_orchestrator_strips_leak_but_keeps_prose_in_mixed_message():
     joined = "\n".join(asst_texts)
     assert "Rendering now." in joined
     assert "<invoke name=" not in joined
+
+
+# ── 4. user-side persist strip (run_67250d95) ──────────────────────────────
+# The ONLY path a RAW <invoke> body persists to data.db is a USER message:
+# assistant-persist funnels through _clean_blocks_for_persist, but user-persist
+# did not. Two user-content write doors (R27 + Gate-1): session_router's
+# db.messages.put (production) and session_pending._payload_json (the raw-INSERT
+# second door). Both must strip. Verified harm: data.db had 2 raw rows, both
+# role=user — a user re-fed a prior turn's on-screen leak remnant.
+
+def _decode_payload_text(payload: str) -> str:
+    """Reconstruct the human-readable text from a _payload_json result.
+
+    MUST decode (not substring-match the raw JSON): dumps_json escapes `"` →
+    `\\"`, so a raw `<invoke name="Bash">` in the text serializes to
+    `<invoke name=\\"Bash\\">` and a naive `'<invoke name="Bash">' in payload`
+    is ALWAYS False — a vacuous assertion that passes with OR without the strip
+    (RP47 theater, caught at BUILD). Decoding back to the real text restores the
+    bytes detect_tool_call_leak actually judges."""
+    import json
+    blocks = json.loads(payload)
+    return "\n".join(b.get("text", "") for b in blocks if isinstance(b, dict))
+
+
+def test_payload_json_strips_user_message_leak():
+    """session_pending._payload_json (the 2nd write door, raw INSERT) must strip
+    a raw <invoke> body from a user_message. Mutation proof: without the strip,
+    the DECODED payload text contains the raw <invoke> → detect fires → RED."""
+    from core.session_pending import _payload_json
+    leak = 'why does this keep happening \'core\n<invoke name="Bash">\n<parameter name="command">ls</parameter>'
+    text = _decode_payload_text(_payload_json(leak, None))
+    assert '<invoke name="Bash">' not in text, text
+    assert detect_tool_call_leak(text) is False, text
+
+
+def test_payload_json_strips_user_content_leak():
+    """Same door, content (multimodal) path: a raw <invoke> body in a content
+    block must be stripped (judged on the DECODED text, not the escaped JSON)."""
+    from core.session_pending import _payload_json
+    content = [{"type": "text", "text": 'look:\n<invoke name="Bash">\n<parameter name="command">rm</parameter>'}]
+    text = _decode_payload_text(_payload_json(None, content))
+    assert '<invoke name="Bash">' not in text, text
+    assert detect_tool_call_leak(text) is False, text
+
+
+def test_payload_json_preserves_clean_and_fenced():
+    """No over-reach: clean text + a fenced <invoke discussion survive intact."""
+    from core.session_pending import _payload_json
+    # clean
+    assert "hello world" in _decode_payload_text(_payload_json("hello world", None))
+    # fenced discussion must be preserved (strip only removes RAW leaks)
+    fenced = 'the leak looks like ```\n<invoke name="Bash">\n```'
+    text = _decode_payload_text(_payload_json(fenced, None))
+    assert "<invoke" in text, "fenced discussion wrongly stripped: " + text
+
+
+def test_session_router_user_persist_calls_clean():
+    """session_router's user-persist path must pass user_content through
+    _clean_blocks_for_persist before db.messages.put. Asserts the call-site wiring
+    by source inspection (the production db.messages.put at the user-persist guard
+    is fed a cleaned list). Mutation proof: remove the _clean_blocks_for_persist
+    call from the user-persist block → this assertion RED."""
+    import inspect
+    from core import session_router
+    src = inspect.getsource(session_router)
+    # The user-persist block (role:"user") must clean user_content. Narrow to the
+    # region around the user put and assert the clean call is present there.
+    idx = src.find('"role": "user"')
+    assert idx != -1, "user-persist put not found"
+    window = src[max(0, idx - 800):idx]
+    assert "_clean_blocks_for_persist(user_content)" in window, (
+        "user_content is persisted WITHOUT _clean_blocks_for_persist — the raw-leak "
+        "user-persist gap (run_67250d95) is open"
+    )

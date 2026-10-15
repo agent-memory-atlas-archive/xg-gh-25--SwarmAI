@@ -3008,6 +3008,13 @@ class SessionRouter:
                 await session_manager.store_session(session_id, agent_id, title)
                 _msg_metadata = {"client_id": client_id} if client_id else None
                 persisted_msg_id = str(uuid4())
+                # Strip raw tool-call leaks before persisting — symmetric with the
+                # assistant path (_clean_blocks_for_persist at the assistant put).
+                # The ONLY way a raw <invoke> body reaches data.db is a USER message
+                # (a user re-feeding a prior turn's on-screen leak remnant); without
+                # this, resume splices it back into the prompt and re-induces the
+                # leak. Lossless on clean text; fenced/inline discussion preserved.
+                user_content = _clean_blocks_for_persist(user_content)
                 await db.messages.put({
                     "id": persisted_msg_id,
                     "session_id": session_id,
