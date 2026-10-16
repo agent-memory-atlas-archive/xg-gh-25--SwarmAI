@@ -15,7 +15,28 @@ Pipeline-owned stage (no sibling skill).
    - **Boundaries** (required — see below)
    - **Success criteria** (required — see below)
    - **Test strategy** (required — see below)
+   - **Required experts** (declare the review experts this change MUST get — see below)
 4. If design requires uncommitted dependencies or API changes -- taste/judgment decision
+
+### Required Experts (declare the review experts this change must get)
+
+Declare, at PLAN, which code-review experts (`backend/experts/code/`) this changeset
+MUST be reviewed by — the experts whose domain the change touches (e.g. a change to
+an endpoint/handler ⇒ `security`; a concurrency/async change ⇒ `concurrency`; a
+state-machine change ⇒ `state-machine`). Record each with:
+
+```
+python backend/scripts/artifact_cli.py run-update --project <P> --run-id <run> \
+    --add-required-expert security --add-required-expert concurrency
+```
+
+This is **append-only** (D7-SAFETY③): PLAN sets the baseline, BUILD may ADD an expert
+if the changeset grows into a new domain, but **nothing removes one** — a removable
+declaration would be a channel to skip a required review. Use the registry's expert
+ids as the vocabulary (`ExpertManager.scan_experts()` / the 12 ids under
+`backend/experts/code/`). Declaring an expert does not yet block a commit (the D7
+enforcement gate is a later run); declaring it now makes the required-set explicit and
+auditable, and is the input the future gate verifies against what actually ran.
 
 ### Exhaustive File Discovery (Required — Before Writing Design Doc) `[MUST]`
 

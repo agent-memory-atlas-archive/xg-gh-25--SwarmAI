@@ -759,6 +759,161 @@ _ERROR_PATTERNS = re.compile(
 
 _PIPELINE_AUDIT_DIR = _STATE_DIR / "pipeline_agent_audit"
 
+# ---------------------------------------------------------------------------
+# Session<->run rendezvous (R1.5a — the D7 "key system")
+# ---------------------------------------------------------------------------
+# The future D7 commit-gate must resolve "which pipeline run does the committing
+# SESSION belong to". The two ids never meet anywhere else: a pipeline run_id is
+# minted by the `artifact_cli.py run-create` CLI SUBPROCESS (printed to stdout as
+# {"pipeline_id": "run_xxx"}), while the session_id the gate keys on is the
+# APP-LEVEL id in `session_context['sdk_session_id']` — set in the DAEMON at
+# session_router.py:3421, NOT the SDK subprocess's own CLAUDE_CODE_SESSION_ID env
+# (a DIFFERENT namespace — a CLI reading that env would write the mapping under the
+# wrong key and D7 would never find it; verified by trace, R1.5a Gate-1).
+#
+# A PostToolUse-Bash hook is the ONLY place both ids coexist: it runs in the daemon
+# (so ctx carries the correct app-level session_id) AND the SDK hands it the Bash
+# tool_response (so it sees run-create's stdout). It (1) revives the EXISTING-but-
+# -set-nowhere `_active_pipeline_run_id` consumer (read at the marker writer below +
+# the compaction briefing) and (2) persists a session_<sid>_run.map file into the
+# SAME _PIPELINE_AUDIT_DIR the gate already scans by session_id.
+
+# Matches the run-create stdout line. The CLI prints a compact JSON object; we read
+# the pipeline_id field rather than regex-sniffing a bare run_xxx so a run id quoted
+# elsewhere in the output (an error echoing a prior id) can't be mistaken for THIS
+# call's result.
+_RUN_CREATE_CMD_RE = re.compile(r"artifact_cli\.py\s+run-create\b")
+
+
+def _session_run_map_path(session_id: str) -> Path:
+    """Disk rendezvous file: session_id -> owning pipeline run_id.
+
+    Lives in _PIPELINE_AUDIT_DIR (the same dir the adversarial commit gate scans by
+    session_id), so a future cross-process reader resolves it the identical way it
+    already finds markers. One file per session; last run-create in a session wins
+    (a session runs one pipeline at a time — sibling sessions get distinct ids).
+    """
+    return _PIPELINE_AUDIT_DIR / f"session_{session_id}_run.map"
+
+
+def _extract_pipeline_id(tool_response: Any) -> Optional[str]:
+    """Pull `pipeline_id` out of a run-create tool_response (stdout), or None.
+
+    tool_response may be a dict, a str (raw stdout), or a list of content blocks
+    depending on how the SDK surfaces it — handle all three, never raise."""
+    def _from_text(text: str) -> Optional[str]:
+        # The CLI prints exactly one compact JSON object with pipeline_id. Find the
+        # LAST such object (the final line is the result; earlier lines may be logs).
+        for m in reversed(list(re.finditer(r'\{[^{}]*"pipeline_id"\s*:\s*"([^"]+)"[^{}]*\}', text))):
+            return m.group(1)
+        return None
+
+    if tool_response is None:
+        return None
+    if isinstance(tool_response, dict):
+        pid = tool_response.get("pipeline_id")
+        if isinstance(pid, str) and pid:
+            return pid
+        # SDK sometimes wraps stdout under common keys
+        for k in ("stdout", "output", "content", "text"):
+            v = tool_response.get(k)
+            if isinstance(v, str) and v:
+                got = _from_text(v)
+                if got:
+                    return got
+        return None
+    if isinstance(tool_response, str):
+        return _from_text(tool_response)
+    if isinstance(tool_response, list):
+        for block in tool_response:
+            if isinstance(block, dict):
+                t = block.get("text") or block.get("content")
+                if isinstance(t, str):
+                    got = _from_text(t)
+                    if got:
+                        return got
+    return None
+
+
+def create_pipeline_run_mapping_hook(session_context: Optional[dict] = None):
+    """PostToolUse-Bash hook: join the just-created run_id with THIS session.
+
+    On a `artifact_cli.py run-create` Bash call, parses the printed pipeline_id from
+    tool_response, sets ``session_context['_active_pipeline_run_id']`` (reviving the
+    existing-but-dead consumer the marker writer reads), and persists a
+    session_<sid>_run.map rendezvous file. The disk write runs OFF-LOOP
+    (asyncio.to_thread) + atomic (write temp, os.replace) — the same discipline the
+    sibling SubagentStop audit hook uses, so a busy disk never blocks the event loop
+    and a crash mid-write never leaves a torn map. Pure plumbing: writes NO gate
+    verdict, changes NO existing marker shape."""
+    ctx = session_context if session_context is not None else {}
+
+    async def _hook(input_data: Any, tool_use_id: Any, context: Any) -> dict:
+        if _extract_field(input_data, "tool_name", "") != "Bash":
+            return {}
+        tool_input = _extract_field(input_data, "tool_input", {})
+        command = tool_input.get("command", "") if isinstance(tool_input, dict) else ""
+        if not command or not _RUN_CREATE_CMD_RE.search(command):
+            return {}
+
+        tool_response = _extract_field(input_data, "tool_response", None)
+        run_id = _extract_pipeline_id(tool_response)
+        if not run_id:
+            return {}  # run-create failed / unparseable → nothing to map
+
+        session_id = ctx.get("sdk_session_id", "") or ""
+        # Revive the in-process consumer immediately (marker writer + compaction
+        # briefing read ctx['_active_pipeline_run_id']). This half needs no disk.
+        ctx["_active_pipeline_run_id"] = run_id
+
+        if not session_id:
+            return {}  # no session to key the disk rendezvous on — ctx half still done
+
+        def _persist() -> None:
+            try:
+                _PIPELINE_AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+                dest = _session_run_map_path(session_id)
+                payload = json.dumps({
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "ts": time.time(),
+                })
+                # Atomic: write a temp sibling then os.replace — a torn map read by
+                # the gate would be worse than a missing one.
+                tmp = dest.with_suffix(".map.tmp")
+                tmp.write_text(payload)
+                tmp.replace(dest)
+            except Exception as e:  # never break the hook path
+                logger.debug("pipeline_run_mapping: persist failed: %s", e)
+
+        await asyncio.to_thread(_persist)
+        return {}
+
+    return _hook
+
+
+def _expert_id_from_agent_type(agent_type: str) -> Optional[str]:
+    """Derive a structured expert_id from the SubagentStop agent_type, or None.
+
+    R1.5a makes the adversarial marker CARRY which expert ran. The spawn mechanism
+    that stamps an expert's registry id onto its subagent_type is R1.5b/R2 work —
+    so today this is a best-effort, nullable derivation: if agent_type already looks
+    like a bare expert id (a known registry shape: lowercase, hyphenated, no spaces),
+    use it; otherwise None. Deliberately conservative — a WRONG expert_id would later
+    mislead the D7 gate, so when unsure we record None (the gate treats None as
+    "unattributed", never as a specific expert). No gate reads this field yet."""
+    st = (agent_type or "").strip()
+    if not st:
+        return None
+    # A registry expert id is lowercase, hyphen-or-alnum, no whitespace/colons
+    # (e.g. "correctness", "state-machine", "security"). A generic SDK agent_type
+    # like "Explore"/"general-purpose"/"claude" also matches that shape, so this is
+    # intentionally NOT authoritative — R1.5b replaces it with a spawn-stamped id.
+    if re.fullmatch(r"[a-z][a-z0-9-]*", st):
+        return st
+    return None
+
+
 # Adversarial-intent classification (Plan B v4). The commit gate
 # (security_hooks.create_adversarial_commit_gate) must pass ONLY when an
 # ADVERSARIAL-review sub-agent completed this session — not any sub-agent (an
@@ -920,6 +1075,14 @@ def create_agent_tool_audit_hook(
                         "session_id": session_id,
                         "adversarial": True,
                         "agent_type": agent_type or "unknown",
+                        # R1.5a: carry WHICH expert ran (structured), not just THAT an
+                        # adversarial sub-agent ran — the D7 gate (R1.5b) will match a
+                        # run's declared required_experts against the expert_ids that
+                        # actually completed. This run only makes the field CARRIABLE;
+                        # it is nullable and derived from agent_type (full semantic
+                        # resolution of a spawned-expert's id is R1.5b's job). No gate
+                        # reads it yet — pure plumbing.
+                        "expert_id": _expert_id_from_agent_type(agent_type),
                     }
                     # Plan A diff-relevance: bind the review to the paths it covered.
                     # KEY PRESENCE is load-bearing — reviewed_paths present (incl. [])
@@ -1797,6 +1960,15 @@ def register_runtime_hooks(
         "PostToolUse",
         create_file_tracker(session_context),
         "file_tracker",
+    )
+
+    # R1.5a: PostToolUse session<->run rendezvous. Detects `artifact_cli.py
+    # run-create`, revives _active_pipeline_run_id in ctx, and persists a
+    # session_<sid>_run.map file for the future D7 commit-gate. Pure plumbing.
+    registry.register(
+        "PostToolUse",
+        create_pipeline_run_mapping_hook(session_context),
+        "pipeline_run_mapping",
     )
 
     # Phase 2: PostToolUse session checkpoint

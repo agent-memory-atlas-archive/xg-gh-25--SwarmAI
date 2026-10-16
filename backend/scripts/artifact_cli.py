@@ -2884,6 +2884,27 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
             run_state.get("files_touched"), args.files_touched
         )
 
+    if args.add_required_expert:
+        # ── R1.5a: required_experts is APPEND-ONLY (D7-SAFETY③) ─────────────────
+        # The IC declares the experts a run MUST spawn (at PLAN); BUILD may ADD more
+        # (a changeset that grows past a dispatch threshold needs another expert),
+        # but NOTHING may REMOVE one — a removable declaration is a skip channel (an
+        # IC could drop an expert to dodge the future D7 gate). There is deliberately
+        # NO --remove-required-expert flag anywhere; the only mutation is this append.
+        # Idempotent: re-adding a declared id is a no-op (order-preserving dedup),
+        # mirroring the files_touched discipline above. The list is STORED this run
+        # but READ by no gate yet (that is R1.5b) — pure plumbing.
+        existing = run_state.get("required_experts")
+        if not isinstance(existing, list):
+            existing = []
+        seen = {str(e).strip() for e in existing if isinstance(e, str)}
+        for eid in args.add_required_expert:
+            eid = str(eid).strip()
+            if eid and eid not in seen:
+                existing.append(eid)
+                seen.add(eid)
+        run_state["required_experts"] = existing
+
     run_state["updated_at"] = now
     run_file.write_text(json.dumps(run_state, indent=2), encoding="utf-8")
 
@@ -6703,6 +6724,8 @@ def main() -> None:
     p_run_update.add_argument("--profile", default=None, help="Pipeline profile override")
     p_run_update.add_argument("--ddd-checksums", default=None, help="DDD doc checksums JSON (from ddd-check)")
     p_run_update.add_argument("--files-touched", default=None, help="JSON array of source file paths THIS run wrote (dedup-appended to run.json files_touched; consumed by run-commit)")
+    p_run_update.add_argument("--add-required-expert", default=None, action="append", metavar="EXPERT_ID",
+                              help="APPEND an expert id to run.json required_experts (R1.5a, D7 key-system; append-only — repeatable, idempotent, NEVER removes). The future D7 gate verifies declared ⊆ actually-ran.")
     p_run_update.add_argument("--force-checkpoint", action="store_true", help="Override the confabulation guard when setting --status paused")
     # C1: revive a TERMINAL run (completed/failed/cancelled/abandoned) back to
     # running/paused — requires BOTH --force and --reason (auditable override).
