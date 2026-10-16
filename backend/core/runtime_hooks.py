@@ -1179,7 +1179,17 @@ def _read_subagent_prompt_head(transcript_path: str) -> str:
                 msg = rec.get("message", rec)
                 content = msg.get("content", "") if isinstance(msg, dict) else msg
                 if isinstance(content, list):  # content-block array
-                    content = " ".join(
+                    # Join with "\n", NOT " ": the SDK can split the first user
+                    # message into multiple text blocks (observed: a resume-history
+                    # block + the prompt block). A SPACE join collapses the newline
+                    # after the `EXPERT-ID: <id>` anchor line into trailing text on
+                    # that line, so the `^EXPERT-ID: <id>\s*$` extractor (which
+                    # requires the id to END the line) fails → expert_id=None → the
+                    # D7 commit-gate false-blocks a completed review. "\n" preserves
+                    # the real line boundary so the anchor stays its own line, while
+                    # genuinely authored trailing junk on one line stays junk (the
+                    # extractor regex is UNCHANGED — the fail-safe tests still hold).
+                    content = "\n".join(
                         b.get("text", "") for b in content if isinstance(b, dict)
                     )
                 if isinstance(content, str) and content.strip():

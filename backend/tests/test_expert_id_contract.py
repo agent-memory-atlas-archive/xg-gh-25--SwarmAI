@@ -180,3 +180,39 @@ def test_e2e_content_block_array_transcript(tmp_path):
     transcript.write_text(json.dumps(rec) + "\n", encoding="utf-8")
     head = rh._read_subagent_prompt_head(str(transcript))
     assert rh._extract_expert_id(head) == "security"
+
+
+def test_e2e_multiblock_content_array_preserves_anchor(tmp_path):
+    """ROOT-CAUSE case (the D7 false-block bug): the SDK delivers the first user
+    record as a MULTI-element content-block array — the EXPERT-ID anchor is its
+    OWN block (or ends one), and the next line of the spawn prompt is a SEPARATE
+    block. `_read_subagent_prompt_head` must join blocks WITHOUT collapsing the
+    newline after the anchor line, else the `^EXPERT-ID: <id>\\s*$` extractor fails
+    (space-joined `EXPERT-ID: correctness You are a...` has trailing text on the
+    anchor line → None → marker expert_id=None → D7 completed-set misses the expert
+    → false-refuse).
+
+    MUTATION-PROOF: reverting the join in `_read_subagent_prompt_head` from
+    `"\\n".join` back to `" ".join` makes this assertion go RED (the space collapses
+    the seam). That is what proves the fix is load-bearing, not vacuous.
+
+    Observed in production: 11 of 113 real first-user-messages were multi-text-block
+    (resume-history block + prompt block); the collapse is the exact intermittent
+    `expert_id=None` seen in run_22321ff4 / run_025d7849 markers.
+    """
+    transcript = tmp_path / "t3.jsonl"
+    # Two separate text blocks: anchor line is block 0, the prompt body is block 1.
+    rec = {
+        "type": "user",
+        "message": {
+            "content": [
+                {"type": "text", "text": "EXPERT-ID: correctness"},
+                {"type": "text", "text": "You are a specialist reviewer.\nAdversarially review this diff."},
+            ]
+        },
+    }
+    transcript.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+    head = rh._read_subagent_prompt_head(str(transcript))
+    assert head, "head read must return the joined spawn prompt"
+    # The anchor must survive block-join as a line of its own → extractable.
+    assert rh._extract_expert_id(head) == "correctness"
