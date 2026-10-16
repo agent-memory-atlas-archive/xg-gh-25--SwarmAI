@@ -46,6 +46,9 @@ jobs:
       - name: Lint skill corpus (metadata + no machine-local references)
         run: python scripts/lint_skills.py
 
+      - name: Lint expert corpus (D3 admission — spawn_as/domain/scope, no memory)
+        run: python scripts/lint_experts.py
+
       - name: Build BVT test list
         id: test-list
         working-directory: ./backend

@@ -147,7 +147,7 @@ sub-agent prompt — only raw diff + raw ACs.
 
 3. **Spawn Spec Compliance sub-agent** using the Agent tool:
    ```
-   Prompt template: review-agents/spec-compliance.md
+   Prompt template: backend/experts/code/spec-compliance.md
    Context: acceptance_criteria + code diff + commit messages
    ```
    The sub-agent returns a JSON report with verdict + coverage matrix.
@@ -218,21 +218,21 @@ single assistant turn** so they execute in parallel. Each sub-agent reads the
 changeset + relevant DDD docs independently.
 
 ```
-Sub-agent prompts are in: backend/skills/s_autonomous-pipeline/review-agents/
+Sub-agent prompts are in: backend/skills/s_autonomous-pipeline/backend/experts/code/
 
 [Already completed before fan-out — see Spec Compliance Gate above]
-  Spec Compliance Agent (review-agents/spec-compliance.md)
+  Spec Compliance Agent (backend/experts/code/spec-compliance.md)
   → AC coverage matrix, MISSING/EXTRA/MISUNDERSTOOD detection
 
 [Parallel fan-out agents — spawned in single turn]
-1. Code Quality Agent (review-agents/code-quality.md)
+1. Code Quality Agent (backend/experts/code/code-quality.md)
    → TECH.md conformance, integration trace, replace/move parity,
      runtime patterns RP1-RP88, depth & seam analysis
 
-2. Security & Safety Agent (review-agents/security-safety.md)
+2. Security & Safety Agent (backend/experts/code/security.md)
    → Confidence-gated security scan, wire test, blast radius trace
 
-3. UX & Test Agent (review-agents/ux-test.md) — ONLY when frontend files changed
+3. UX & Test Agent (backend/experts/code/ux-test.md) — ONLY when frontend files changed
    → UX review (UX1-UX5), test coverage gaps, E2E trace
 ```
 

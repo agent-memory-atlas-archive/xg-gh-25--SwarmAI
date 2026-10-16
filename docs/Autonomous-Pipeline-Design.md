@@ -208,7 +208,7 @@ The pipeline spawns fresh-context sub-agents at two points:
 | **REVIEW** (parallel fan-out) | Up to 3 parallel sub-agents | Code quality + security + UX review |
 | **DELIVER** (adversarial gate) | Up to 5 specialist sub-agents + 1 meta-review | Fresh-eyes adversarial attack on complete delivery |
 
-Sub-agents use **review-agents/** (4 domain agents) and **stages/specialists/** (9 specialist profiles).
+Sub-agents use **backend/experts/code/** (12 unified code-review experts — formerly review-agents/ + stages/specialists/).
 
 ### The Three Gates — Three Moments of Truth
 
@@ -480,10 +480,10 @@ Plus **Meta-Review** sub-agent for operational blind spots.
 
 | Agent | File | Responsibility |
 |-------|------|---------------|
-| **Spec Compliance** | `review-agents/spec-compliance.md` | AC verification: MISSING / EXTRA / MISUNDERSTOOD. Serial, blocking. |
-| **Code Quality** | `review-agents/code-quality.md` | RP checklist (RP1-RP84), integration trace, replace/move parity, depth/seam analysis |
-| **Security & Safety** | `review-agents/security-safety.md` | Confidence-gated security scan (1-10 per file + exploit scenario), wire test WR1-4 |
-| **UX & Test** | `review-agents/ux-test.md` | Frontend-only. Discoverability, feedback states, escape handling, E2E trace |
+| **Spec Compliance** | `backend/experts/code/spec-compliance.md` | AC verification: MISSING / EXTRA / MISUNDERSTOOD. Serial, blocking. |
+| **Code Quality** | `backend/experts/code/code-quality.md` | RP checklist (RP1-RP84), integration trace, replace/move parity, depth/seam analysis |
+| **Security & Safety** | `backend/experts/code/security.md` | Confidence-gated security scan (1-10 per file + exploit scenario), wire test WR1-4 |
+| **UX & Test** | `backend/experts/code/ux-test.md` | Frontend-only. Discoverability, feedback states, escape handling, E2E trace |
 
 ### Specialists (9 Deep Reviewers)
 
@@ -813,22 +813,7 @@ s_autonomous-pipeline/
 │   ├── deliver.md              # Stage 7: convergence + adversarial (Gate 2)
 │   ├── reflect.md              # Stage 8: lessons + cultivation
 │   ├── complete.md             # Terminal: completion summary + exec summary output format
-│   ├── goal_cycle.md           # Goal profile: iterative loop
-│   └── specialists/            # 9 deep-review specialist profiles
-│       ├── api-contract.md
-│       ├── concurrency.md
-│       ├── correctness.md
-│       ├── integration.md
-│       ├── operational.md
-│       ├── performance.md
-│       ├── red-team.md
-│       ├── security.md
-│       └── state-machine.md
-├── review-agents/              # 4 domain review agents
-│   ├── spec-compliance.md
-│   ├── code-quality.md
-│   ├── security-safety.md
-│   └── ux-test.md
+│   └── goal_cycle.md           # Goal profile: iterative loop
 └── scripts/                    # Pipeline-local tooling
     ├── confidence_score.py     # Delivery gate scorer
     ├── goal_metrics.py         # Goal loop velocity tracking
@@ -837,7 +822,26 @@ s_autonomous-pipeline/
 
 backend/scripts/                # Shared pipeline engine (not skill-local)
 ├── artifact_cli.py             # State machine + artifact storage + code-enforced gates
-└── pipeline_validator.py       # Stage-boundary schema + gate validation (publish-time)
+├── pipeline_validator.py       # Stage-boundary schema + gate validation (publish-time)
+└── lint_experts.py             # (repo-root scripts/) D3 admission gate — see below
+
+backend/experts/                # Expert Library — a top-level asset, NOT skill-local.
+├── _core/                      #   The 12 code-review experts (formerly stages/specialists/
+│   └── adversarial-stance.md   #   + review-agents/) were extracted here so they are a
+├── code/                       #   cross-Super-IC shared adversarial-review layer, each a
+│   ├── correctness.md          #   .md with 7-field frontmatter (expert/display_name_zh/_en/
+│   ├── concurrency.md          #   domain/scope/spawn_as/visibility). security.md is the
+│   ├── state-machine.md        #   union of the old security.md + security-safety.md.
+│   ├── security.md             #   Registry SSOT = core/expert_manager.py (reuses
+│   ├── red-team.md             #   skill_manager.parse_frontmatter). Admission gate =
+│   ├── api-contract.md         #   scripts/lint_experts.py (CI, fail-closed on the D3 rules).
+│   ├── integration.md
+│   ├── operational.md
+│   ├── performance.md
+│   ├── spec-compliance.md
+│   ├── code-quality.md
+│   └── ux-test.md
+└── content/                    # (R3) Pollinate content-review experts — not yet created
 ```
 
 ---

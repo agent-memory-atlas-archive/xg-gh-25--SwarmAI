@@ -135,11 +135,20 @@ _IN_FENCE_TEMPLATES = (
 
 # Files that are referenced by PATH only (never pasted). They must not carry a
 # second, differently-worded copy of the contract.
+#
+# R1 Expert Library migration: the 12 code experts moved out of
+# `s_autonomous-pipeline/{stages/specialists,review-agents}/` into the top-level
+# `backend/experts/code/` asset, and `security-safety.md` merged INTO `security.md`.
+# So these path-referenced templates now live under _EXPERTS_ROOT, and the
+# security-safety entry is gone (its content is union-merged into security.md,
+# which is NOT a contract-restating template and need not be listed).
+_EXPERTS_ROOT = Path(__file__).resolve().parents[1] / "experts"
+
 _PATH_REFERENCED_TEMPLATES = (
-    _SKILL_ROOT / "review-agents" / "security-safety.md",
-    _SKILL_ROOT / "review-agents" / "code-quality.md",
-    _SKILL_ROOT / "review-agents" / "ux-test.md",
-    _SKILL_ROOT / "stages" / "specialists" / "red-team.md",
+    _EXPERTS_ROOT / "code" / "security.md",
+    _EXPERTS_ROOT / "code" / "code-quality.md",
+    _EXPERTS_ROOT / "code" / "ux-test.md",
+    _EXPERTS_ROOT / "code" / "red-team.md",
 )
 
 
@@ -222,10 +231,18 @@ def test_no_volatile_measured_values_in_skill_text():
         re.I,
     )
     offenders: list[str] = []
-    for path in sorted(_SKILL_ROOT.rglob("*.md")):
-        for i, line in enumerate(path.read_text().splitlines(), 1):
-            if banned.search(line):
-                offenders.append(f"{path.relative_to(_SKILL_ROOT)}:{i}: {line.strip()[:70]}")
+    # R1 Expert Library migration: the experts moved OUT of _SKILL_ROOT into
+    # backend/experts/, so a sweep of _SKILL_ROOT alone would silently STOP covering
+    # them (THINK falsified the "repoint-only" assumption). Scan BOTH trees so the
+    # moved experts keep the volatile-value guard.
+    scan_roots = [_SKILL_ROOT, _EXPERTS_ROOT]
+    for root in scan_roots:
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*.md")):
+            for i, line in enumerate(path.read_text().splitlines(), 1):
+                if banned.search(line):
+                    offenders.append(f"{path.relative_to(root)}:{i}: {line.strip()[:70]}")
     assert not offenders, (
         "skill text embeds values that will expire:\n  " + "\n  ".join(offenders) +
         "\nReplace each with a claim that stays true across a model or corpus "

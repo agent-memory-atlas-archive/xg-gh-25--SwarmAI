@@ -396,13 +396,13 @@ git ls-files --others --exclude-standard
 
 | Specialist | Dispatch When | Checklist |
 |-----------|---------------|-----------|
-| **Correctness** | Always (if changeset > 50 lines) | `stages/specialists/correctness.md` |
-| **Security** | Files touch: routers/, handlers, auth, database queries, user input, file paths | `stages/specialists/security.md` |
-| **Performance** | Files touch: endpoints, database, loops over collections, hooks, background tasks | `stages/specialists/performance.md` |
-| **API Contract** | Files touch: routers/, schemas/, models, response types, frontend services | `stages/specialists/api-contract.md` |
-| **Integration** | Changeset creates new public functions, classes, hooks, or handlers | `stages/specialists/integration.md` |
-| **Operational** | Files touch: hooks/, jobs/, schedulers, daemon code, background tasks | `stages/specialists/operational.md` |
-| **Red Team** | CONDITIONAL: changeset > 200 lines OR any specialist found HIGH severity | `stages/specialists/red-team.md` |
+| **Correctness** | Always (if changeset > 50 lines) | `backend/experts/code/correctness.md` |
+| **Security** | Files touch: routers/, handlers, auth, database queries, user input, file paths | `backend/experts/code/security.md` |
+| **Performance** | Files touch: endpoints, database, loops over collections, hooks, background tasks | `backend/experts/code/performance.md` |
+| **API Contract** | Files touch: routers/, schemas/, models, response types, frontend services | `backend/experts/code/api-contract.md` |
+| **Integration** | Changeset creates new public functions, classes, hooks, or handlers | `backend/experts/code/integration.md` |
+| **Operational** | Files touch: hooks/, jobs/, schedulers, daemon code, background tasks | `backend/experts/code/operational.md` |
+| **Red Team** | CONDITIONAL: changeset > 200 lines OR any specialist found HIGH severity | `backend/experts/code/red-team.md` |
 
 **For bugfix profile:** Only dispatch Correctness + Security.
 
@@ -617,7 +617,7 @@ not parallel). Adds ~30s wall-clock time when triggered.
 If neither condition met, skip Red Team.
 
 **Red Team sub-agent receives:**
-1. The red-team checklist from `stages/specialists/red-team.md`
+1. The red-team checklist from `backend/experts/code/red-team.md`
 2. The merged specialist findings (so it knows what was already caught)
 3. The list of changed files
 
