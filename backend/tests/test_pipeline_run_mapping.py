@@ -9,8 +9,8 @@ Covered:
     _active_pipeline_run_id in ctx, persists the session->run map keyed by the
     APP-LEVEL session_id (NOT an env value — the identity correctness AC7).
   * _extract_pipeline_id — dict / str / list / wrapped-stdout shapes.
-  * _expert_id_from_agent_type — conservative, nullable derivation.
   * run-update --add-required-expert — append-only + idempotent + NO remove path.
+  (expert_id extraction moved to test_expert_id_contract.py in R1.5b-i.)
 """
 import asyncio
 import json
@@ -127,18 +127,10 @@ def test_mapping_key_is_app_session_not_env(tmp_path, monkeypatch):
     )
 
 
-# ---- _expert_id_from_agent_type --------------------------------------------
-
-@pytest.mark.parametrize("agent_type,expected", [
-    ("correctness", "correctness"),
-    ("state-machine", "state-machine"),
-    ("security", "security"),
-    ("", None),
-    ("Explore", None),            # capital → generic SDK type, not an expert
-    ("general purpose", None),    # whitespace → not a bare id
-])
-def test_expert_id_derivation(agent_type, expected):
-    assert rh._expert_id_from_agent_type(agent_type) == expected
+# NOTE: `_expert_id_from_agent_type` was REMOVED in R1.5b-i (方案 Z) — the expert_id
+# is no longer derived from the SDK agent_type (which is `general-purpose` for real
+# spawns). It is now extracted from the spawn-prompt's `EXPERT-ID:` anchor line; see
+# test_expert_id_contract.py for the inject↔extract contract tests.
 
 
 # ---- run-update --add-required-expert (append-only) -------------------------

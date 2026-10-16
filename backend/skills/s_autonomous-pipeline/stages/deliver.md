@@ -506,6 +506,17 @@ has fresh context — no prior review bias.
 python backend/skills/s_autonomous-pipeline/scripts/spawn_prompt.py --gate gate2-adversarial
 ```
 
+> **⚠️ ALSO fill `<EXPERT_ID>` (R1.5b-i, 方案 Z — the D7 key, do NOT skip).** The
+> template's first line is `EXPERT-ID: <EXPERT_ID>`. Fill it with the specialist's
+> **lowercase registry id** — the `<id>` from the dispatch table's `experts/code/<id>.md`
+> path (e.g. Correctness → `correctness`, API Contract → `api-contract`, Red Team →
+> `red-team`), **NOT** the Title-case `<DOMAIN>` display name. This anchor line is what
+> `runtime_hooks._extract_expert_id` reads back from the sub-agent's transcript head to
+> record which expert actually ran (the identity carried in OUR OWN prompt, never via the
+> SDK agent-registry). A Title-case or misspelled value fails the `^EXPERT-ID: [a-z…]$`
+> anchor → `expert_id` records None (unattributed) — fail-safe, but the D7 gate (R1.5b-ii)
+> then can't credit this expert, so get the lowercase id right.
+
 **Sub-agent configuration:**
 - **Do NOT pin a model.** Review quality comes from BOUNDED SCOPE + FRESH
   CONTEXT, not from a model name. The retired directive here read "use default

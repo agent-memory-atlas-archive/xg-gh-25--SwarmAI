@@ -892,26 +892,56 @@ def create_pipeline_run_mapping_hook(session_context: Optional[dict] = None):
     return _hook
 
 
-def _expert_id_from_agent_type(agent_type: str) -> Optional[str]:
-    """Derive a structured expert_id from the SubagentStop agent_type, or None.
+# R1.5b-i (方案 Z, zero Claude coupling): the expert identity is OUR OWN
+# information — we decide which expert to spawn and author its prompt — so it must
+# NOT round-trip through the SDK agent-registry (that is the rejected X/Y coupling:
+# .claude/agents or ClaudeAgentOptions.agents=). Instead the spawn prompt carries a
+# structured anchor line `EXPERT-ID: <id>` (injected by deliver.md/gate2-adversarial.md),
+# and we extract it from the sub-agent's own transcript head — the same head already
+# read for adversarial-intent classification, so no new transcript read.
+#
+# Anchored + bare-id-only ON PURPOSE: the line must START a line (`^EXPERT-ID:`),
+# the id must be a lowercase registry id (`[a-z][a-z0-9-]*`), and nothing but
+# whitespace may follow it (`\s*$`). This rejects the drift classes the natural-
+# language `_is_adversarial_intent` classifier suffers from — a Title-case value, an
+# embedded-in-prose mention, a trailing-words line — by returning None (fail-safe: a
+# wrong-shaped line yields "unattributed", never a wrong expert). This REPLACES the
+# former `_expert_id_from_agent_type`, which derived the id from the SDK `agent_type`
+# — the rejected coupling path, and `general-purpose` for real spawns.
+#
+# We validate the FIRST `EXPERT-ID:`-prefixed line ONLY — never scan past a malformed
+# one. The contract puts the anchor on line 1 of the spawn prompt; the orchestrator
+# fills review content (requirement text, changed-file paths, pasted excerpts) BELOW
+# it, inside the same 2000-char head window. A plain `.search` for the WELL-FORMED
+# pattern would skip an unfilled/malformed line 1 (`EXPERT-ID: <EXPERT_ID>`) and match
+# an attacker/author-influenced `EXPERT-ID: <id>` line in that content → wrong
+# attribution. Binding to the first EXPERT-ID line closes that: a malformed anchor
+# yields None, it is never silently overridden by injected content below.
+_EXPERT_ID_PREFIX = re.compile(r"^EXPERT-ID:.*$", re.MULTILINE)
+_EXPERT_ID_LINE = re.compile(r"^EXPERT-ID:\s*([a-z][a-z0-9-]*)\s*$")
 
-    R1.5a makes the adversarial marker CARRY which expert ran. The spawn mechanism
-    that stamps an expert's registry id onto its subagent_type is R1.5b/R2 work —
-    so today this is a best-effort, nullable derivation: if agent_type already looks
-    like a bare expert id (a known registry shape: lowercase, hyphenated, no spaces),
-    use it; otherwise None. Deliberately conservative — a WRONG expert_id would later
-    mislead the D7 gate, so when unsure we record None (the gate treats None as
-    "unattributed", never as a specific expert). No gate reads this field yet."""
-    st = (agent_type or "").strip()
-    if not st:
+
+def _extract_expert_id(prompt_head: str) -> Optional[str]:
+    """Extract the registry expert_id from a spawn-prompt head's `EXPERT-ID:` anchor
+    line, or None if absent/malformed.
+
+    Binds to the FIRST line beginning `EXPERT-ID:` and validates ONLY that line — it
+    does NOT scan forward past a malformed anchor into injected review content below
+    (which would let an author-influenced `EXPERT-ID: <id>` line mis-attribute the
+    expert).
+
+    Fail-safe by design: no `EXPERT-ID:` line, or a first one that is not a well-formed
+    `EXPERT-ID: <lowercase-id>`, returns None — it does NOT fall back to the SDK
+    agent_type (that was the rejected coupling path, and agent_type is `general-purpose`
+    for real spawns anyway). None means "unattributed"; the D7 gate (R1.5b-ii) treats
+    None as never-a-specific-expert."""
+    if not prompt_head:
         return None
-    # A registry expert id is lowercase, hyphen-or-alnum, no whitespace/colons
-    # (e.g. "correctness", "state-machine", "security"). A generic SDK agent_type
-    # like "Explore"/"general-purpose"/"claude" also matches that shape, so this is
-    # intentionally NOT authoritative — R1.5b replaces it with a spawn-stamped id.
-    if re.fullmatch(r"[a-z][a-z0-9-]*", st):
-        return st
-    return None
+    prefix = _EXPERT_ID_PREFIX.search(prompt_head)
+    if not prefix:
+        return None
+    m = _EXPERT_ID_LINE.match(prefix.group(0))
+    return m.group(1) if m else None
 
 
 # Adversarial-intent classification (Plan B v4). The commit gate
@@ -1032,14 +1062,22 @@ def create_agent_tool_audit_hook(
             # record; splitting them would double hops and let a cancellation land
             # mid-record.
             def _classify_and_write() -> None:
+                # Read the sub-agent's spawn-prompt head ONCE, UNCONDITIONALLY (R1.5b-i):
+                # it feeds BOTH adversarial-intent classification AND expert_id
+                # extraction. It MUST be read outside the `if not adversarial` branch —
+                # if agent_type already classifies adversarial, the head was never read
+                # before, so the EXPERT-ID line (and thus expert_id) would never be
+                # extracted → completed-expert set empty → the D7 gate self-locks. One
+                # read here (still inside this off-loop thread hop) serves both uses.
+                prompt_head = (
+                    _read_subagent_prompt_head(transcript_path) if transcript_path else ""
+                )
                 # Classify THIS sub-agent's intent: agent_type primary; the HEAD of
                 # its OWN transcript (spawn prompt) as fallback. Per-agent-correct by
                 # construction — this SubagentStop fires for exactly one sub-agent.
                 adversarial = _is_adversarial_intent(agent_type, "", "")
-                if not adversarial and transcript_path:
-                    prompt_head = _read_subagent_prompt_head(transcript_path)
-                    if prompt_head:
-                        adversarial = _is_adversarial_intent(agent_type, "", prompt_head)
+                if not adversarial and prompt_head:
+                    adversarial = _is_adversarial_intent(agent_type, "", prompt_head)
 
                 # Write run-specific marker if run_id available (primary path)
                 if run_id:
@@ -1075,14 +1113,15 @@ def create_agent_tool_audit_hook(
                         "session_id": session_id,
                         "adversarial": True,
                         "agent_type": agent_type or "unknown",
-                        # R1.5a: carry WHICH expert ran (structured), not just THAT an
-                        # adversarial sub-agent ran — the D7 gate (R1.5b) will match a
+                        # R1.5b-i: carry WHICH expert ran (structured), not just THAT an
+                        # adversarial sub-agent ran — the D7 gate (R1.5b-ii) will match a
                         # run's declared required_experts against the expert_ids that
-                        # actually completed. This run only makes the field CARRIABLE;
-                        # it is nullable and derived from agent_type (full semantic
-                        # resolution of a spawned-expert's id is R1.5b's job). No gate
-                        # reads it yet — pure plumbing.
-                        "expert_id": _expert_id_from_agent_type(agent_type),
+                        # actually completed. The id comes from the `EXPERT-ID:` anchor
+                        # line WE injected into the spawn prompt (方案 Z, zero Claude
+                        # coupling) and read back from this sub-agent's transcript head —
+                        # NOT from the SDK agent_type (which is `general-purpose` for real
+                        # spawns). Nullable: None = unattributed (no well-formed line).
+                        "expert_id": _extract_expert_id(prompt_head),
                     }
                     # Plan A diff-relevance: bind the review to the paths it covered.
                     # KEY PRESENCE is load-bearing — reviewed_paths present (incl. [])
