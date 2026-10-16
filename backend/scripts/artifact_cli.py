@@ -3050,7 +3050,16 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
             and s.get("status") in ("completed", "done")
         ]
 
-        if new_rank < current_rank and post_evaluate_stages:
+        # A FIRST-SET (profile was None — the by-design "not yet classified" state,
+        # cmd_run_create stores None when --profile is omitted) is NEVER a downgrade:
+        # there is no prior tier whose quality gates could be bypassed. Without this,
+        # normalize_profile(None) returns "full" (pipeline_profiles.py) → rank 4, so a
+        # run born without --profile that EVALUATE then classifies as research/docs
+        # (rank 2) was wrongly judged a downgrade (2 < 4) and trapped at the
+        # full-profile completion gate forever. The C036 guard only applies to a
+        # genuine tier→lower-tier change (a real prior profile).
+        is_first_set = current_profile is None
+        if new_rank < current_rank and post_evaluate_stages and not is_first_set:
             print(json.dumps({
                 "error": (
                     f"BLOCKED: Profile downgrade '{current_profile}' → '{args.profile}' "

@@ -2761,3 +2761,76 @@ class TestCLITrustBoundary:
         arts = list((workspace / "Projects" / "TestProject" / ".artifacts"
                      / "runs" / "run_real01").glob("evaluation-*.json"))
         assert len(arts) == 1
+
+
+class TestProfileFirstSetVsDowngrade:
+    """A run born with profile=None (profile is classified AFTER evaluate, by design —
+    cmd_run_create stores None when --profile is omitted) must be able to have its
+    profile SET for the first time to ANY tier — including a 'low' one like research —
+    without the C036 downgrade guard mistaking None for a high tier.
+
+    Bug: current_profile=None → normalize_profile(None) returns "full" → rank 4.
+    So None→research (rank 2) with a completed post-evaluate stage was judged a
+    DOWNGRADE (2 < 4) and BLOCKED — trapping a research run born without --profile at
+    the full-completion gate forever. A first-set is never a downgrade: there is no
+    prior tier whose quality gates could be bypassed."""
+
+    def _args(self, run_id, new_profile):
+        import argparse
+        attrs = ("active_only actual_effort add_required_expert adversarial_count "
+                 "alternatives backend categories command context data ddd_checksums "
+                 "dismissed escalated evaluation_id event files_estimated files_touched "
+                 "fixed force force_checkpoint frontend full indicators lessons limit "
+                 "modules outcome overlap partial probes producer profile project reason "
+                 "requirement resolved retries review_count rp_violations run_id scope "
+                 "stage stage_json state status summary taste_decision timestamp "
+                 "tokens_consumed topic type types user_override").split()
+        ns = argparse.Namespace(**{a: None for a in attrs})
+        ns.project = "TestProject"
+        ns.run_id = run_id
+        ns.profile = new_profile
+        return ns
+
+    def _born_none_with_completed_think(self, workspace, run_id):
+        """A run with profile=None and a completed post-evaluate stage (think) —
+        exactly the shape of a research run that ran evaluate+think before anyone
+        set --profile."""
+        from scripts.artifact_cli import ArtifactRegistry
+        import scripts.artifact_cli as cli
+        run_dir = workspace / "Projects" / "TestProject" / ".artifacts" / "runs" / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        run_data = {
+            "id": run_id, "project": "TestProject", "requirement": "research task",
+            "profile": None, "status": "running",
+            "stages": [
+                {"stage": "evaluate", "status": "completed", "stage_doc_consumed": True},
+                {"stage": "think", "status": "completed", "stage_doc_consumed": True},
+            ],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        (run_dir / "run.json").write_text(json.dumps(run_data, indent=2))
+        return cli, ArtifactRegistry(workspace), run_dir / "run.json"
+
+    def test_first_set_none_to_research_is_allowed(self, workspace, monkeypatch):
+        """None → research (first set, with a completed post-evaluate stage) must
+        SUCCEED — it is NOT a downgrade. RED on current code (None→"full"→rank 4)."""
+        import scripts.artifact_cli as cli
+        c, reg, rf = self._born_none_with_completed_think(workspace, "run_nr")
+        monkeypatch.setattr(cli, "_get_workspace", lambda: workspace)
+        c.cmd_run_update(self._args("run_nr", "research"), reg)
+        assert _read_run(rf)["profile"] == "research", \
+            "first-set None→research must land, not be rejected as a downgrade"
+
+    def test_genuine_downgrade_still_blocked(self, workspace, monkeypatch, capsys):
+        """No-regression: an ACTUAL downgrade (full→research with a completed
+        post-evaluate stage) must STILL be BLOCKED — the C036 guard stays intact for
+        a real prior tier."""
+        import scripts.artifact_cli as cli
+        c, reg, rf = self._born_none_with_completed_think(workspace, "run_dg")
+        d = _read_run(rf); d["profile"] = "full"; rf.write_text(json.dumps(d))
+        monkeypatch.setattr(cli, "_get_workspace", lambda: workspace)
+        with pytest.raises(SystemExit):
+            c.cmd_run_update(self._args("run_dg", "research"), reg)
+        assert _read_run(rf)["profile"] == "full", \
+            "a real full→research downgrade must remain blocked (C036)"
