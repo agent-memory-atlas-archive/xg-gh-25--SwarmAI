@@ -61,7 +61,6 @@ def _make_unit(state: SessionState = SessionState.DEAD,
     unit._retry_count = 0
     unit._recycle_kill_pending = False
     unit._buffer_overflow_recovery = False
-    unit._tool_call_leak_recovery = False
     unit._sdk_session_id = sdk_session_id
     unit._app_session_id = "app-sess-456"
     unit._model_name = "claude-opus-4-8"

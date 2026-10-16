@@ -6,19 +6,20 @@ What is tested
    distinguishes a real leak (``call`` line + line-start ``<invoke name=``) from
    prose that merely discusses the syntax inline. Table-driven, including the
    exact shapes observed in the messages DB on 2026-06-24.
-2. The StreamingOrchestrator TextBlock guard — a leaked text block is NOT
-   appended/yielded as assistant content, ``kill()`` is awaited, and a
-   RuntimeError matching a retriable pattern is raised (→ send() --resume retry).
+2. The StreamingOrchestrator TextBlock guard (去容灾化 contract) — a leaked text
+   block is STRIPPED (raw ``<invoke>`` removed) and KEPT; the turn yields to its
+   natural completion. kill()/respawn was removed — termination authority belongs
+   to the model, not a disaster-recovery kill.
 
 Key properties / invariants
 ----------------------------
 - INV1: every DB-confirmed leak shape (call+invoke) → True
 - INV2: inline-discussion + fenced-code-block mention → False (false-positive
   safety on the hottest path — every assistant text block)
-- INV3: a detected leak is retriable (``_is_retriable_error`` recognizes the
-  raised message) so the existing retry loop resumes the turn
-- INV4: the guard fires INSIDE the TextBlock branch, before persist — the
-  leaked block never reaches a yielded ``assistant`` event
+- INV3: a detected leak does NOT kill or raise — strip+keep, one path for both
+  pure-leak and leak-alongside-real-tool_use (the former fork was removed)
+- INV4: the strip fires INSIDE the TextBlock branch, before persist — the raw
+  leak never reaches a yielded ``assistant`` event (but the cleaned block does)
 """
 
 from __future__ import annotations
@@ -34,7 +35,6 @@ from pathlib import Path
 from core.session_utils import (
     detect_tool_call_leak,
     strip_tool_call_leak,
-    _is_retriable_error,
 )
 
 
@@ -107,12 +107,6 @@ def test_detector_handles_large_text_without_truncation():
     assert detect_tool_call_leak(big_leak) is True
     big_clean = "z" * 500_000
     assert detect_tool_call_leak(big_clean) is False
-
-
-def test_detected_leak_is_retriable():
-    """INV3: the RuntimeError message the guard raises is recognized as
-    retriable, so send() routes it to the --resume retry path."""
-    assert _is_retriable_error("Tool-call XML leaked into text channel (session_id=x)") is True
 
 
 # ── 1b. strip_tool_call_leak — the WRITE-side cleaner ───────────────────────
@@ -531,28 +525,41 @@ def _make_orchestrator():
     return orch
 
 
-def test_orchestrator_blocks_leaked_block_and_kills():
-    """INV4: a leaked TextBlock is not yielded as assistant content; kill() is
-    awaited and a retriable RuntimeError is raised."""
+def test_orchestrator_strips_pure_leak_and_keeps_turn():
+    """New contract (去容灾化): a PURE-LEAK TextBlock (leak text, NO real
+    tool_use) is NOT killed and does NOT raise — the leak text is STRIPPED
+    (best-effort pollution reduction) and the turn yields to natural completion.
+    Termination authority belongs to the model, not a kill+respawn.
+
+    This is the unification of the old PURE-LEAK and MIXED branches into a single
+    strip-and-keep path. Replaces the old test_orchestrator_blocks_leaked_block_
+    and_kills (which asserted the removed kill()+raise disaster-recovery)."""
     orch = _make_orchestrator()
     orch._parent._streaming_start_time = 0.0
     leak = 'analysis text\n\ncall\n<invoke name="Bash">\n<parameter name="command">cd /x</parameter>'
     msg = _make_assistant_message(leak)
 
-    events, raised = asyncio.run(_drive(orch, [msg]))
+    # A trailing ResultMessage so the turn ends via the normal result path —
+    # the turn is no longer aborted mid-stream, it completes naturally.
+    events, raised = asyncio.run(_drive(orch, [msg, _make_result_message()]))
 
-    # kill was invoked
-    assert orch._parent._kill_calls["n"] == 1
-    # a retriable RuntimeError was raised — and specifically the LEAK guard's
-    # error, not the unrelated zombie detector (proves the right path fired)
-    assert raised is not None
-    assert "Tool-call XML leaked into text channel" in str(raised)
-    assert _is_retriable_error(str(raised)) is True
-    # the leaked XML never reached a yielded assistant content event
-    for ev in events:
-        if ev.get("type") == "assistant":
-            for block in ev.get("content", []):
-                assert "<invoke name=" not in block.get("text", "")
+    # Termination authority stays with the model: NO kill, NO raise.
+    assert orch._parent._kill_calls["n"] == 0, "pure-leak must NOT kill (去容灾化)"
+    assert raised is None, "pure-leak must NOT raise — turn completes naturally"
+    # The leak text was STRIPPED but the turn's assistant content was KEPT
+    # (not dropped) — strip+keep, identical to the former MIXED branch.
+    assistant_evs = [ev for ev in events if ev.get("type") == "assistant"]
+    assert assistant_evs, "the turn's assistant content must still be yielded (kept)"
+    for ev in assistant_evs:
+        for block in ev.get("content", []):
+            # raw leak XML is stripped from the kept content
+            assert "<invoke name=" not in block.get("text", "")
+    # and the strip placeholder proves the text was cleaned, not dropped wholesale
+    assert any(
+        "[tool-call omitted]" in block.get("text", "")
+        for ev in assistant_evs
+        for block in ev.get("content", [])
+    ), "stripped leak must leave the placeholder (content kept + cleaned, not dropped)"
 
 
 def test_orchestrator_passes_clean_text_block():

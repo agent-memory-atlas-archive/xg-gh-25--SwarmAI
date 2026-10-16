@@ -1034,92 +1034,47 @@ class StreamingOrchestrator:
                 saw_assistant_message = True
                 self._parent._last_progress_time = time.time()  # real content blocks
                 content_blocks = []
-                # ── Third leak signal: does this message have a REAL tool_use? ─
-                # If the model emitted an actual ToolUseBlock, any <invoke> text
-                # in a sibling TextBlock is the model TALKING about a tool call,
-                # not leaking one — so the text-shape guard must NOT fire. The
-                # leak is defined by malformed text WITH NO real tool call.
-                _has_real_tool_use = any(
-                    isinstance(b, ToolUseBlock) for b in message.content
-                )
                 for block in message.content:
                     if isinstance(block, TextBlock):
-                        # ── Tool-call XML leak guard ──────────────────────
+                        # ── Tool-call XML leak guard (strip, never terminate) ──
                         # The model occasionally emits tool-call SYNTAX
                         # (<invoke name=...><parameter ...>) as RAW plain text
                         # instead of a real tool_use block. The SDK hands it over
-                        # as a TextBlock, so without this guard the raw XML
-                        # persists to the messages DB, renders as half-finished
-                        # XML, and the turn ends with no tool execution
-                        # ("response stopped mid-way"). This is the DB-persist
-                        # gate — drop the block (don't append/yield it), then
-                        # kill + raise a retriable error so send() respawns with
-                        # --resume and the model re-attempts with a proper
-                        # tool_use. detect_tool_call_leak strips code fences /
-                        # inline backticks (documentation). NOTE: the same text
-                        # may have already streamed live via text_delta; the
-                        # kill+resume + turn-end reconcile replaces that transient
-                        # on-screen partial. DB persistence (the durable harm)
-                        # happens only on the yielded `assistant` event.
+                        # as a TextBlock. Disposition (XG-directed, 去容灾化):
+                        # STRIP the raw leak text (best-effort pollution
+                        # reduction) and KEEP the block — the turn yields to its
+                        # natural completion and the MODEL decides what to do
+                        # next. We do NOT kill the subprocess and do NOT raise to
+                        # force a --resume respawn: termination authority belongs
+                        # to the model, and kill+respawn only upgraded a quiet
+                        # half-answer into an interrupted+rerun (the pain this
+                        # removes — STEERING #2 "容灾不能冒充正常逻辑"; a model
+                        # bug is not survivable-by-restart, it is cleaned in place
+                        # and left to the model). Pollution never persists
+                        # regardless: `_clean_blocks_for_persist` (the assistant
+                        # persist door), `session_pending` (the user persist door)
+                        # and `context_injector` (the resume read side) each strip
+                        # UNCONDITIONALLY, independent of this detect — and with a
+                        # WIDER anchor that also catches the truncated form this
+                        # detector misses. This strip is a best-effort live-stream
+                        # clean on top of those durable layers.
                         #
-                        # TWO cases, split by whether this message has a REAL
-                        # tool_use (`_has_real_tool_use`), per the leak-feedback
-                        # fix (run_da39669c):
-                        #   • NO real tool_use + leak  → PURE-LEAK: the turn made
-                        #     no real call, the subprocess state is off the rails;
-                        #     drop the block, kill + raise retriable → --resume
-                        #     respawn. DISPOSITION UNCHANGED (XG-directed: a leak
-                        #     is not survivable in place).
-                        #   • real tool_use + leak text → MIXED: the model DID
-                        #     invoke a real tool, so the turn is legitimate and
-                        #     must NOT be killed (killing would abort in-flight
-                        #     tool execution). But the sibling leak text would
-                        #     still persist raw <invoke> to the DB and re-induce
-                        #     the loop on resume — so STRIP it per-block (keeping
-                        #     fenced/inline references) rather than persisting it.
-                        #     This closes the mixed-message gap where the old
-                        #     message-level `_has_real_tool_use` skip let the leak
-                        #     text through verbatim (data.db session a0f04b00).
+                        # One path for BOTH shapes (pure-leak AND leak alongside a
+                        # real tool_use) — the former `_has_real_tool_use` fork was
+                        # removed with the kill()+raise it gated: strip + keep is
+                        # correct for both.
                         from .session_utils import (
                             detect_tool_call_leak,
                             strip_tool_call_leak,
                         )
 
                         if detect_tool_call_leak(block.text):
-                            if not _has_real_tool_use:
-                                logger.warning(
-                                    "session_unit.tool_call_leak_detected "
-                                    "session_id=%s — model emitted tool-call XML "
-                                    "as text (block_len=%d); dropping block + "
-                                    "killing for --resume respawn",
-                                    self._parent.session_id, len(block.text),
-                                )
-                                # Exception-safe: guarantee the retriable
-                                # RuntimeError is raised even if kill() throws —
-                                # otherwise a kill() error would propagate as a
-                                # NON-retriable error and bypass --resume retry.
-                                try:
-                                    await self._parent.kill()
-                                except Exception as kill_exc:
-                                    logger.warning(
-                                        "session_unit.tool_call_leak_kill_failed "
-                                        "session_id=%s: %s",
-                                        self._parent.session_id,
-                                        f"{type(kill_exc).__name__}: {kill_exc}",
-                                    )
-                                raise RuntimeError(
-                                    f"Tool-call XML leaked into text channel "
-                                    f"(session_id={self._parent.session_id}) — "
-                                    f"retrying with --resume for a proper tool_use"
-                                )
-                            # MIXED message: keep the turn (real tool_use ran),
-                            # but strip the raw leak text so it never persists.
                             cleaned_text = strip_tool_call_leak(block.text)
                             logger.warning(
-                                "session_unit.tool_call_leak_stripped_mixed "
-                                "session_id=%s — leak text in a message WITH a "
-                                "real tool_use; stripped from persistence "
-                                "(block_len=%d→%d), turn preserved",
+                                "session_unit.tool_call_leak_stripped "
+                                "session_id=%s — tool-call XML in text channel; "
+                                "stripped from persistence (block_len=%d→%d), "
+                                "turn preserved (no kill/respawn — 去容灾化)",
                                 self._parent.session_id,
                                 len(block.text), len(cleaned_text),
                             )

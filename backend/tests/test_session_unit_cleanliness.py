@@ -81,7 +81,11 @@ def _make_unit(
     unit._heal_checkpoint = None
     unit._recycle_kill_pending = False
     unit._user_stopped_current_turn = False
-    unit._tool_call_leak_recovery = False
+    # Mirror the real __init__ (session_unit.py:715) — the poison-guard predicate
+    # _should_poison_guard_recycle() reads this; without it _make_unit (which
+    # bypasses __init__) raises AttributeError. Pre-existing fixture gap since the
+    # prewarm-pool commit (ec88af16) added the attr to __init__ but not here.
+    unit._adopted_prewarm_fresh = False
     unit._buffer_overflow_recovery = False
     unit._active_agent_tools = {}
     unit._open_tool_uses = {}

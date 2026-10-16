@@ -403,12 +403,6 @@ def _is_retriable_error(raw_error: str, tb_str: str = "") -> bool:
         # attempt gets a cache hit and completes within timeout.
         # Circuit breaker stops after 2 consecutive timeouts + >1M context.
         r"operation timed out",
-        # Tool-call XML leaked into the text channel — the model emitted
-        # tool-call syntax (a "call" line + <invoke name=...>) as plain text
-        # instead of a real tool_use block, so the turn ends with no tool
-        # execution.  Kill + --resume gives the model a fresh attempt to
-        # emit a proper tool_use.  See detect_tool_call_leak() below.
-        r"Tool-call XML leaked into text channel",
     ]
     for pattern in retriable_patterns:
         if re.search(pattern, raw_error, re.IGNORECASE):
