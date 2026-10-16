@@ -548,6 +548,31 @@ def _read_json_arg(raw: str, argname: str) -> str:
     return raw
 
 
+def _resolve_precheck_stage_json(raw: "str | None") -> "str | None":
+    """Resolve a --stage-json source for the BEST-EFFORT deliver-ack precheck.
+
+    Distinct from _read_json_arg on two points that matter ONLY in the precheck:
+    - On an unreadable @path it returns None (skip the precheck), NEVER sys.exit —
+      the precheck is best-effort and must not abort the whole run-update (a
+      SystemExit would escape the precheck's `except (ValueError,TypeError)`
+      swallow; two Gate-2 specialists caught that regression).
+    - @- returns None WITHOUT reading stdin, so stdin stays intact for the single
+      authoritative read at the main parse (the old double-read exhausted it →
+      the main parse saw empty stdin).
+    A non-@ (inline) arg is returned verbatim; a read OSError → None.
+    """
+    if not isinstance(raw, str):
+        return None
+    if raw.startswith("@"):
+        if raw == "@-":
+            return None  # never consume stdin in a best-effort precheck
+        try:
+            return Path(raw[1:]).expanduser().read_text(encoding="utf-8")
+        except (OSError, IOError):
+            return None  # unreadable @file → skip precheck, do NOT abort
+    return raw
+
+
 def cmd_publish(args, reg: ArtifactRegistry) -> None:
     """Publish a new artifact. Validates schema when --stage is provided.
 
@@ -2793,11 +2818,19 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
             _surfaced = _ack(_deliver)
             if not _surfaced and getattr(args, "stage_json", None):
                 try:
-                    _incoming = json.loads(_read_json_arg(args.stage_json, "--stage-json"))
-                    if (_incoming.get("stage", _incoming.get("name")) == "deliver"
-                            and _ack(_incoming)):
-                        _surfaced = True
-                except (ValueError, TypeError):
+                    # Best-effort deliver-ack precheck: resolve the source via the
+                    # precheck resolver (NOT _read_json_arg — its OSError→sys.exit(1)
+                    # SystemExit would escape this swallow and hard-exit a merely
+                    # best-effort check; a Gate-2 finding). @- resolves to None so
+                    # stdin is NOT consumed here, staying intact for the single
+                    # authoritative read at the main parse below.
+                    _sj = _resolve_precheck_stage_json(args.stage_json)
+                    if _sj is not None:
+                        _incoming = json.loads(_sj)
+                        if (_incoming.get("stage", _incoming.get("name")) == "deliver"
+                                and _ack(_incoming)):
+                            _surfaced = True
+                except (ValueError, TypeError, OSError):
                     pass
 
             # ── Completion delivery gate (run_0851350b root fix) ──────────────
