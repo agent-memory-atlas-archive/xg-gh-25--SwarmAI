@@ -162,6 +162,15 @@ def run_preflight(stage, project, run_id, workspace):
 
     run_path = (Path(workspace) / "Projects" / project / ".artifacts"
                 / "runs" / run_id / "run.json")
+    # Containment: --project / --run-id are external inputs concatenated into a path.
+    # Resolve BOTH sides (so a legitimately symlinked workspace root is not wrongly
+    # rejected) and refuse anything that escapes the workspace — BEFORE touching the
+    # filesystem. Return error (not raise): this is an advisory tool (exit 0 always).
+    _ws = Path(workspace).resolve()
+    if not run_path.resolve().is_relative_to(_ws):
+        return {"stage": stage, "run_id": run_id,
+                "error": f"resolved run.json path is outside the workspace "
+                         f"({_ws}); refusing to read: {run_path}"}
     if not run_path.is_file():
         return {"stage": stage, "run_id": run_id, "error": f"run.json not found: {run_path}"}
 

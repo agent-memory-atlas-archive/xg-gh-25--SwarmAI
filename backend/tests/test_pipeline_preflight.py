@@ -245,3 +245,71 @@ def test_readonly_does_not_mutate_run_json(tmp_path):
     _run_preflight(tmp_path, project, run_id)
     after = (run_dir / "run.json").read_text()
     assert before == after, "preflight mutated run.json — must be read-only"
+
+
+def test_path_traversal_refused(tmp_path):
+    """#1 (run_22321ff4): a crafted --project/--run-id that escapes the workspace
+    must be REFUSED (error, not a read) — containment via resolve()-within-workspace.
+    A real run.json is planted OUTSIDE the workspace to prove it is never read."""
+    # workspace is tmp_path/ws; plant a run.json OUTSIDE it, then try to reach it via
+    # ../ traversal in --project. run_path = ws/Projects/<project>/.artifacts/runs/<run_id>/run.json,
+    # so to escape ws the project must climb above ws/Projects (../.. gets to tmp_path).
+    ws = tmp_path / "ws"
+    (ws / "Projects").mkdir(parents=True)
+    # a secret file sibling of ws, reachable only by escaping the workspace
+    secret_dir = tmp_path / "secret" / "runs" / "r"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "run.json").write_text('{"id":"r","stages":[],"profile":"bugfix"}')
+    # --project "../../secret" + run_id "r" with the .artifacts/runs path collapses to
+    # ws/Projects/../../secret/.artifacts/runs/r/... — escaping ws. (The exact collapse
+    # need not hit the secret file; the point is resolve() lands outside ws → refuse.)
+    rc, data = _run_preflight(ws, "../../secret", "r")
+    assert "error" in data, data
+    assert "outside" in data["error"].lower() or "workspace" in data["error"].lower(), data
+
+
+def test_legitimate_path_not_rejected(tmp_path):
+    """#1 regression guard: a NORMAL in-workspace path must still work (resolve()
+    containment must not reject the happy path)."""
+    stages = [{"stage": "deliver", "status": "completed",
+               "push_ready": True, "outputs_surfaced": True}]
+    project, run_id, _ = _write_run(tmp_path, stages, top={"files_touched": ["a.py"]})
+    rc, data = _run_preflight(tmp_path, project, run_id)
+    assert "error" not in data, data
+    assert "blockers" in data, data
+
+
+def test_required_experts_lowercased_on_add(tmp_path):
+    """#3 (run_22321ff4): add_required_expert normalizes to lowercase so stored
+    required_experts matches the D7 comparison side, and "Correctness"/"correctness"
+    dedupe as one entry (not a cosmetic duplicate)."""
+    import os
+    ARTIFACT_CLI = REPO / "scripts" / "artifact_cli.py"
+    run_id = "run_lc_test"
+    project = "TestProj"
+    run_dir = tmp_path / "Projects" / project / ".artifacts" / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps(
+        {"id": run_id, "project": project, "profile": "bugfix", "status": "running",
+         "stages": [{"stage": "evaluate", "status": "completed"}]}))
+    # run-update locates run.json via SWARM_WORKSPACE env (artifact_cli._get_workspace),
+    # not a --workspace flag.
+    env = dict(os.environ, SWARM_WORKSPACE=str(tmp_path), PYTHONIOENCODING="utf-8")
+
+    def _add(name):
+        return subprocess.run(
+            [sys.executable, str(ARTIFACT_CLI), "run-update",
+             "--project", project, "--run-id", run_id,
+             "--add-required-expert", name],
+            capture_output=True, text=True, timeout=30, env=env)
+
+    # mixed-case add → stored lowercase
+    _add("Correctness")
+    doc = json.loads((run_dir / "run.json").read_text())
+    re_list = doc.get("required_experts", [])
+    assert "correctness" in re_list, re_list
+    assert "Correctness" not in re_list, re_list
+    # re-add in a different case → no-op (dedupe), not a duplicate
+    _add("correctness")
+    doc2 = json.loads((run_dir / "run.json").read_text())
+    assert doc2.get("required_experts", []).count("correctness") == 1, doc2.get("required_experts")

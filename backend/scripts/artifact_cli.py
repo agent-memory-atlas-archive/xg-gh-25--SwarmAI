@@ -520,6 +520,34 @@ def _append_stage_to_run(
     run_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def _read_json_arg(raw: str, argname: str) -> str:
+    """Resolve a CLI JSON argument's RAW-STRING source — @path / @- / inline.
+
+    Shared by ``publish --data`` and ``run-update --stage-json`` so both read a
+    file identically (run_b7620c6e introduced @file for --data only; this unifies
+    it — R25 de-dup / P8 one entry rule). ``@PATH`` reads the file, ``@-`` reads
+    stdin, anything else is returned verbatim (a JSON value never starts with '@',
+    so the prefix is an unambiguous discriminator).
+
+    DELIBERATELY does NOT ``json.loads`` — it returns the raw string and the caller
+    parses it. This preserves the asymmetric exception semantics at the two
+    run-update call sites: the deliver-ack precheck swallows a parse error
+    (best-effort), the main parse lets it raise. Merging json.loads here would
+    erase that difference (contract drift). ``argname`` only parameterizes the
+    read-failure message so a --stage-json failure does not misreport "--data".
+    """
+    if isinstance(raw, str) and raw.startswith("@"):
+        try:
+            if raw == "@-":
+                return sys.stdin.read()
+            return Path(raw[1:]).expanduser().read_text(encoding="utf-8")
+        except (OSError, IOError) as e:
+            print(json.dumps({"error": f"Could not read {argname} source {raw!r}: {e}"}),
+                  file=sys.stderr)
+            sys.exit(1)
+    return raw
+
+
 def cmd_publish(args, reg: ArtifactRegistry) -> None:
     """Publish a new artifact. Validates schema when --stage is provided.
 
@@ -533,21 +561,9 @@ def cmd_publish(args, reg: ArtifactRegistry) -> None:
     additive and best-effort (absent on render failure); the agent relays it into
     the ① EVALUATE landmark instead of hand-typing. ``--quiet`` never carries it.
     """
-    # --data accepts a raw JSON string OR "@PATH" (read a file) OR "@-" (stdin).
-    # A JSON value never starts with '@' (object/array/string/number/bool/null),
-    # so the '@' prefix is an unambiguous discriminator. Lets large artifact
-    # payloads avoid shell-string quoting gymnastics (run_b7620c6e #1).
-    _raw = args.data
-    if isinstance(_raw, str) and _raw.startswith("@"):
-        try:
-            if _raw == "@-":
-                _raw = sys.stdin.read()
-            else:
-                _raw = Path(_raw[1:]).expanduser().read_text(encoding="utf-8")
-        except (OSError, IOError) as e:
-            print(json.dumps({"error": f"Could not read --data source {args.data!r}: {e}"}),
-                  file=sys.stderr)
-            sys.exit(1)
+    # --data accepts a raw JSON string OR "@PATH" (read a file) OR "@-" (stdin),
+    # resolved by the shared _read_json_arg helper (same path as --stage-json).
+    _raw = _read_json_arg(args.data, "--data")
     try:
         data = json.loads(_raw)
     except json.JSONDecodeError as e:
@@ -880,7 +896,22 @@ def cmd_schema(args, reg: "ArtifactRegistry | None") -> None:
     """
     from pipeline_validator import get_stage_schema
     info = get_stage_schema(args.stage)
-    print(json.dumps({"stage": args.stage, **info}))
+    # Surface `template` FIRST + a _hint: a consumer that reads only `required`/
+    # `depth` (field-name lists) misses that nested objects like
+    # layers.ac_driven must be {run, pass} — the shape lives ONLY in `template`.
+    # Additive key reorder: every original key is preserved (dict insertion order
+    # puts template first), so json.load(out)['required'] etc. keep working.
+    template = info.get("template")
+    out = {"stage": args.stage}
+    if template is not None:
+        out["template"] = template
+        out["_hint"] = ("Build your payload FROM `template` — it carries the full "
+                        "nested shape (e.g. layers.ac_driven:{run,pass}). `required`/"
+                        "`depth` are field-NAME lists only, not the nested structure.")
+    for k, v in info.items():
+        if k not in out:
+            out[k] = v
+    print(json.dumps(out))
 
 
 def cmd_state(args, reg: ArtifactRegistry) -> None:
@@ -1043,25 +1074,41 @@ def cmd_advance(args, reg: ArtifactRegistry) -> None:
         # rule. Both keys are pre-seeded so the payload SHAPE is stable even if
         # resolution fails — INSTRUCTIONS.md documents them as always present, and
         # a consumer doing payload["next_action"] must not hit a KeyError.
-        payload = {
-            "project": args.project,
-            "pipeline_state": args.state,
-            "next_stage_doc": None,
-            "next_action": None,
-        }
-        try:
-            next_doc, next_action = _next_stage_continuation(
-                args.project, args.state, getattr(args, "run_id", None)
-            )
-            payload["next_stage_doc"] = next_doc
-            payload["next_action"] = next_action
-        except Exception:
-            # The hint is an enhancement; a failure here must never fail an
-            # otherwise-successful advance. Keys stay present but null.
-            pass
-        print(json.dumps(payload))
+        if getattr(args, "quiet", False):
+            # --quiet: a COMPACT, stable payload for a programmatic caller that
+            # only needs to confirm the transition. The large next_stage_doc /
+            # next_action continuation fields are DROPPED — they bloat the output
+            # and get display-truncated. A non-quiet caller (the orchestrator
+            # following the continuation contract) still gets them below.
+            print(json.dumps({
+                "project": args.project,
+                "pipeline_state": args.state,
+                "advanced": True,
+            }))
+        else:
+            payload = {
+                "project": args.project,
+                "pipeline_state": args.state,
+                "next_stage_doc": None,
+                "next_action": None,
+            }
+            try:
+                next_doc, next_action = _next_stage_continuation(
+                    args.project, args.state, getattr(args, "run_id", None)
+                )
+                payload["next_stage_doc"] = next_doc
+                payload["next_action"] = next_action
+            except Exception:
+                # The hint is an enhancement; a failure here must never fail an
+                # otherwise-successful advance. Keys stay present but null.
+                pass
+            print(json.dumps(payload))
     except ValueError as e:
-        print(json.dumps({"error": str(e)}), file=sys.stderr)
+        # Explicit blocked-advance shape: {advanced:false, reason} so a caller
+        # distinguishes "the transition was refused" from "the output failed to
+        # parse". Kept on stderr+exit1 (unchanged contract) for both quiet and
+        # non-quiet — a blocked advance is an error either way.
+        print(json.dumps({"advanced": False, "reason": str(e)}), file=sys.stderr)
         sys.exit(1)
 
 
@@ -2746,7 +2793,7 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
             _surfaced = _ack(_deliver)
             if not _surfaced and getattr(args, "stage_json", None):
                 try:
-                    _incoming = json.loads(args.stage_json)
+                    _incoming = json.loads(_read_json_arg(args.stage_json, "--stage-json"))
                     if (_incoming.get("stage", _incoming.get("name")) == "deliver"
                             and _ack(_incoming)):
                         _surfaced = True
@@ -2841,7 +2888,7 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
             _generate_metrics_after_merge = True
 
     if args.stage_json:
-        stage_record = json.loads(args.stage_json)
+        stage_record = json.loads(_read_json_arg(args.stage_json, "--stage-json"))
         # Normalize: accept both "name" and "stage" as the stage identifier
         if "name" in stage_record and "stage" not in stage_record:
             stage_record["stage"] = stage_record.pop("name")
@@ -3013,9 +3060,14 @@ def cmd_run_update(args, reg: ArtifactRegistry) -> None:
         existing = run_state.get("required_experts")
         if not isinstance(existing, list):
             existing = []
-        seen = {str(e).strip() for e in existing if isinstance(e, str)}
+        # Normalize to lowercase on write so the stored value matches what the D7
+        # reader compares against (_d7_missing_required_experts / _d7_completed_expert_ids
+        # both .strip().lower()). Without this, "Correctness" and "correctness" dedupe
+        # as two entries (cosmetic duplicate); lowercasing keeps the stored set clean
+        # and consistent with the comparison side.
+        seen = {str(e).strip().lower() for e in existing if isinstance(e, str)}
         for eid in args.add_required_expert:
-            eid = str(eid).strip()
+            eid = str(eid).strip().lower()
             if eid and eid not in seen:
                 existing.append(eid)
                 seen.add(eid)
@@ -6977,6 +7029,12 @@ def main() -> None:
         help="Run to auto-validate before advancing. REQUIRED to enable the "
              "pre-advance validation gate; omitting it skips validation (we never "
              "guess which run to validate — run_f3975b8b).",
+    )
+    p_advance.add_argument(
+        "--quiet", action="store_true",
+        help="Emit a compact {project,pipeline_state,advanced} payload, dropping "
+             "the large next_stage_doc/next_action continuation fields (mirrors "
+             "publish --quiet; for programmatic callers that only confirm the move).",
     )
 
     # learn
