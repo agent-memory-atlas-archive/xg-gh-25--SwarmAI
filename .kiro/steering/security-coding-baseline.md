@@ -104,8 +104,9 @@ answer."
 
 ### B4. Preserve the existing defense-in-depth — don't weaken it
 When touching these, you MUST NOT loosen them:
-- Four-layer PreToolUse chain (pre_tool_logger, dangerous_command_blocker,
-  human_approval_hook, skill_access_checker).
+- The PreToolUse gate family registered in `backend/core/hook_builder.py` (listed in
+  AGENTS.md "Security Architecture"): never remove a gate, widen its matcher to skip a
+  tool, or turn a deny into a warn without explicit approval.
 - Bash allowlist regexes MUST stay anchored (`^...$`) — unanchored patterns
   are a documented bypass (e.g. reading a credential file via a loose match).
 - Least privilege: workspace isolation, file access control, deniedPaths for

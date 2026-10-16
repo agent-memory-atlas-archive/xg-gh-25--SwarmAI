@@ -1,24 +1,35 @@
 ---
 inclusion: fileMatch
-fileMatchPattern: "desktop/src/pages/ChatPage.tsx,desktop/src/hooks/useChatStreamingLifecycle.ts,desktop/src/hooks/useUnifiedTabState.ts,desktop/src/services/tabPersistence.ts,desktop/src/services/chat.ts"
+fileMatchPattern: ["desktop/src/pages/ChatPage.tsx", "desktop/src/hooks/useChatStreamingLifecycle.ts", "desktop/src/hooks/useUnifiedTabState.ts", "desktop/src/services/tabPersistence.ts", "desktop/src/services/chat.ts", "desktop/src/stores/MessageStore.ts"]
 ---
 
 # Multi-Tab Chat Isolation Principles
 
 ## Architecture Overview
 
-Each chat tab is a standalone session with its own end-to-end lifecycle. The system supports 1-4 concurrent tabs (RAM-adaptive) processing different tasks in parallel. Tabs MUST NOT interfere with each other at any layer.
+Each chat tab is a standalone session with its own end-to-end lifecycle. Several tabs
+(RAM-adaptive limit, see `ResourceMonitor.compute_max_tabs()`) process different tasks in
+parallel. Tabs MUST NOT interfere with each other at any layer.
 
 ### State Ownership Model
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
+│  MessageStore (messageStoreRegistry.get(tabId))             │
+│  ════════════════════════════════════════════                │
+│  SINGLE WRITER for a tab's messages. All message mutations  │
+│  go through the store (insertOptimisticMessages, append,    │
+│  updateLast, replace). tabState.messages is a fallback      │
+│  cache only.                                                │
+│                                                             │
 │  tabMapRef (useRef<Map<string, UnifiedTab>>)                │
 │  ════════════════════════════════════════════                │
-│  AUTHORITATIVE source of truth for ALL per-tab state:       │
-│  • messages, sessionId, pendingQuestion                     │
-│  • isStreaming, abortController, streamGen                  │
-│  • status (idle/streaming/waiting_input/error/etc.)         │
+│  AUTHORITATIVE for all other per-tab state:                 │
+│  • sessionId, pendingQuestion, pendingPermissionRequestId   │
+│  • isStreaming (readonly; driven by the per-tab streaming   │
+│    state machine inside setIsStreaming), abortController,   │
+│    streamGen, userStopped                                   │
+│  • status (idle/streaming/permission_needed/error/etc.)     │
 │                                                             │
 │  React useState (messages, sessionId, isStreaming, etc.)    │
 │  ════════════════════════════════════════════                │
@@ -27,12 +38,13 @@ Each chat tab is a standalone session with its own end-to-end lifecycle. The sys
 │                                                             │
 │  pendingStreamTabs (useState<Set<string>>)                  │
 │  ════════════════════════════════════════════                │
-│  PENDING TRACKER — covers the gap between handleSendMessage │
-│  and session_start SSE event. Keyed by tabId.               │
+│  PENDING TRACKER — narrow: covers only the gap before a tab │
+│  is registered as streaming. Keyed by tabId. Once the tab   │
+│  is registered, its own isStreaming flag is the only truth. │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## The 7 Isolation Principles
+## The 8 Isolation Principles
 
 ### Principle 1: Tab-Scoped State Mutations
 
@@ -93,34 +105,33 @@ Each tab stores its own `abortController` in `tabMapRef`. When the user clicks "
 
 **Anti-pattern**: Using a shared `abortRef` that gets overwritten by the last tab to start streaming — only the last tab's abort function would be reachable.
 
-### Principle 6: Permission — Shared Approval, Per-Tab Request
+### Principle 6: Permission — Per-Session Approval, Per-Tab Request
 
-Command permissions have two distinct layers:
+**Backend approval is per session.** `PermissionManager.approve_command(session_id, …)`
+stores a command hash in memory for that session only. An approval in Tab A does not
+apply to Tab B and does not survive a restart. (`CmdPermissionManager` and
+`~/.swarm-ai/cmd_permissions/` no longer exist.)
 
-**User-scoped approval (SHARED)**: Once a user approves a command pattern (e.g., `npm test`), that approval is stored in `CmdPermissionManager` (filesystem-backed) and applies across ALL sessions and tabs. This is correct — the user's trust decision is global.
+**Each tab owns its pending request.** On a `cmd_permission_request` SSE event, for the
+originating tab whether active or not, the stream handler:
 
-**Per-tab permission request (ISOLATED)**: Each tab/session independently raises its own `cmd_permission_request` to the user. If Tab A asks to run `rm -rf build/` and Tab B asks to run `docker build`, these are separate prompts that must not be mixed. The permission modal shows only when the requesting tab is active.
+1. Appends an inline `cmd_permission_request` block to that tab's MessageStore
+   (rendered by `InlinePermissionRequest`, not a modal).
+2. Sets `tabState.pendingPermissionRequestId` (and `sessionId`); mirrors it to React state
+   only if `isActiveTab`.
+3. Ends streaming for that tab (`setIsStreaming(false, capturedTabId)`, `incrementStreamGen()`,
+   turn-end reconcile) and sets status `permission_needed`.
 
-```
-Backend (shared):
-  CmdPermissionManager.approve(command)  → persisted to ~/.swarm-ai/cmd_permissions/
-  is_command_approved(command)           → checked by ALL sessions before executing
-
-Frontend (per-tab):
-  cmd_permission_request SSE event       → sets pendingPermission only if isActiveTab
-  tabState.status = 'permission_needed'  → indicator for background tabs
-  handlePermissionDecision()             → uses per-tab sessionId from tabMapRef
-```
-
-**Current behavior**: `pendingPermission` is a single `useState` in ChatPage. The `isActiveTab` guard prevents showing the wrong tab's permission request. Background tabs get a `permission_needed` status indicator in the tab bar.
-
-**Known limitation**: If two background tabs both need permission simultaneously, only the last one to become active will show its modal. The other tab's request may have timed out on the backend. This is acceptable for now — concurrent permission requests across tabs are rare.
+`pendingPermissionRequestId` is saved and restored on tab switch, so every tab keeps its
+own prompt answerable. `handlePermissionDecision()` uses the per-tab `sessionId`, guards
+double clicks with `permissionLoadingTabs`, and streams both approve and deny through
+`/cmd-permission-continue`.
 
 ### Principle 7: Tab Switch = Save + Restore + Re-derive
 
 Tab switching follows a strict 3-step protocol:
 
-1. **Save**: Write current React state (`messages`, `sessionId`, `pendingQuestion`) into the source tab's `tabMapRef` entry
+1. **Save**: Write current React state (`pendingQuestion`, `pendingPermissionRequestId`, scroll; plus `messages`/`sessionId` only for an IDLE tab — a streaming tab's `tabMapRef` is already newer) into the source tab's `tabMapRef` entry
 2. **Restore**: Read target tab's state from `tabMapRef` and set React state
 3. **Re-derive**: Call `bumpStreamingDerivation()` so `isStreaming` re-derives from the new active tab's `tabMapRef` entry
 
@@ -133,7 +144,7 @@ Tab switching follows a strict 3-step protocol:
 | 3 tabs streaming in parallel | Each tab shows its own spinner, messages, and activity label | `capturedTabId` in stream handlers, per-tab `isStreaming` in `tabMapRef` |
 | Stop Tab A while Tab B and C stream | Only Tab A stops; B and C continue unaffected | Per-tab `abortController` in `tabMapRef`, per-tab `sessionId` for backend stop call |
 | Tab B completes while A and C stream | Tab B shows "complete_unread" indicator; A and C spinners continue | `updateTabStatus(capturedTabId, isActiveTab ? 'idle' : 'complete_unread')` |
-| Tab A needs permission while B streams | Permission modal shows only when Tab A is active; Tab B unaffected | `isActiveTab` guard on `setPendingPermission`, `tabState.status = 'permission_needed'` for background |
+| Tab A needs permission while B streams | Tab A gets an inline approval block and `permission_needed` status; Tab B unaffected | Per-tab `pendingPermissionRequestId` in `tabMapRef`; React mirror set only if `isActiveTab` |
 | Switch from streaming Tab A to idle Tab B | Tab B shows idle state, input enabled; Tab A continues streaming in background | `bumpStreamingDerivation()` re-derives `isStreaming` from Tab B's state; Tab A's `tabMapRef` entry unchanged |
 | Switch back to Tab A (still streaming) | Tab A's messages and spinner restored correctly | `handleTabSelect` restores from `tabMapRef`; `bumpStreamingDerivation()` re-derives `isStreaming` |
 | Tab A errors while viewing Tab B | Tab A gets `status: 'error'` indicator; Tab B unaffected | `setIsStreaming(false, capturedTabId)` only clears Tab A; error content written to Tab A's `tabMapRef` only |
@@ -143,18 +154,10 @@ Tab switching follows a strict 3-step protocol:
 
 ### Principle 8: Session ID Stability Across Restarts
 
-A tab's session ID is the conversation's identity. It is the key that maps to all stored messages and provides critical context continuity for the model. Once assigned, a session ID MUST NEVER be replaced.
-
-- One tab = one session ID for the lifetime of that conversation
-- When the backend restarts and loses its in-memory SDK client, it MUST create a fresh SDK client but continue using the ORIGINAL session ID for all persistence and frontend communication
-- The SDK's internal session ID is an implementation detail — it MUST NOT leak into the app's session model
-- All messages (user + assistant) MUST be saved under the original session ID
-- The `session_start` SSE event MUST always carry the original session ID
-- The frontend tab's localStorage entry MUST NOT be overwritten with a different session ID
-
-**Anti-pattern**: Backend falls back to a fresh SDK session and emits `session_start` with the NEW SDK session ID, causing the tab to silently switch IDs and orphan all previous messages.
-
-**Correct pattern**: Backend detects resume failure → creates fresh SDK client → maps the SDK's internal session ID to the app's original session ID → saves all messages under the original ID → emits `session_start` with the original ID.
+A tab's session ID is the conversation's identity and MUST NEVER be replaced. On the
+frontend: never overwrite a tab's `sessionId` (in `tabMapRef` or `open_tabs.json`) with a
+different value after `session_start`. The backend side of this contract (app ID vs SDK
+ID, resume, identity persistence) is in `session-identity-and-backend-isolation.md`.
 
 ## Regression Prevention Checklist
 
@@ -168,7 +171,8 @@ When modifying chat tab code, verify:
 - [ ] No new shared `useRef` or `useState` that could leak between tabs
 - [ ] `isActiveTab` guard is used before writing to React state in stream handlers
 - [ ] Error/complete handlers use `capturedTabId`, not `activeTabIdRef.current`
-- [ ] Permission state is guarded by `isActiveTab` before showing modal
+- [ ] Permission state lives in `tabState.pendingPermissionRequestId`; the React mirror is set only if `isActiveTab`
+- [ ] Message writes go through the tab's MessageStore, never a raw `setMessages`-only write
 - [ ] Tests cover multi-tab scenarios (at least 2 tabs with concurrent streaming)
 
 ## Tab Persistence Safety
@@ -186,6 +190,6 @@ Anti-pattern: Saving tab state before `fileRestoreDone.current` is true — this
 ## Cross-Reference: Backend Isolation
 
 Frontend tab isolation depends on backend session isolation. See `session-identity-and-backend-isolation.md` for:
-- Per-session concurrency locks (prevents double-send)
-- Per-session permission queues (prevents cross-session contention)
-- Session ID stability across backend restarts (resume-fallback path)
+- Send admission / SESSION_BUSY → pending-message conversion (prevents double-send and lost messages)
+- Per-session permission queues and approvals
+- Session ID stability across backend restarts and subprocess recycles

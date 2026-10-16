@@ -52,9 +52,14 @@ backend core modules, a broad skill library, a React component tree, and an exte
 pytest + Hypothesis suite. (Measure any count live — e.g. `git ls-files | grep …` — never
 trust a frozen number in docs; volatile metrics live in `docs/CODEBASE_METRICS.md`.)
 
-**For development rules, anti-patterns, and invariants → see `.kiro/steering/swarmai-dev-rules.md`**
-(loaded automatically by Kiro on every interaction; the `.kiro/steering/` directory also
-holds the security baseline, multi-tab isolation principles, and debugging methodology).
+**Who owns what (each fact lives in exactly one place):**
+- **This file** — architecture, the push gate, test/build commands, commit rules.
+- **`.kiro/steering/swarmai-dev-rules.md`** — platform rules, coding anti-patterns, session
+  lifecycle invariants (Kiro auto-loads it).
+- **`.kiro/steering/*` (fileMatch)** — deep invariants for regression-prone areas, loaded
+  only when the matching files are in context. Plus the always-on security baseline and
+  debugging methodology.
+- **`CLAUDE.md`** — a short pointer to this file for tools that don't read AGENTS.md.
 
 ## Architecture
 
@@ -92,7 +97,7 @@ backend/
 │   ├── streaming_orchestrator.py # SDK response streaming, SSE event formatting, liveness
 │   ├── prompt_builder.py      # System prompt assembly from 11 context files + MCP tier loading
 │   ├── context_directory_loader.py # Loads/orders/budgets the governed context files
-│   ├── lifecycle_manager.py   # 12hr TTL kill, orphan reaper, hook serialization
+│   ├── lifecycle_manager.py   # 24h idle TTL, orphan reaper, hook enqueue chokepoint
 │   ├── session_healing.py     # HealthSensor + HealingLoop — invisible auto-respawn
 │   ├── security_hooks.py      # The PreToolUse gate family (the "OS disposes" layer)
 │   ├── resource_monitor.py    # RAM-adaptive compute_max_tabs() [1,4], spawn_budget()
@@ -142,10 +147,13 @@ git-tracked, human-readable. This is the OS's memory; the design goal is that a 
 `git diff` how the system's judgment changed.
 
 11 source files across 10 priority slots (SOUL and SELF share P2) are assembled into the
-system prompt on every session start. Priority = both injection order AND truncation order:
+system prompt on every session start, in priority order (the source of truth is
+`CONTEXT_FILES` in `backend/core/context_directory_loader.py`):
 
-- **P0–P2 (SWARMAI, IDENTITY, SOUL, SELF):** system identity + personality + the runtime
-  self-portrait. Never truncated, read-only (0o444).
+- **P0–P2 (SWARMAI, IDENTITY, SOUL):** system identity + personality. System-owned,
+  always overwritten from the template, read-only (0o444).
+- **P2 (SELF):** the runtime self-portrait. Non-truncatable but runtime-owned:
+  copy-only-if-missing (0o644), so the live `.context/SELF.md` is authoritative.
 - **P3 (AGENT):** behavioral rules. System default, truncatable.
 - **P4–P6 (USER, STEERING, TOOLS):** user-customized, copy-only-if-missing (0o644).
 - **P7–P8 (MEMORY, EVOLUTION):** agent-owned cross-session cognition, copy-only-if-missing (0o644).
@@ -161,19 +169,15 @@ Key behaviors:
   size-valve archival), not by injection-time truncation.
 - L1 cache with budget-tier validation (`<!-- budget:NNNNN -->` header) and git-first
   freshness check.
-- Truncation DIRECTION metadata (MEMORY/EVOLUTION keep newest via head, others via tail) is
-  retained as a safety-net ordering, but is inert on the current read-line (never fires on
-  1M-context models).
-- DailyActivity: today + yesterday loaded ephemerally (2K token cap per file, disk never
-  modified).
+- The `truncatable`/`direction` fields on `ContextFileSpec` are legacy metadata and inert:
+  nothing truncates at read time.
+- DailyActivity: the 2 most recent files loaded ephemerally (2K token cap per file, disk
+  never modified).
 - `locked_write.py`: fcntl.flock for safe MEMORY.md modification by skills.
 - Memory is **sovereign** — self-owned in `.context/MEMORY.md`, never delegated to a
   provider's memory feature. Recall is pure-filesystem keyword/FTS5/BM25 (no vector DB).
-- Auto-commit: `git add -A` + commit after every conversation turn (non-blocking
-  background thread).
-- **Co-Authored-By: ALL commits MUST use `Co-Authored-By: Swarm <swarm@swarmai.dev>` —
-  NEVER Claude/Anthropic identity. This is the project's AI identity and overrides any SDK
-  or harness default.** (See "Git Commits" below.)
+- Auto-commit: `WorkspaceAutoCommitHook` commits the workspace at **session close**
+  (post-session hook, serialized by a shared lock), with a generated conventional message.
 
 ## Tab State Architecture
 
@@ -182,7 +186,7 @@ Tab state uses `useUnifiedTabState` hook with `useRef<Map<string, UnifiedTab>>` 
 - `tabMapRef`: Authoritative store (mutations don't re-render)
 - `renderCounter`: Bumped to trigger `useMemo` re-derivation of `openTabs`, `tabStatuses`, `activeTab`
 - `restoreFromFile()`: Loads tabs from `~/.swarm-ai/open_tabs.json` on startup
-- Dynamic tab limit: `ResourceMonitor.compute_max_tabs()` returns [1,4] based on available RAM
+- Dynamic tab limit: `ResourceMonitor.compute_max_tabs()` returns [2,4] based on available RAM (floor 2 = 1 chat + 1 channel)
 - Messages loaded lazily from backend API when tab becomes active
 - Per-tab `MessageStore` is a **single-writer** (all writes go through the store, never raw
   `setMessages`), SSE-streamed, fully isolated — cross-tab message bleed is structurally
@@ -196,26 +200,30 @@ IDs back to the single app session ID for persistence and frontend communication
 
 ## Security Architecture
 
-The "OS disposes" layer. A **Four-layer PreToolUse** defense chain runs before any tool
-executes, by category:
+The "OS disposes" layer: a family of PreToolUse hooks registered per session in
+`backend/core/hook_builder.py` (`build_hooks`, the source of truth for the list and order;
+implementations in `security_hooks.py`). By category:
 
-1. **Observability** — `pre_tool_logger`: logs every tool invocation (name + input keys);
-   never blocks.
-2. **Command safety** — `dangerous_command_gate` (Bash): regex patterns for destructive ops
-   (`rm -rf /`, fork bombs, etc.), plus `external_approval_gate` for irreversible external
-   ops (repo-visibility toggles, force-push, resource deletion → approve-on-desktop /
-   deny-headless).
-3. **Human-in-the-loop** — the CmdPermissionManager surfaces an SSE permission dialog for
-   commands needing approval (filesystem-backed, glob-matched, persistent, shared across
-   sessions).
-4. **Scope enforcement** — `skill_access_checker` (Skill): validates the skill is in the
-   agent's allowed set; `governance_file_gate` protects the governed context files.
+1. **Observability** — `pre_tool_logger`: logs every tool invocation; never blocks.
+2. **Hang prevention (Bash)** — `background_command_guard` (default-deny backgrounding),
+   `pytest_command_guard` (denies pytest piped to tail/head or without a wall-clock cap),
+   `bash_syntax_guard` (`bash -n` parse check).
+3. **Command safety + human-in-the-loop** — `dangerous_command_gate` (Bash) and
+   `external_approval_gate` (non-Bash off-machine side effects) route risky calls through
+   `PermissionManager` (`permission_manager.py`): an SSE approval dialog, approvals tracked
+   per session by command hash, pending requests persisted to
+   `~/.swarm-ai/pending_approvals.json`, 4h answer timeout. `ask_question_gate` blocks for
+   AskUserQuestion answers.
+4. **Scope + commit discipline** — `skill_access_checker` (Skill), `governance_file_gate`
+   (Write|Edit on governed context files), `adversarial_commit_gate` (no `git commit` without
+   a sub-agent review this session), `active_run_commit_gate` (files owned by an active
+   pipeline run go through run-commit).
+5. **Advisory / hygiene** — `inclusive_term_guard`, `design_lint_guard` (warn only),
+   `image_read_dedup_guard`.
 
-Additional gates in the same family: `adversarial_commit_gate` (blocks a commit unless an
-adversarial review marker covers every committed path), `commit_trailer_gate` (see below),
-`ask_question_gate`, `image_read_dedup_guard`. Plus workspace isolation, file-access
-control, bash sandboxing, and error sanitization. These gates are the concrete form of the
-principle "when prose fails, build a gate" — they enforce what a comment cannot.
+Plus `can_use_tool` file-access control, workspace isolation, and error sanitization. These
+gates are the concrete form of "when prose fails, build a gate". When adding one, register
+it in `hook_builder.py` and update this list — don't restate it in other docs.
 
 ## Debugging
 
@@ -306,11 +314,11 @@ Co-Authored-By: Swarm <swarm@swarmai.dev>
 Never use Claude/Anthropic identity in commit trailers. This overrides any SDK or harness
 default. Commit directly to `main` (project convention) — never auto-branch.
 
-**Write it yourself — no local hook will fix it for you.** A PreToolUse gate BLOCKS a
-commit whose message omits the trailer, but nothing auto-inserts it. `core.hooksPath` on
-this machine points at the corporate git-defender hook set, and a hooksPath override
-*replaces* `.git/hooks` rather than merging with it. So every repo-local hook is shadowed
-and silently inert:
+**Write it yourself — nothing enforces it for a manual commit.** Only the pipeline's
+`run-commit` (`backend/scripts/artifact_cli.py`) builds the trailer into its own message. For any commit you make
+by hand, add the line yourself. `core.hooksPath` on this machine points at the corporate
+git-defender hook set, and a hooksPath override *replaces* `.git/hooks` rather than merging
+with it. So every repo-local hook is shadowed and silently inert:
 
 | repo-local hook | what it was guarding | status |
 |---|---|---|
@@ -319,23 +327,27 @@ and silently inert:
 | `pre-commit` | `scripts/lint_doc_frontmatter.py --staged` | dead (currently 0 errors) |
 | `pre-commit` | `scripts/sync_discussions.py --check` mirror drift | dead |
 
-Enforcement is therefore TWO layers, because CI alone was too late:
-
-| layer | when it fires | what it does |
-|---|---|---|
-| `security_hooks.create_commit_trailer_gate` (PreToolUse, Bash) | at `git commit` | DENIES the command when its **inline** message (`-m`/`-am`/`--message`/`-F -`) lacks the trailer or carries a Claude/Anthropic identity. Fails OPEN for any message it cannot read (`-F <path>`, `--amend --no-edit`, `-C`, editor). Bypass: `SWARM_TRAILER_GATE_FORCE=1`. |
-| `scripts/check_commit_trailers.py` | at push (CI `version-check`) | backstop for the paths the gate cannot see; ratcheted from a cutoff SHA so published history is not rewritten. Run locally: `python3 scripts/check_commit_trailers.py`. |
-
-Why the gate exists: CI catches this at PUSH, which under this repo's commit-on-main-for-days
-workflow is hours-to-days late — and by then the only repair is a history rewrite. The gate
-moves the catch to the one moment the fix is free (re-run the command with the line appended).
-Bump `ENFORCED_FROM` ONLY to record a deliberate, explained amnesty — never to paper over a
-fresh violation.
+There is **no automated enforcement** any more. The PreToolUse `commit_trailer_gate`
+was removed 2026-08-16 (`73378945`: a project's private convention must not be a
+product-wide runtime hook), and the CI trailer check was removed the same day
+(`b493577a`). `scripts/check_commit_trailers.py` remains for optional local use:
+`python3 scripts/check_commit_trailers.py`.
 
 Do NOT "fix" this by changing `core.hooksPath` — it is machine/corporate policy, and the
 project rules forbid modifying git config. Any check that must actually run belongs in CI.
 (git-defender is also why `git commit` is slow: a 22 MB `commit-msg` binary plus a scanning
 daemon. Allow ~600s for a commit in automation.)
+
+## Development Commands
+
+```bash
+./dev.sh                        # Full dev: backend (port 8000) + Vite + Tauri window
+./dev.sh backend                # Backend only
+./prod.sh build                 # PyInstaller + verify + deploy to daemon
+./prod.sh release               # Full release cycle
+./prod.sh status                # Daemon health + versions
+cd desktop && npm run build:all # Frontend production build (embedded in the .app)
+```
 
 ## Before You Push — the local quality gate
 
@@ -344,9 +356,14 @@ change is fully green on THREE checks — any one unrun or red blocks the push:
 
 1. **Build** — `./prod.sh build` (backend) and/or `cd desktop && npm run build:all`
    (frontend), per what the change touches.
-2. **Tests** — at least the affected suites, wrapped with a wall-clock timeout
-   (`perl -e 'alarm 90' python -m pytest tests/test_<module>.py --timeout=60`); full suite
-   (`SWARMAI_SUITE=1`) only when the blast radius warrants. Never pipe pytest through `| tail`.
+2. **Tests** — at least the affected suites, wrapped with a wall-clock cap:
+   `cd backend && perl -e 'alarm 90; exec @ARGV' python -m pytest tests/test_<module>.py -v --timeout=60`
+   (the `exec @ARGV` is required — without it perl exits 0 and pytest never runs; `gtimeout`
+   is not installed here; a per-test `--timeout` alone is not a cap and `pytest_command_guard`
+   denies it). Frontend: `cd desktop && npm test -- --run`. Never pipe pytest through
+   `| tail`/`| head`. Last-failed: add `--lf`. Full suite (`SWARMAI_SUITE=1`, cap ≥120s per
+   test) only on explicit request or when the blast radius clearly warrants it — never as a
+   reflex.
 3. **Eval** — `cd backend && python scripts/ci_eval_gate.py`. This is a *pure check* (zero
    Bedrock cost): it verifies the latest committed eval report is FRESH (its code_digest
    matches current eval-relevant code) and GREEN. Never *run* the eval judge inside a coding

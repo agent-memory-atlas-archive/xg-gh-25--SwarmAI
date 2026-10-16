@@ -1,110 +1,95 @@
 ---
 inclusion: fileMatch
-fileMatchPattern: "backend/skills/s_self-evolution/*,backend/context/EVOLUTION.md,backend/context/EVOLUTION_CHANGELOG.jsonl,backend/routers/chat.py,backend/hooks/evolution_maintenance_hook.py,backend/hooks/evolution_trigger_hook.py,desktop/src/hooks/useChatStreamingLifecycle.ts,desktop/src/services/evolution.ts"
+fileMatchPattern: ["backend/skills/s_self-evolution/*", "backend/context/EVOLUTION.md", "backend/context/EVOLUTION_CHANGELOG.jsonl", "backend/core/evolution_optimizer.py", "backend/core/evolution/*.py", "backend/hooks/evolution_maintenance_hook.py", "backend/hooks/evolution_trigger_hook.py", "backend/jobs/run_evolution.py", "backend/jobs/system_jobs.py"]
 ---
 
 # Self-Evolution Guardrails
 
 ## Core Invariant: Evolution Improves Stability, Not Complexity
 
-The self-evolution system is prompt-driven by design. The agent detects capability gaps, builds solutions, and persists them in EVOLUTION.md. Backend code provides infrastructure only: file provisioning, SSE event parsing, config defaults, and locked writes.
+Priority ordering (ADL Protocol): Stability > Interpretability > Reusability > Extensibility > Novelty.
+The model proposes; code gates. Nothing in the evolution system may auto-write the
+governed judgment files (SOUL / AGENT / STEERING) — it writes proposals for a human.
 
-Priority ordering (ADL Protocol): Stability > Interpretability > Reusability > Extensibility > Novelty
+## The Three Evolution Paths (current)
 
-## What Is Code-Enforced vs Prompt-Dependent
+| Path | Trigger | Code | Writes |
+|------|---------|------|--------|
+| Skill-optimization cycle (MINE→ASSESS→ACT→AUDIT) | Weekly system job `evolution-cycle` (Thu 07:00, 1800s timeout) — the ONLY trigger | `evolution_optimizer.run_evolution_cycle` via `jobs/run_evolution.py` | skill_health.json, `.evolution_proposals.json`, EVOLUTION.md + changelog |
+| EVOLUTION.md maintenance | Session close (`EvolutionMaintenanceHook`, post-session hook) | `hooks/evolution_maintenance_hook.py` | EVOLUTION.md, monthly archive shard, changelog |
+| Governance lifecycle | Prompt-driven | `s_self-evolution` skill (CLASSIFY/CAPTURE/PROMOTE/REFINE/RETIRE/COMPRESS) | EVOLUTION.md via Read + Edit, changelog |
 
-| Layer | Mechanism | Reliability |
-|-------|-----------|-------------|
-| EVOLUTION.md loading at P8 | `ContextDirectoryLoader` | Code-enforced |
-| EVOLUTION.md provisioning | `ensure_directory()` | Code-enforced |
-| SSE event marker parsing | `_extract_evolution_events()` regex in `chat.py` | Code-enforced |
-| Frontend evolution rendering | `useChatStreamingLifecycle` + `EvolutionMessage` | Code-enforced |
-| EvolutionBadge wiring | `deriveEvolutionCounts` in ChatPage → SwarmRadar prop | Code-enforced |
-| Config defaults | `AppConfigManager` `evolution` key | Code-enforced |
-| Entry deprecation + pruning | `EvolutionMaintenanceHook` at session close | Code-enforced |
-| Tool failure trigger nudge | `ToolFailureTracker` in message loop | Code-enforced |
-| Trigger detection | `s_self-evolution/SKILL.md` instructions | Prompt-dependent (code-assisted) |
-| Evolution loop execution | `s_self-evolution/SKILL.md` instructions | Prompt-dependent |
-| EVOLUTION.md writes | Agent uses Read+Edit / `locked_write.py` | Prompt-dependent |
-| Entry dedup before write | `s_self-evolution/SKILL.md` Step 0 procedure | Prompt-dependent |
-| JSONL changelog | Agent appends after every Edit | Prompt-dependent |
+Never put the cycle back on the session-close hook: it takes ~5 min against a 180s hook
+budget and re-fired every session (run_6ac3fc0b).
 
-## SSE Event Flow — Do Not Break the Chain
+## Cycle Guardrails (code-enforced, evolution_optimizer.py)
 
-```
-Agent text → <!-- EVOLUTION_EVENT: {...} --> marker
-  → _extract_evolution_events() regex parse in chat.py
-  → Separate SSE data line emitted by sse_with_heartbeat()
-  → Frontend: event.type.startsWith('evolution_') check
-  → Message with evolutionEvent property → EvolutionMessage component
-```
+- Process flock on `.evolution_cycle.lock` (non-blocking, stale-lock break) — one cycle at a time.
+- LLM cost cap: `evolution.max_llm_skills_per_cycle` (default 5), highest confidence first.
+- Confidence tiers: HIGH → proposal/deploy, MED → recommendation, LOW → log only.
+  HIGH needs ≥2 corrections, else it is demoted to MED.
+- Regression gate: a deployed skill whose fitness dropped >0.1 is auto-reverted from
+  `SKILL.md.bak`. Deploys are atomic (tmp + `os.replace` + verify + rollback).
+- Freshness re-read before applying changes (the skill may have changed since MINE).
+- **Known drift:** module constants are HIGH=0.15 / MED=0.08, but
+  `AppConfigManager` defaults are `high_confidence: 0.35` / `med_confidence: 0.15`, and
+  `_get_confidence_thresholds()` reads the config first. Decide which is intended before
+  touching thresholds.
 
-Rules:
-- Evolution markers are HTML comments embedded in assistant text — they survive DB persistence (invisible in rendered markdown)
-- Extracted evolution events are frontend-only — NOT persisted separately to DB
-- The regex in `_extract_evolution_events()` MUST match the marker format emitted by the skill
-- If you change the marker format in the skill, you MUST update the regex
+## Maintenance Hook Order (EvolutionMaintenanceHook.execute)
 
-## EVOLUTION.md File Format Invariants
+1. `_quality_gate` — drops garbage Competence entries (<3 words / commit-hash text), fixes duplicate C-IDs.
+2. `_fold_corrections` — folds data-point families over the cap (`_FOLD_CAP = 2`) into
+   `EVOLUTION-archive-YYYY-MM.md`. The whitelist lives in `data_point_folding._FOLDABLE_MARKERS`.
+3. `_size_evict` — size valve: above 20K tokens, evict lowest-value whole `###` blocks down
+   to 15K, into the monthly shard (recall-backed, not deletion). Marker-bearing blocks
+   (`**Pattern**`, `**Durable tell**`, CAPSTONE, METHOD FIX, …) go last; recent (≤14 days) next.
+4. E/K lifecycle — `Capabilities Built` and `Competence Learned` only: active + idle >30d +
+   usage 0 → deprecated; deprecated + usage 0 + >30d → removed.
+5. Promotion threshold check (3x rule), correction-class auto-resolve (30 days quiet),
+   correction classifier, escalation ladder (proposals to `.evolution_proposals.json` only).
 
-- Five sections with sequential IDs: E-entries (Capabilities), O-entries (Optimizations), C-entries (Corrections), K-entries (Competence), F-entries (Failed)
-- IDs are sequential within each section (E001, E002, ...; O001, O002, ...)
-- Entry lifecycle: `active` → `deprecated` (30 days idle or cap exceeded) → `superseded` (replaced)
-- Soft cap: 30 active entries. Oldest + lowest usage deprecated first.
-- Salience decay: -0.1/week idle, usage resets to 1.0. At 0.3 → `fading`, at 0.0 → `deprecated`.
+Every step is error-isolated and runs under the EVOLUTION.md flock; on lock timeout it
+skips rather than clobbering. All mutations log to `EVOLUTION_CHANGELOG.jsonl`
+(`rotate_jsonl_if_oversized`). Run order matters: fold before the valve, or the valve
+over-archives.
 
-### EvolutionMaintenanceHook (Code-Enforced Lifecycle)
+## Write Rules
 
-`EvolutionMaintenanceHook` runs as the 4th session lifecycle hook and performs code-enforced EVOLUTION.md housekeeping that was previously prompt-dependent:
-
-- Scans `Capabilities Built` and `Competence Learned` sections for entries with Status + Usage Count fields
-- Deprecation: entries with `status=active`, idle >30 days, `usage_count=0` → set to `deprecated`
-- Pruning: entries with `status=deprecated`, `usage_count=0`, idle >30 days → removed from file
-- All actions logged to `EVOLUTION_CHANGELOG.jsonl` with `source: "maintenance_hook"`
-- Uses `locked_write.py` functions for atomic field updates (imported as library, not shelled out)
-- Configurable `deprecation_days` (default 30)
+- The skill writes EVOLUTION.md with Read + Edit and must NOT shell out to
+  `locked_write.py` (PyInstaller crash). A changelog append after every mutation is mandatory.
+- Backend code uses `scripts.locked_write` functions as a library under the flock.
+- EVOLUTION.md stays at P8 in `CONTEXT_FILES`, `user_customized=True` (copy-if-missing).
 
 ## Configuration Boundaries
 
-All evolution config lives under `config.json["evolution"]`, read via `AppConfigManager.get("evolution")`:
+`config.json["evolution"]`, read via `AppConfigManager.get("evolution")`.
 
-- `enabled: true` — master switch. `false` disables ALL evolution.
-- `auto_approve_skills/scripts/installs: false` — user must approve capability creation by default
-- `max_triggers_per_session: 3` — hard cap, enforced by `/tmp/swarm-evo-triggers-{session_id}` counter
-- `max_retries: 3` — per-trigger attempt limit
-- `max_active_entries: 30` — soft cap on EVOLUTION.md entries
+- NEVER change `auto_approve_skills/scripts/installs` defaults to `true`.
+- `high_confidence`, `med_confidence`, `max_llm_skills_per_cycle` are consumed by the cycle.
+- `max_triggers_per_session`, `max_retries`, `max_active_entries`,
+  `same_type_cooldown_seconds` are NOT read by backend code. They are prompt-level limits
+  only, and `deprecation_days` is not wired into the hook (it uses its constructor default
+  of 30). Don't describe them as code-enforced.
 
-When modifying config defaults, NEVER change `auto_approve_*` to `true` — this would allow the agent to create skills/scripts without user consent.
+## Dead Code (don't build on it)
 
-## Trigger Counter Isolation
+- The `<!-- EVOLUTION_EVENT -->` marker chain: no skill emits the marker any more
+  (39756bd5). The parser in `routers/chat.py` (`_extract_evolution_events`), the frontend
+  `evolution_*` SSE branch, `EvolutionMessage`, and the unimported `EvolutionBadge` are
+  unreachable.
+- `ToolFailureTracker` (`hooks/evolution_trigger_hook.py`) is never instantiated. The live
+  repeated-failure hint is `create_error_pattern_detector` + `create_failure_tracker_reset`
+  in `core/runtime_hooks.py` (per-session `session_context["_failure_tracker"]`).
 
-The per-session trigger counter uses session-scoped files at `/tmp/swarm-evo-triggers-{session_id}`. Each session gets its own counter file, preventing cross-session interference. Files in `/tmp/` auto-clean on OS reboot.
-
-## Tool Failure Tracker (Code-Assisted Trigger Detection)
-
-`ToolFailureTracker` is instantiated per-session (stored in `_active_sessions[sid]["failure_tracker"]`) and watches for repeated tool failures:
-
-- Tracks failure signatures: `tool_name.lower() + ":" + first_100_chars_of_error`
-- After `FAILURE_THRESHOLD` (2) consecutive failures with same signature → emits evolution nudge
-- Nudge cooldown: 120s per signature, max 3 nudges per session (`_max_nudges_per_session`)
-- On tool success → `reset_tool()` clears all failure signatures for that tool
-- Nudge is a system-level hint injected into agent context, not user-visible
-- No shared mutable state — each session has its own tracker instance
-
-Anti-pattern: Making `ToolFailureTracker` a module-level singleton — this would leak failure state between sessions.
+Remove these in a dedicated change, or revive them deliberately — don't patch around them.
 
 ## Regression Checklist
 
-When modifying self-evolution code:
-
-- [ ] `_extract_evolution_events()` regex still matches the marker format in `s_self-evolution/SKILL.md`
-- [ ] Evolution SSE events are emitted as SEPARATE data lines (not embedded in assistant content)
-- [ ] Frontend `event.type.startsWith('evolution_')` check still catches all 4 event types
-- [ ] EVOLUTION.md is still at P8 in CONTEXT_FILES with `truncate_from="head"` and `user_customized=True`
-- [ ] `ensure_directory()` provisions EVOLUTION.md and EVOLUTION_CHANGELOG.jsonl from templates
-- [ ] Config defaults in `AppConfigManager` match the documented defaults above
+- [ ] The cycle is triggered only by the scheduled job, never by a session hook
+- [ ] Cycle lock, LLM cap, regression revert, and atomic deploy still in place
+- [ ] Maintenance order: quality gate → fold → size valve → lifecycle → governance
+- [ ] Size valve still archives to the monthly shard (never deletes)
+- [ ] Escalation writes proposals only; never SOUL/AGENT/STEERING
 - [ ] `auto_approve_*` defaults remain `false`
-- [ ] Evolution markers in assistant text are HTML comments (invisible in rendered markdown)
-- [ ] `EvolutionMaintenanceHook` registered as 4th hook in lifespan (after DistillationTriggerHook)
-- [ ] `ToolFailureTracker` is per-session (stored in `_active_sessions`), not module-level
-- [ ] `ToolFailureTracker.reset_tool()` called on tool success to clear stale failure counts
+- [ ] EVOLUTION.md still P8, `user_customized=True`

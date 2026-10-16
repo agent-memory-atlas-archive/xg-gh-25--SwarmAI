@@ -210,9 +210,10 @@ jobs:
       # direct/parallel-session commit landed trailer-less and required a manual
       # ENFORCED_FROM amnesty (4 in 3 days). Recurring toil for zero quality signal.
       # (fetch-depth: 0 was dropped with it — sync-version.sh reads only worktree
-      # files, no git history.) The PreToolUse commit_trailer_gate in security_hooks.py
-      # still enforces the trailer at COMMIT time (prevention); this only removed the
-      # CI detection half. scripts/check_commit_trailers.py is kept for optional local use.
+      # files, no git history.) The PreToolUse commit_trailer_gate was also removed
+      # the same day (73378945), so nothing enforces the trailer automatically; only
+      # run-commit builds it in. scripts/check_commit_trailers.py is kept for optional
+      # local use.
 
   # ── Code-security boundary gate (bandit HIGH + detect-secrets) ────────────
   # Server-side HARD gate: fails the job on any NEW high-severity finding or

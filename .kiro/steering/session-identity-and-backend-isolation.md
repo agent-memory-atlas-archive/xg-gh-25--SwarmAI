@@ -1,114 +1,118 @@
 ---
 inclusion: fileMatch
-fileMatchPattern: "backend/core/session_router.py,backend/core/session_unit.py,backend/core/session_registry.py,backend/core/session_manager.py,backend/core/permission_manager.py,backend/core/security_hooks.py,backend/routers/chat.py"
+fileMatchPattern: ["backend/core/session_router.py", "backend/core/session_unit.py", "backend/core/session_registry.py", "backend/core/session_manager.py", "backend/core/lifecycle_manager.py", "backend/core/streaming_orchestrator.py", "backend/core/permission_manager.py", "backend/core/security_hooks.py", "backend/routers/chat.py"]
 ---
 
 # Session Identity and Backend Isolation Principles
 
-## Core Invariant: One Tab = One Session ID = One Conversation
+## Core Invariant: One Tab = One Session ID = One SessionUnit
 
-A session ID is the permanent identity of a conversation. It is the key for all message persistence, backend API calls, and frontend tab state. Once assigned, it MUST NOT change for the lifetime of that conversation.
+The app session ID is the permanent identity of a conversation: the key for message
+persistence, SSE events, permission queues, approvals, and frontend tab state. Once
+assigned it MUST NOT change. Exactly one `SessionUnit` exists per app session ID, held in
+`SessionRouter._units` (mutated under `_slot_lock`). The unit outlives its subprocess and
+returns to COLD between lives.
 
-## The Dual-ID Model
+## Two IDs, One Canonical
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│  app_session_id (frontend tab ID)                            │
-│  ═══════════════════════════════                             │
-│  Assigned by the frontend when a tab first sends a message.  │
-│  Stable across backend restarts. This is the CANONICAL ID    │
-│  for all persistence and SSE communication.                  │
-│                                                              │
-│  sdk_session_id (Claude SDK internal ID)                     │
-│  ═══════════════════════════════                             │
-│  Assigned by the Claude SDK subprocess. Changes on every     │
-│  fresh client creation. This is an IMPLEMENTATION DETAIL     │
-│  that MUST NOT leak into the app's session model.            │
-│                                                              │
-│  effective_session_id pattern:                               │
-│    app_session_id ?? sdk_session_id                          │
-│  Used in ~15 places for all persistence and keying.          │
-└──────────────────────────────────────────────────────────────┘
-```
-
-## Session ID Rules
-
-1. `session_start` SSE event MUST always carry the `app_session_id` (original tab session ID), never the SDK's internal session ID
-2. All messages (user + assistant) MUST be saved under `app_session_id`
-3. The `_active_sessions` dict MUST be keyed by `effective_session_id` so resume finds the client under the original tab ID
-4. Frontend tab's `tabMapRef` entry MUST NOT be overwritten with a different session ID after `session_start`
-
-## Resume-Fallback Path (Backend Restart Scenario)
-
-When the backend restarts and loses its in-memory SDK client:
-
-```
-1. Frontend sends chat_stream with session_id (the app_session_id)
-2. Backend: is_resuming=True, but _get_active_client() returns None
-3. Backend: Falls back to PATH A (fresh SDK client)
-4. Backend: session_context["app_session_id"] = original tab session ID
-5. Backend: Emits session_start with app_session_id (NOT the new SDK ID)
-6. Backend: Saves all messages under app_session_id
-7. Backend: Stores client in _active_sessions keyed by app_session_id
-```
-
-Anti-pattern: Emitting `session_start` with the new SDK session ID — this causes the tab to silently switch IDs and orphan all previous messages.
-
-## Per-Session Concurrency Guard
-
-`_execute_on_session()` uses a per-session `asyncio.Lock` keyed by `app_session_id ?? session_id`. This prevents double-send corruption (e.g., user clicks Send twice quickly).
+- **App session ID** — `SessionUnit.session_id`. Supplied by the frontend, or minted with
+  `uuid4()` in `run_conversation`. Canonical for everything.
+- **SDK session ID** — `SessionUnit._sdk_session_id`, captured from the CLI's messages.
+  A private detail used ONLY for `--resume`. It never keys persistence or SSE.
 
 Rules:
-- Lock key MUST use `app_session_id` when available (stable across resume-fallback)
-- For brand-new sessions (both IDs None), use an ephemeral UUID so parallel new sessions don't collide
-- If the lock is already held, return `SESSION_BUSY` error immediately — do NOT queue
-- Ephemeral lock keys are cleaned up in the `finally` block; stable keys are cleaned up by `_cleanup_session()`
+1. `session_start` always carries `unit.session_id` (streaming_orchestrator), never the SDK ID.
+2. Messages, permission queues, and approvals are keyed by the app session ID.
+3. The frontend tab's session ID is never overwritten after `session_start`.
+4. The `prewarm-` prefix is server-mint-only (`prewarm_channel_session` / desktop
+   prewarm pool). It grants TTL/orphan/poison/hook exemptions, so `run_conversation`
+   rejects client-supplied IDs with it. Adoption re-keys the unit under `_slot_lock`.
 
-## Per-Session Permission Queues
+## Resume and Identity Persistence
 
-`PermissionManager` provides per-session `asyncio.Queue` instances for command permission requests. This replaced a global queue that caused cross-session busy-loop contention.
+- A COLD unit with `_sdk_session_id` respawns with `--resume`. If `--resume` hits
+  session-not-found, the stale ID is dropped and the DB history is re-injected (true cold
+  resume) — never a silent history-less spawn.
+- `_sdk_session_id` is KEPT on interrupt, recycle, kill, and shutdown
+  (`_crash_to_cold_async(clear_identity=False)`). It is cleared only by `/chat/refresh`,
+  give-up, or a session-not-found `--resume`.
+- Shutdown: `disconnect_all` persists identities to `session_state.json` BEFORE killing
+  anything. Boot: `SessionRouter.__init__` loads them; `get_or_create_unit` pops one into
+  the new unit (one-shot).
 
-Rules:
-- Each session gets its own queue via `get_session_queue(session_id)`
-- Security hooks write to the session's queue using the SDK session ID
-- Queues are cleaned up via `remove_session_queue()` during session cleanup
-- Never use the deprecated `get_permission_queue()` (global queue)
+## Send Admission and Concurrency
 
-## CmdPermissionManager vs PermissionManager
+The state machine is the guard (`SessionUnit.send()`); there is no per-session lock dict.
 
-Two distinct systems that MUST NOT be confused:
+- STREAMING with an interrupt in flight (`_stop_event` set) → wait up to 6s for it.
+- STREAMING, last event < `AUTO_RECOVER_STALL_THRESHOLD` (180s) → `SessionBusyError`.
+  Stalled longer → `force_unstick_streaming` → COLD → respawn.
+- WAITING_INPUT with a live outstanding tool_use → `SessionBusyError`. A new message is
+  NEVER auto-treated as the answer. A dead waiter is reaped to COLD first.
+- If the unit flips out of IDLE during the slot/`_client_io` wait (concurrent refresh,
+  kill, or release), yield SESSION_BUSY + `_abort`. The re-check and the STREAMING
+  transition stay in one synchronous block with no `await` between them.
 
-| System | Scope | Storage | Purpose |
-|--------|-------|---------|---------|
-| `CmdPermissionManager` | Global (all sessions) | Filesystem (`~/.swarm-ai/cmd_permissions/`) | Persistent command pattern approvals (glob matching) |
-| `PermissionManager` | Per-session | In-memory (asyncio.Event + Queue) | Real-time HITL permission request/response signaling |
+## Message Durability
 
-`CmdPermissionManager.is_approved()` is checked BEFORE `PermissionManager` — if a command pattern was previously approved, no HITL prompt is needed.
+- The user message is persisted BEFORE slot acquisition (`run_conversation`).
+- On SESSION_BUSY / QUEUE_TIMEOUT the row is converted to pending
+  (`session_pending.mark_pending_by_id`), never deleted. The router's serial drain worker
+  delivers it at the next clean IDLE. `retryPayload` is sent to the frontend only when the
+  pending conversion failed — otherwise a frontend re-send would double-deliver.
+- The `finally` in `run_conversation` rolls back claimed-but-unfinalized pending sets on
+  GeneratorExit / CancelledError (SSE disconnect). Don't catch these with a bare
+  `except Exception` and skip that rollback.
 
-## Session Cleanup Lifecycle
+## Stop, Disconnect, Release
 
-Sessions are cleaned up via `_cleanup_session()` triggered by:
-- TTL expiry (2h stale session cleanup loop)
-- Explicit delete (user closes session)
-- Backend shutdown (`disconnect_all()`)
+- **User Stop** (`POST /chat/stop` → `interrupt()`): captures `_send_generation` and bails
+  if a newer send started; sets `_user_stopped_current_turn` (suppresses self-heal); on
+  success recycles the subprocess to COLD with identity kept (PIT01). Only
+  `autonomous=True` (tool-hang watchdog) keeps it warm.
+- **SSE disconnect**: `recover_from_disconnect()` → clean IDLE + drain, then a soft
+  `flush_subprocess_pipe` that leaves the subprocess ALIVE on timeout so a long tool
+  call can finish and persist. Never POST `/stop` on disconnect.
+- **Tab close** (`/chat/release`): kills an IDLE unit to free its slot; skips channel
+  units; skips STREAMING/WAITING_INPUT unless `force=True`, which interrupts first.
+  Never raw-`kill()` an active unit.
+- Lock rules: `interrupt()` and flush never take `_client_io`; `_client_io` is a short
+  barrier, never held across the stream; spawn holds `_spawn_lock` then `_env_lock`
+  through `wrapper.__aenter__()`.
 
-Cleanup fires `SessionLifecycleHookManager.fire_post_session_close()` via `BackgroundHookExecutor` which runs 4 hooks in order:
-1. `DailyActivityExtractionHook` — extracts conversation summary
-2. `WorkspaceAutoCommitHook` — git auto-commit (uses shared `git_lock`)
-3. `DistillationTriggerHook` — memory distillation check
-4. `EvolutionMaintenanceHook` — deprecate/prune idle EVOLUTION.md entries
+## Per-Session Permission State
 
-Hooks run as fire-and-forget `asyncio.Task`s via `BackgroundHookExecutor` — they never block the chat path. Each hook is error-isolated with 30s timeout. A failing hook does NOT block subsequent hooks.
+`PermissionManager` (`permission_manager.py`) is the only permission system.
+
+- Queues: `get_session_queue(session_id)` / `remove_session_queue`, keyed by the APP
+  session ID (the consumer in streaming_orchestrator reads `self._parent.session_id`).
+  There is no global queue.
+- Approvals: `approve_command(session_id, command)` stores a SHA-256 command hash in memory
+  for that session only. Approvals are not shared across tabs and don't survive a restart.
+- Pending requests (not approvals) persist to `~/.swarm-ai/pending_approvals.json` so an
+  open prompt survives a daemon restart; idempotency is keyed by (session_id, tool_call_id).
+- Approval waits are 4h (`PERMISSION_ANSWER_TIMEOUT_SECONDS`), which must stay below the
+  lifecycle WAITING_INPUT watchdog (4h05m).
+
+## Session End and Hooks
+
+- Lifetimes (`LifecycleManager`): 24h idle TTL (channel and prewarm units exempt), orphan
+  reaper for IDLE units not in open_tabs.json (10 min), COLD units purged from `_units`
+  after 1h.
+- EVERY end path (TTL kill, crash→COLD, purge, release) must call
+  `LifecycleManager._release_session_state(session_id)`, which clears registry dicts plus
+  permission approvals and the queue. A new per-session dict must be added there.
+- Post-session hooks fire through `LifecycleManager.enqueue_hooks` (skips `prewarm-`
+  sessions; once per unit via `_hooks_enqueued`) → `BackgroundHookExecutor`: one serial
+  worker, error-isolated, 180s per hook. The list and order live in `main.py` lifespan.
 
 ## Regression Checklist
 
-When modifying session or permission code:
-
-- [ ] `session_start` SSE event uses `app_session_id`, not SDK session ID
-- [ ] Messages saved under `effective_session_id` (app_session_id ?? sdk_session_id)
-- [ ] `_active_sessions` keyed by `effective_session_id`
-- [ ] Per-session lock uses `app_session_id` when available
-- [ ] Permission requests routed to per-session queue, not global queue
-- [ ] Session cleanup calls `remove_session_queue()` for the session
-- [ ] No new global mutable state that could leak between sessions
-- [ ] `_env_lock` held during client creation (subprocess inherits correct env)
+- [ ] `session_start` and all persistence use `unit.session_id`, never the SDK ID
+- [ ] `_sdk_session_id` preserved on every recycle/kill/shutdown path
+- [ ] User message persisted before slot acquisition; busy/timeout → pending, not delete
+- [ ] `interrupt()` keeps its `_send_generation` stale guard; no raw kill of active units
+- [ ] Permission requests go to the per-session queue; approvals stay per session
+- [ ] New per-session state is released in `_release_session_state`
+- [ ] No new module-level mutable state that is not keyed by session ID
+- [ ] Spawn still holds `_spawn_lock` + `_env_lock` through `wrapper.__aenter__()`
