@@ -2,7 +2,7 @@
 
 Canonical terms for skills, agents, and documentation. When writing a skill,
 use these terms exactly. When a term has "Avoid" entries, never use those
-synonyms — they cause confusion across the 69-skill ecosystem.
+synonyms — they cause confusion across the skill ecosystem.
 
 ---
 
@@ -138,7 +138,7 @@ synonyms — they cause confusion across the 69-skill ecosystem.
 
 ---
 
-_This glossary is the single source of truth for terminology across all 69 skills.
+_This glossary is the single source of truth for terminology across the skill library.
 When creating or reviewing a skill, verify terminology against this file.
 Update this file when new canonical terms emerge — never let skills invent
 their own synonyms for existing concepts._
