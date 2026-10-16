@@ -83,6 +83,23 @@ export interface Skill {
   tier: 'always' | 'lazy';  // load tier (Capabilities panel faint marker); 'lazy' fallback
 }
 
+// Expert (R2 Experts visualization — the Capabilities "Experts" view). A read-only
+// projection of the backend Expert Library (backend/experts/), one per adversarial
+// review specialist. isValid is the health signal (false = malformed frontmatter,
+// surfaced not dropped). No per-run D7 enforcement state here — that is a separate
+// pipeline concern (kept out to avoid run-scoped coupling in a static registry view).
+export interface Expert {
+  expertId: string;         // frontmatter `expert:` — identity contract
+  displayNameZh: string;
+  displayNameEn: string;
+  domain: string;           // grouping key (e.g. 'code')
+  scope: string;            // one-line "what this expert reviews"
+  spawnAs: string;          // e.g. 'adversarial'
+  visibility: string;       // 'public' | ...
+  isValid: boolean;         // health: every required frontmatter field present
+}
+export type ExpertsByDomain = Record<string, Expert[]>;  // {domain: [Expert]}
+
 // Skill health (Capabilities panel scannable dot, run_a85e6641). Qualitative status only
 // on the row (no raw counts — R30#4); success_rate/last_used are for the detail drawer.
 export type SkillHealthStatus = 'healthy' | 'low_success' | 'never_used' | 'stale';

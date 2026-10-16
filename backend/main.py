@@ -21,7 +21,7 @@ from pathlib import Path
 from config import settings, get_app_data_dir, get_log_file_path
 from core import session_registry
 from utils.bundle_paths import get_resource_file
-from routers import agents_router, skills_router, mcp_router, chat_router, chat_threads_router, auth_router, workspace_router, settings_router, plugins_router, tasks_router, channels_router, system_router, todos_router, search_router, workspace_config_router, workspace_api_router, projects_router, tscc_router, artifacts_router, escalations_router, attention_router, voice_router, hive_router
+from routers import agents_router, skills_router, experts_router, mcp_router, chat_router, chat_threads_router, auth_router, workspace_router, settings_router, plugins_router, tasks_router, channels_router, system_router, todos_router, search_router, workspace_config_router, workspace_api_router, projects_router, tscc_router, artifacts_router, escalations_router, attention_router, voice_router, hive_router
 from routers.autonomous_jobs import router as autonomous_jobs_router
 from routers.pipelines import router as pipelines_router
 from routers.pollinate import router as pollinate_router
@@ -1568,6 +1568,7 @@ setup_error_handlers(app)
 app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(agents_router, prefix="/api/agents", tags=["agents"])
 app.include_router(skills_router, prefix="/api/skills", tags=["skills"])
+app.include_router(experts_router, prefix="/api/experts", tags=["experts"])
 app.include_router(mcp_router, prefix="/api/mcp", tags=["mcp"])
 app.include_router(chat_router, prefix="/api/chat", tags=["chat"])
 app.include_router(chat_threads_router, prefix="/api", tags=["chat-threads"])

@@ -11,7 +11,7 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { render, screen, cleanup, waitFor, fireEvent } from '@testing-library/react';
 import { groupSkills, orderedCategories, mostUsed, byFrequencyThenName, CapabilitiesContent } from './CapabilitiesOverlay';
-import type { Skill, SkillHealthMap } from '../../types';
+import type { Skill, SkillHealthMap, ExpertsByDomain } from '../../types';
 
 // Health fixture builder — invocation_count is now required (run_ff4adc88).
 function h(status: SkillHealthMap[string]['status'], invocation_count: number | null, success_rate: number | null = null, last_used: string | null = null): SkillHealthMap[string] {
@@ -24,11 +24,17 @@ class ResizeObserverStub { observe() {} unobserve() {} disconnect() {} }
 
 const listSkills = vi.fn();
 const getHealth = vi.fn();
+// Experts (R2): default to empty so the many skills-focused tests don't need to stub it;
+// the Experts-view tests below set a real grouped payload.
+const listExperts = vi.fn(() => Promise.resolve({}));
 vi.mock('../../services/skills', () => ({
   skillsService: {
     list: () => listSkills(),
     getHealth: () => getHealth(),
   },
+}));
+vi.mock('../../services/experts', () => ({
+  expertsService: { list: () => listExperts() },
 }));
 const listAllMcp = vi.fn(() => Promise.resolve([]));
 vi.mock('../../services/mcpConfig', () => ({
@@ -385,5 +391,59 @@ describe('CapabilitiesContent — Connections registry honesty (run_3989a574)', 
     // marker icons render (faint, but present)
     expect(screen.getByTestId('cap-conn-tier-always-mcp').textContent).toBe('⚡');
     expect(screen.getByTestId('cap-conn-tier-ondemand-mcp').textContent).toBe('💤');
+  });
+});
+
+describe('CapabilitiesContent — Experts view (R2)', () => {
+  afterEach(() => {
+    cleanup();
+    listExperts.mockReset();
+    listExperts.mockResolvedValue({});
+    listSkills.mockResolvedValue([]);
+    getHealth.mockResolvedValue({});
+  });
+
+  const grouped: ExpertsByDomain = {
+    code: [
+      { expertId: 'correctness', displayNameZh: '正确性评审官', displayNameEn: 'Correctness Auditor', domain: 'code', scope: '逻辑、边界条件、错误处理', spawnAs: 'adversarial', visibility: 'public', isValid: true },
+      { expertId: 'security', displayNameZh: '安全评审官', displayNameEn: 'Security Auditor', domain: 'code', scope: '鉴权、注入、密钥', spawnAs: 'adversarial', visibility: 'public', isValid: true },
+    ],
+  };
+
+  it('switching to Experts tab renders experts grouped by domain with name + scope', async () => {
+    listSkills.mockResolvedValue([]);
+    getHealth.mockResolvedValue({});
+    listExperts.mockResolvedValue(grouped);
+    render(<CapabilitiesContent onDispatch={() => true} close={() => {}} />);
+    fireEvent.click(screen.getByTestId('cap-view-experts'));
+    await waitFor(() => expect(screen.getByTestId('cap-expert-group-code')).toBeTruthy());
+    const card = screen.getByTestId('cap-expert-correctness');
+    expect(card.textContent).toContain('Correctness Auditor');
+    expect(card.textContent).toContain('逻辑、边界条件、错误处理'); // scope = the decision line
+  });
+
+  it('health signal: a valid expert shows ready, a malformed one shows malformed (the ONE standout)', async () => {
+    listExperts.mockResolvedValue({
+      code: [
+        { expertId: 'good', displayNameZh: '好', displayNameEn: 'Good', domain: 'code', scope: 's', spawnAs: 'adversarial', visibility: 'public', isValid: true },
+        { expertId: 'bad', displayNameZh: '坏', displayNameEn: 'Bad', domain: 'code', scope: 's', spawnAs: 'adversarial', visibility: 'public', isValid: false },
+      ],
+    });
+    render(<CapabilitiesContent onDispatch={() => true} close={() => {}} />);
+    fireEvent.click(screen.getByTestId('cap-view-experts'));
+    await waitFor(() => expect(screen.getByTestId('cap-expert-health-good')).toBeTruthy());
+    expect(screen.getByTestId('cap-expert-health-good').getAttribute('data-valid')).toBe('true');
+    expect(screen.getByTestId('cap-expert-health-good').textContent).toContain('ready');
+    expect(screen.getByTestId('cap-expert-health-bad').getAttribute('data-valid')).toBe('false');
+    expect(screen.getByTestId('cap-expert-health-bad').textContent).toContain('malformed');
+  });
+
+  it('FAIL-SAFE: experts fetch REJECTS → empty state, no crash, skills view still works', async () => {
+    listSkills.mockResolvedValue([]);
+    getHealth.mockResolvedValue({});
+    listExperts.mockRejectedValue(new Error('network down'));
+    render(<CapabilitiesContent onDispatch={() => true} close={() => {}} />);
+    fireEvent.click(screen.getByTestId('cap-view-experts'));
+    await waitFor(() => expect(screen.getByTestId('cap-experts-empty')).toBeTruthy());
   });
 });

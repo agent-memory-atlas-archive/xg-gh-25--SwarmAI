@@ -50,13 +50,21 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { skillsService } from '../../services/skills';
+import { expertsService } from '../../services/experts';
 import { mcpConfigService, type ConfigEntry } from '../../services/mcpConfig';
 import { classifyLoadError } from '../../services/api';
-import type { Skill, SkillHealthMap, SkillHealthStatus } from '../../types';
+import type { Skill, SkillHealthMap, SkillHealthStatus, ExpertsByDomain } from '../../types';
 import { WorkbenchToolbar, OverlayDrawer } from './overlayShell';
 
 /** Health dot presentation — the ONE scannable standout (Von Restorff). Qualitative only;
  *  no raw counts on the row (R30#4). Keyed by the qualitative status the backend folds. */
+/** Human-readable domain headers for the Experts view (R2). Falls back to the raw
+ *  domain key for any domain not listed, so a new expert domain never renders blank. */
+const DOMAIN_LABEL: Record<string, string> = {
+  code: 'Code Review',
+  content: 'Content',
+};
+
 const HEALTH_DOT: Record<SkillHealthStatus, { color: string; label: string }> = {
   healthy: { color: 'var(--color-success, #4ade80)', label: 'Healthy — recently used, succeeding' },
   low_success: { color: 'var(--color-danger, #f87171)', label: 'Low success rate' },
@@ -95,7 +103,7 @@ export interface CapabilitiesContentProps {
   close: () => void;
 }
 
-type ViewMode = 'skills' | 'connections';
+type ViewMode = 'skills' | 'connections' | 'experts';
 
 /** The two signature abilities — rendered as heroes, the ONE thing that stands out.
  *  Keys are the exact folder_name (hyphenated, s_ prefix) — matched by `in SIGNATURE`. */
@@ -185,6 +193,12 @@ export function CapabilitiesContent({ onDispatch, close }: CapabilitiesContentPr
   // has no health data (never_used skills carry an explicit entry, so absence = no-data).
   const [health, setHealth] = useState<SkillHealthMap>({});
   const [healthSettled, setHealthSettled] = useState(false);
+  // Experts (R2): LAZY + FAIL-SAFE, independent of the skills/mcp load — a fetch
+  // failure renders an empty-state, never blocks or crashes the panel (same
+  // discipline as the health fetch below). `expertsSettled` distinguishes
+  // not-fetched-yet from fetched-but-empty so the view never sticks on 'loading'.
+  const [experts, setExperts] = useState<ExpertsByDomain>({});
+  const [expertsSettled, setExpertsSettled] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -216,6 +230,19 @@ export function CapabilitiesContent({ onDispatch, close }: CapabilitiesContentPr
       .then((h) => { if (alive) setHealth(h); })
       .catch(() => { if (alive) setHealth({}); })
       .finally(() => { if (alive) setHealthSettled(true); });
+    return () => { alive = false; };
+  }, []);
+
+  // LAZY + FAIL-SAFE experts fetch (R2) — SEPARATE from load() so the Experts
+  // view is never coupled to the skills/mcp fetch. A rejection renders an empty
+  // state (never throws, never blocks the panel).
+  useEffect(() => {
+    let alive = true;
+    expertsService
+      .list()
+      .then((e) => { if (alive) setExperts(e); })
+      .catch(() => { if (alive) setExperts({}); })
+      .finally(() => { if (alive) setExpertsSettled(true); });
     return () => { alive = false; };
   }, []);
 
@@ -358,7 +385,7 @@ export function CapabilitiesContent({ onDispatch, close }: CapabilitiesContentPr
         loading={loading}
         left={
           <div className="flex items-center gap-1 rounded-lg border border-[var(--color-border)] p-0.5">
-            {(['skills', 'connections'] as ViewMode[]).map((v) => (
+            {(['skills', 'experts', 'connections'] as ViewMode[]).map((v) => (
               <button
                 key={v}
                 data-testid={`cap-view-${v}`}
@@ -370,7 +397,7 @@ export function CapabilitiesContent({ onDispatch, close }: CapabilitiesContentPr
                     : 'text-[var(--color-text-muted)] hover:bg-[var(--color-hover)]')
                 }
               >
-                {v === 'skills' ? 'Skills' : 'Connections'}
+                {v === 'skills' ? 'Skills' : v === 'experts' ? 'Experts' : 'Connections'}
               </button>
             ))}
           </div>
@@ -458,6 +485,64 @@ export function CapabilitiesContent({ onDispatch, close }: CapabilitiesContentPr
             {!loading && groups.length === 0 && heroes.length === 0 && (
               <div className="text-sm text-[var(--color-text-faint)] py-8 text-center" data-testid="cap-empty">
                 {query ? 'No abilities match your search.' : 'No abilities found.'}
+              </div>
+            )}
+          </div>
+        )}
+
+        {!error && view === 'experts' && (
+          <div data-testid="cap-experts-view">
+            {/* Experts grouped by domain (chunking — Miller/Hick). Each card answers
+                "what does this reviewer check?" (scope), not a field dump: title =
+                English name, zh name demoted, scope is the one-line decision, and the
+                ONE standout signal is health (isValid). No per-group count header
+                (the grid shows N — redundant data-ink, Tufte). Between-group mb-8 >
+                within-group gap-3 so grouping reads (design-judgment check 6). */}
+            {Object.entries(experts)
+              .sort(([a], [b]) => a.localeCompare(b))
+              .map(([domain, list]) => (
+                <div key={domain} className="mb-8" data-testid={`cap-expert-group-${domain}`}>
+                  <h2 className="text-xs font-semibold text-[var(--color-text-muted)] uppercase tracking-wide mb-1">
+                    {DOMAIN_LABEL[domain] ?? domain}
+                  </h2>
+                  <div className="grid grid-cols-2 gap-3">
+                    {list.map((e) => (
+                      <div
+                        key={e.expertId}
+                        data-testid={`cap-expert-${e.expertId}`}
+                        className="rounded-xl border border-[var(--color-border)] p-3 min-w-0 flex flex-col"
+                      >
+                        {/* Title: English name + zh demoted (muted, right) */}
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="text-[var(--color-text)] text-sm font-semibold truncate">{e.displayNameEn}</span>
+                          <span className="ml-auto shrink-0 text-[11px] text-[var(--color-text-faint)] truncate">{e.displayNameZh}</span>
+                        </div>
+                        {/* Scope — the one-line "what this expert reviews" */}
+                        <div className="text-xs text-[var(--color-text-muted)] mt-1 line-clamp-2 min-w-0">{e.scope}</div>
+                        {/* Health — the ONE standout signal: an unhealthy expert pops red */}
+                        <div
+                          data-testid={`cap-expert-health-${e.expertId}`}
+                          data-valid={e.isValid}
+                          className="mt-auto pt-2 flex items-center gap-1.5 text-[11px] text-[var(--color-text-muted)]"
+                        >
+                          <span
+                            className="inline-block w-2 h-2 rounded-full shrink-0"
+                            style={{ background: e.isValid ? 'var(--color-success, #4ade80)' : 'var(--color-danger, #f87171)' }}
+                            title={e.isValid ? 'well-formed' : 'malformed frontmatter'}
+                          />
+                          <span className="truncate">
+                            <span className="font-medium">{e.isValid ? 'ready' : 'malformed'}</span>
+                            {e.spawnAs && <span className="text-[var(--color-text-faint)]"> · {e.spawnAs}</span>}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            {expertsSettled && Object.keys(experts).length === 0 && (
+              <div className="text-sm text-[var(--color-text-faint)] py-8 text-center" data-testid="cap-experts-empty">
+                No experts found.
               </div>
             )}
           </div>
