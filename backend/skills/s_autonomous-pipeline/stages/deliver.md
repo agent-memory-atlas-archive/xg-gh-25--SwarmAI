@@ -404,7 +404,23 @@ git ls-files --others --exclude-standard
 | **Operational** | Files touch: hooks/, jobs/, schedulers, daemon code, background tasks | `backend/experts/code/operational.md` |
 | **Red Team** | CONDITIONAL: changeset > 200 lines OR any specialist found HIGH severity | `backend/experts/code/red-team.md` |
 
-**For bugfix profile:** Only dispatch Correctness + Security.
+**For bugfix profile:** the tier-default set is Correctness + Security.
+
+**🚨 ALWAYS take the UNION with the PLAN's declared `required_experts`:**
+
+```
+actual_dispatch_set = union(profile_tier_default_set, run.json["required_experts"])
+```
+
+Read `required_experts` from the CURRENT run.json at dispatch time (it is
+append-only — D7-SAFETY③ — so BUILD may have added one; take the union against
+whatever is present NOW). The D7 commit-gate (`_d7_missing_required_experts`)
+BLOCKS run-commit unless EVERY declared expert actually reviewed — so an expert
+the PLAN declared but the tier-default omits will be rejected AFTER the fact,
+forcing a wasteful second serial batch. Taking the union up front eliminates the
+mismatch at its root: dispatch exactly the set the gate will verify, in ONE
+parallel batch. (Do NOT instead constrain `required_experts` down to the tier —
+that would reopen the D7 skip channel the gate exists to close.)
 
 **⚠️ EXCEPTION — `understanding.work_type == refactor` (architecture task):** do NOT
 apply the bugfix narrowing above even when the profile resolved to bugfix. A refactor's
@@ -445,6 +461,13 @@ Dispatching N specialists: [names]. Skipped: [names] (scope not detected).
 message** (multiple Agent tool calls) so they run in parallel. (The *tier* is [GATE·cli];
 that you spawned in ONE parallel message is discipline — code checks the tier/evidence, not the batching.) Each sub-agent
 has fresh context — no prior review bias.
+
+> **"ALL selected" = the `actual_dispatch_set` from Step 1 (the UNION with
+> `required_experts`), in ONE batch — never a tier-default batch now and a
+> required-experts batch later.** Splitting into two serial batches is the exact
+> waste this stage was fixed to prevent: the second batch's wall-clock + a second
+> meta-review serialize behind the first for no reason. Compute the union FIRST,
+> then spawn the whole set in a single message.
 
 > **The file LIST is inert; the prompt's WORDING is load-bearing. Do not confuse
 > the two.**
