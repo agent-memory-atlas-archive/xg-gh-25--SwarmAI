@@ -164,9 +164,10 @@ class TestContentContractCopyReport:
     generates REPORT.md (Pipeline Report step) BEFORE run-commit. run_44a06138 is the
     known-good proof: its B is a verbatim copy of A's terminal REPORT.md incl. §9 Lessons."""
 
-    def test_B_is_a_copy_of_terminal_report(self, workspace, tmp_path):
-        """AC1+AC2 (tracer): A has a terminal REPORT.md containing the §需求溯源审计
-        section → B copies it verbatim as REPORT.md (NOT a separate REQUIREMENTS.md)."""
+    def test_B_is_a_projection_of_terminal_report(self, workspace, tmp_path):
+        """AC1+AC3 (tracer): A has a terminal REPORT.md with the §需求溯源审计 section →
+        B is a WHITELIST PROJECTION of A as REPORT.md (NOT a separate REQUIREMENTS.md,
+        NOT a verbatim copy). Whitelisted sections survive; A (ledger) is untouched."""
         from scripts.artifact_cli import _generate_review_deliverable
         from unittest.mock import patch
         repo = _src_repo(tmp_path, "reprepo")
@@ -181,15 +182,21 @@ class TestContentContractCopyReport:
 
         assert created, f"B must generate when A has REPORT.md; got {warnings}"
         names = {Path(c).name for c in created}
-        # B carries a single terminal REPORT.md (the §4.6 provenance section lives INSIDE it),
-        # NOT a separate REQUIREMENTS.md.
         assert "REPORT.md" in names, f"B must carry REPORT.md, got {names}"
         assert "REQUIREMENTS.md" not in names, f"B must NOT carry a separate REQUIREMENTS.md, got {names}"
-        # The copy is verbatim — identical bytes to ledger A's terminal REPORT.md.
+        # CONTRACT CHANGE (run_d8321b43): B is a WHITELIST PROJECTION of A, not a verbatim
+        # copy. A (ledger) stays the full durable audit; B (committed) carries only the
+        # reviewer-facing whitelist sections. Prefix-match keeps the CJK provenance title
+        # even though its rendered form has an English suffix.
         b_report = next(c for c in created if Path(c).name == "REPORT.md")
         a_report = workspace / "Projects" / "TestProject" / ".artifacts" / "runs" / "run_rep" / "REPORT.md"
-        assert Path(b_report).read_text(encoding="utf-8") == a_report.read_text(encoding="utf-8"), \
-            "B's REPORT.md must be a verbatim copy of ledger A's terminal REPORT.md"
+        b_body = Path(b_report).read_text(encoding="utf-8")
+        a_body = a_report.read_text(encoding="utf-8")
+        assert "## TL;DR" in b_body
+        assert "需求溯源审计" in b_body, "B must keep the provenance section (whitelist, prefix-match)"
+        assert "## 9. Lessons" in b_body and "learned X" in b_body
+        # A (ledger) is untouched — still carries its full self.
+        assert "需求溯源审计" in a_body and "## 9. Lessons" in a_body
 
     def test_copied_report_carries_provenance_section(self, workspace, tmp_path):
         """AC2: the copied REPORT.md carries the §4.6 需求溯源审计 section (Intent→
@@ -574,3 +581,92 @@ class TestContentSafetyScan:
         assert any("REPORT.md" in c for c in created)
         assert not any("CONTENT-SAFETY" in w for w in warnings), \
             f"clean content must not trigger a false content-safety warning, got {warnings}"
+
+
+class TestReviewProjection:
+    """run_d8321b43: B is a WHITELIST PROJECTION of ledger A, not a verbatim copy.
+    Keeps reviewer-facing sections (TL;DR / §1 / 需求溯源审计 / §2 / §3 / §6 / §7 / §8 / §9 / §10);
+    drops pure process (§4 Pipeline Execution / §5 TDD Results). §7 Quality Gates is
+    KEPT but STRIPPED to its reviewer-facing sub-verdicts (§7.5 Adversarial Review +
+    §7.6 Completion Audit) — the leading Gate stat table (REVIEW findings count / TEST
+    pass count / Confidence N/10) is dropped as noise (Gate-2 Red-Team HIGH: the
+    adversarial verdict + 'NOT RUN' quality-gap flag are the single most reviewer-
+    critical facts and must survive; the stat rows are noise). §8 Files Changed is
+    re-rendered from the live staging set. A (cmd_run_report output) is never touched."""
+
+    _FULL_A = (
+        "# Autonomous Pipeline Report: thing\n"
+        "## TL;DR\ndone\n"
+        "## 1. Requirement\nmake it true\n"
+        "## 需求溯源审计 (Requirement Provenance Audit)\n### 原始意图\n> intent\nFR-1\n"
+        "## 2. Evaluation\nGO scope complex\n"
+        "## 3. Design & Approach\nwhitelist projection\n"
+        "## 4. Pipeline Execution\n### 4.1 Per-Stage Elapsed\nstage timings\n"
+        "## 5. TDD Results\n| Tests total | 7 |\n| Tests passed | 7 |\n"
+        "## 6. Decision Log\nchose A because\n"
+        "## 7. Quality Gates\n"
+        "| Gate | Result |\n|------|--------|\n"
+        "| REVIEW (code quality) | 2 findings (HIGH) |\n"
+        "| TEST (suite) | 22/22 pass |\n"
+        "| Confidence | 8/10 |\n"
+        "\n### 7.5 Adversarial Review\n"
+        "**⚠️ NOT RUN** — adversarial sub-agent was not spawned during this run.\n"
+        "\n### 7.6 Completion Audit\n- [x] AC1 met\n**Met:** 1 | **Unmet:** 0\n"
+        "## 8. Files Changed\n- `self_reported.py`\n\n**+10 / -2 lines** | 1 files\n"
+        "## 9. Lessons\n- learned something transferable\n"
+        "## 10. Known Gaps & Attention Flags\ngap: none\n"
+    )
+
+    def _project(self, source_files):
+        from scripts.artifact_cli import _project_report_for_review
+        return _project_report_for_review(self._FULL_A, source_files)
+
+    def test_AC1_whitelist_sections_kept(self):
+        out = self._project(["a.py"])
+        for title in ("## TL;DR", "## 1. Requirement", "需求溯源审计", "## 2. Evaluation",
+                      "## 3. Design & Approach", "## 6. Decision Log", "## 7. Quality Gates",
+                      "## 8. Files Changed", "## 9. Lessons", "## 10. Known Gaps & Attention Flags"):
+            assert title in out, f"whitelist section must survive: {title!r}\n{out}"
+
+    def test_AC2_process_stats_sections_dropped(self):
+        out = self._project(["a.py"])
+        for title in ("## 4. Pipeline Execution", "### 4.1", "## 5. TDD Results",
+                      "Tests total"):
+            assert title not in out, f"pure-process section must be dropped: {title!r}\n{out}"
+
+    def test_AC7_quality_gates_kept_but_stat_table_stripped(self):
+        # Gate-2 Red-Team HIGH: §7 is KEPT (adversarial verdict + completion audit are
+        # the most reviewer-critical facts), but the leading Gate stat table is stripped.
+        out = self._project(["a.py"])
+        # KEPT — the reviewer-facing sub-verdicts:
+        assert "### 7.5 Adversarial Review" in out, "§7.5 adversarial verdict must survive"
+        assert "NOT RUN" in out, "§7.5 'adversarial NOT RUN' quality-gap flag must survive"
+        assert "### 7.6 Completion Audit" in out, "§7.6 completion audit must survive"
+        assert "AC1 met" in out
+        # STRIPPED — the stat-table noise (Confidence / findings count / TEST pass count):
+        assert "Confidence | 8/10" not in out, "Confidence stat row must be stripped"
+        assert "REVIEW (code quality)" not in out, "REVIEW findings-count stat row must be stripped"
+        assert "22/22 pass" not in out, "TEST pass-count stat row must be stripped"
+
+    def test_AC2_provenance_prefix_match(self):
+        # Gate-1 Q1: real title has an English suffix; exact-equal would drop it.
+        out = self._project(["a.py"])
+        assert "需求溯源审计 (Requirement Provenance Audit)" in out
+        assert "> intent" in out and "FR-1" in out
+
+    def test_AC4_section8_from_live_staging(self):
+        # §8 re-rendered from the live staging set, NOT the agent self-reported file.
+        out = self._project(["backend/real_a.py", "backend/real_b.py"])
+        assert "## 8. Files Changed" in out
+        assert "backend/real_a.py" in out and "backend/real_b.py" in out
+        assert "self_reported.py" not in out, "§8 must use live staging, not A's self-report"
+        # The self-reported lines-count noise is gone (we show real files, not stats).
+        assert "+10 / -2 lines" not in out
+
+    def test_AC6_empty_staging_is_honest_not_fabricated(self):
+        out = self._project([])
+        assert "## 8. Files Changed" in out
+        # No fabricated file list; an honest "no committed files" marker instead.
+        assert "self_reported.py" not in out
+        assert ("无 committed" in out or "no committed" in out.lower()
+                or "No committed" in out), f"empty staging must be honest, got §8:\n{out}"

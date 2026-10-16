@@ -275,6 +275,118 @@ def _report_section9_is_degenerate(report_md: str) -> bool:
     return not has_lesson_bullet
 
 
+# Top-level ``## `` section titles that the committed review deliverable B KEEPS.
+# B is a reviewer-facing PROJECTION of ledger A — it carries only what a reviewer
+# should review (intent→requirement, evaluation, design, decisions, files, lessons,
+# known gaps), NOT A's full process/stats record (§4 Pipeline Execution, §5 TDD
+# Results, §7 Quality Gates — those are the pipeline's internal audit, kept in A).
+# Matching is PREFIX, not exact-equal: the provenance section's rendered title is
+# ``## 需求溯源审计 (Requirement Provenance Audit)`` (an English suffix the exact-match
+# would silently drop — Gate-1 Q1). Dropping a ``## N`` parent drops its ``### N.x``
+# children because the slice runs header-to-next-``## ``-header.
+_B_REVIEW_SECTION_WHITELIST = (
+    "## TL;DR",
+    "## 1. Requirement",
+    "## 需求溯源审计",
+    "## 2. Evaluation",
+    "## 3. Design & Approach",
+    "## 6. Decision Log",
+    # §7 is KEPT but its leading stat table is stripped in the projection (only the
+    # §7.5 adversarial verdict + §7.6 completion audit survive — see _strip_quality_gate_stats).
+    "## 7. Quality Gates",
+    "## 8. Files Changed",
+    "## 9. Lessons",
+    "## 10. Known Gaps & Attention Flags",
+)
+
+
+def _render_review_files_section(source_files: list[str]) -> str:
+    """Render B's ``## 8. Files Changed`` from the LIVE staging set (the real
+    git-committed source files), NOT A's agent-self-reported ``files_changed``.
+    source_files is the caller's live staging list at run-commit time (``by_repo``);
+    an empty list is reported HONESTLY (no fabricated file list, no stat noise)."""
+    out = "## 8. Files Changed\n"
+    real = [f for f in (source_files or []) if f]
+    if real:
+        for f in real:
+            out += f"- `{f}`\n"
+    else:
+        out += "_(无 committed 文件 / no committed source files recorded for this run)_\n"
+    # Trailing blank line so the next ``## `` section is separated like every other
+    # section (A's sections carry a blank line via cmd_run_report's "\n\n".join).
+    out += "\n"
+    return out
+
+
+# §7 Quality Gates keeps its reviewer-facing sub-verdicts (§7.5 Adversarial Review +
+# §7.6 Completion Audit) but DROPS its leading Gate stat table (REVIEW findings count,
+# TEST pass count, Confidence N/10) — those are noise; the adversarial verdict and the
+# "NOT RUN" quality-gap flag are the reviewer-critical facts (Gate-2 Red-Team HIGH).
+def _strip_quality_gate_stats(section_lines: list[str]) -> list[str]:
+    """Given the full ``## 7. Quality Gates`` section (header + body lines), return the
+    header followed by everything from the first ``### `` sub-heading onward — dropping
+    the leading stat table between the ``## 7`` header and ``### 7.5``. If no ``### ``
+    sub-heading exists (degenerate), keep the section unchanged (fail-safe: never drop
+    content we cannot classify)."""
+    first_sub = None
+    for idx, ln in enumerate(section_lines):
+        if ln.startswith("### "):
+            first_sub = idx
+            break
+    if first_sub is None or first_sub <= 0:
+        # No sub-heading (degenerate) → keep whole section (fail-safe). first_sub<=0
+        # cannot happen on the sole call path (section[0] is always the ``## 7`` header,
+        # never ``### ``), but guarding it keeps the helper safe in isolation (would
+        # otherwise duplicate line 0 via [0] + [0:]).
+        return section_lines
+    return [section_lines[0]] + section_lines[first_sub:]
+
+
+def _project_report_for_review(report_md: str, source_files: list[str]) -> str:
+    """Project ledger A's full REPORT.md into the committed review deliverable B.
+
+    B keeps ONLY the reviewer-facing whitelist sections (``_B_REVIEW_SECTION_WHITELIST``,
+    prefix-matched) and drops A's pure-process sections (§4/§5). Two kept sections are
+    re-shaped: ``## 8. Files Changed`` is re-rendered from the LIVE staging set
+    (``source_files``) so B reflects git truth, never A's self-reported counts; and
+    ``## 7. Quality Gates`` is stripped to its §7.5 adversarial verdict + §7.6 completion
+    audit (the leading stat table is dropped). A (the ledger) is read-only — never mutated.
+
+    A whitelist section ABSENT from A is simply absent from B (no fabrication / no
+    placeholder — honesty over completeness)."""
+    lines = report_md.splitlines(keepends=True)
+    out_parts: list[str] = []
+    i = 0
+    n = len(lines)
+    # Leading non-section preamble (document title etc.) is carried through.
+    while i < n and not lines[i].startswith("## "):
+        out_parts.append(lines[i])
+        i += 1
+    while i < n:
+        header = lines[i]
+        # Slice this section: header line + body up to (not incl.) the next ``## `` header.
+        section = [header]
+        j = i + 1
+        while j < n and not lines[j].startswith("## "):
+            section.append(lines[j])
+            j += 1
+        header_stripped = header.strip()
+        kept = any(header_stripped.startswith(w) for w in _B_REVIEW_SECTION_WHITELIST)
+        if kept:
+            if header_stripped.startswith("## 8. Files Changed"):
+                # Replace §8 wholesale with the live-staging render (drops A's
+                # self-reported file list + lines-count stat noise).
+                out_parts.append(_render_review_files_section(source_files))
+            elif header_stripped.startswith("## 7. Quality Gates"):
+                # Keep §7 but strip its leading stat table — only the §7.5 adversarial
+                # verdict + §7.6 completion audit (the reviewer-critical facts) survive.
+                out_parts.extend(_strip_quality_gate_stats(section))
+            else:
+                out_parts.extend(section)
+        i = j
+    return "".join(out_parts)
+
+
 def _get_workspace() -> Path:
     """Resolve workspace root from environment or default."""
     import os
@@ -3162,7 +3274,8 @@ _FAILLOUD_SENTINEL = "⛔FAILLOUD⛔ deliverable B:"
 
 
 def _generate_review_deliverable(
-    project: str, run_id: str, target_repo_root: str
+    project: str, run_id: str, target_repo_root: str,
+    source_files: list[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Generate derivative "B" — the review deliverable — into the real repo's
     ``.aidlc/deliverables/<run_id>/`` so a reviewer sees code + context in the SAME
@@ -3356,7 +3469,12 @@ def _generate_review_deliverable(
                 f"populated. Seed the lessons, re-run run-report, then re-run run-commit "
                 f"to produce a correct review deliverable."
             ]
-        (dest / "REPORT.md").write_text(report_content, encoding="utf-8")
+        # B is a reviewer-facing PROJECTION of ledger A — NOT a verbatim copy.
+        # Keep only the whitelist sections; re-render §8 from the LIVE staging set
+        # (source_files) so committed B reflects git truth, not A's self-reported
+        # counts. A on disk is untouched (read-only above). (run_d8321b43)
+        projected = _project_report_for_review(report_content, source_files or [])
+        (dest / "REPORT.md").write_text(projected, encoding="utf-8")
         created.append(str(dest / "REPORT.md"))
     except (OSError, UnicodeDecodeError) as e:
         # B is best-effort (ledger A is the durable truth) — a read/write/decode
@@ -3480,8 +3598,14 @@ def cmd_run_commit(args, reg: ArtifactRegistry) -> None:
                           "(§4.9 边界② — deliver via ledger A, no check-in)"]
             _b_paths = []
         else:
+            # Pass the LIVE staging set for this target root as B's §8 source — at
+            # this point by_repo holds THIS run's real source files and _b_paths has
+            # NOT yet been appended (that happens below), so it is pure source, no B.
+            # run_state['commits'] is NOT usable here: it is persisted AFTER this call
+            # (Gate-1 Q3), so it would be empty on the normal single-commit path.
             _b_paths, warnings_b = _generate_review_deliverable(
-                args.project, args.run_id, _target_root
+                args.project, args.run_id, _target_root,
+                source_files=list(by_repo.get(_target_root, [])),
             )
             # FR-2: a fail-loud sentinel means auto-generation of the audit projection
             # FAILED (真异常 — corrupt/unreadable ledger or a render crash). This is NOT
