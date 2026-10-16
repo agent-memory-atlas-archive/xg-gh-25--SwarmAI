@@ -444,6 +444,67 @@ def _build_dynamic_prefix_block(
     return "\n\n".join(parts)
 
 
+def _build_terminal_prefix_block(terminal_context: Optional[dict]) -> Optional[str]:
+    """Run 2 (prompt-injection root-fix) — SSoT builder for the attached-terminal
+    UNTRUSTED-DATA block that rides the USER/query channel. Returns the exact block
+    string ``_prepend_terminal_to_query`` prepends (or ``None`` when empty).
+
+    Sibling of ``_build_dynamic_prefix_block`` / ``_build_resume_prefix_block``:
+    the send-site reads this to capture EXACTLY what was delivered onto the query
+    (for TSCC ``full_text`` + the security-scan panel) WITHOUT a fragile
+    before/after diff of ``query_content`` (ambiguous for the multimodal list
+    shape). One source of truth: both the prefixer and the metadata-capture read it.
+
+    Why the terminal block is delivered on the query channel at all: for Claude,
+    ``role: system`` is the non-spoofable operator channel with the WEAKEST
+    injection defense; user/tool content is treated as possibly-forged with the
+    STRONGEST defense (Anthropic claude-api canonical). Attacker-controllable
+    terminal ``buffer_tail`` therefore belongs on the user channel, never the
+    system prompt. Rendering (UNTRUSTED boundary + dynamic fence) is the SSoT
+    ``prompt_builder.render_terminal_data_block``.
+    """
+    if not terminal_context:
+        return None
+    # Lazy import mirrors _build_dynamic_prefix_block's in-function import to
+    # avoid the prompt_builder ↔ session-layer import cycle at module load.
+    from .prompt_builder import render_terminal_data_block
+
+    buffer_tail = terminal_context.get("buffer_tail", "") or ""
+    term_cwd = terminal_context.get("cwd", "") or ""
+    block = render_terminal_data_block(buffer_tail, term_cwd)
+    return block or None
+
+
+def _prepend_terminal_to_query(
+    query_content: Any,
+    terminal_context: Optional[dict],
+) -> Any:
+    """Run 2 (prompt-injection root-fix) — prefix the attached-terminal
+    UNTRUSTED-DATA block onto the user query. Pure — no IO, no mutation of inputs.
+
+    UNLIKE ``_prepend_dynamic_context_to_query`` (recall + UI-SENSE, gated on
+    ``should_prefix=_will_reuse_live``) and the resume prefix (gated on
+    ``_should_prefix_resume``), the terminal block is prefixed **UNCONDITIONALLY
+    — on BOTH the cold-spawn and warm-reuse paths**. That is the whole point of
+    Run 2: terminal DATA no longer rides the system prompt on ANY path (the
+    build_system_prompt injection was deleted), so the query channel is its ONLY
+    delivery — and both cold and warm send ``query_content`` to the subprocess as
+    a USER turn (session_unit stream_query wraps it ``role: user``). There is no
+    double-inject: the system-prompt sink is gone, so the query prefix is the
+    sole carrier on every path.
+
+    Returns ``query_content`` UNCHANGED when there is no terminal block. For a
+    ``str`` query the block is prepended as text; for a multimodal ``list`` it is
+    a leading ``{type: text}`` block.
+    """
+    block = _build_terminal_prefix_block(terminal_context)
+    if not block:
+        return query_content
+    if isinstance(query_content, list):
+        return [{"type": "text", "text": block}, *query_content]
+    return f"{block}\n\n{query_content}"
+
+
 # resume-context-injection去根 (run_d108b914): the provenance header that wraps a
 # resume block when it rides the query channel. The 150K resume block is prior
 # conversation history — NOT this turn's user intent. Framing it explicitly as
@@ -3470,18 +3531,40 @@ class SessionRouter:
             getattr(unit, "_resume_query_block", None),
             should_prefix=_should_prefix_resume(is_cold_resume, needs_channel_resume),
         )
+        # Run 2 (prompt-injection root-fix): prefix the attached-terminal
+        # UNTRUSTED-DATA block UNCONDITIONALLY — on BOTH cold-spawn and warm-reuse.
+        # Unlike recall/SENSE (gated _will_reuse_live) and resume (gated
+        # _should_prefix_resume), terminal has NO system-prompt sink anymore (the
+        # build_system_prompt injection was deleted), so the query channel is its
+        # ONLY carrier on every path — hence unconditional, no double-inject. This
+        # runs LAST so the terminal block is the OUTERMOST (leading) prefix; the
+        # _prefix_parts capture below mirrors that order (terminal inserted first).
+        query_content = _prepend_terminal_to_query(query_content, terminal_context)
 
         # TSCC/security-scan alignment (run_380413c5): capture the EXACT
         # query-channel prefix delivered this turn, via the SSoT block-builders (the
         # same functions the two prefixers use — NOT a fragile before/after diff of
         # query_content, which is ambiguous for the multimodal list shape; Gate-1
-        # P1/P2). Gates MUST mirror the two prefixers above so the captured block is
-        # exactly what was prepended: dynamic = _will_reuse_live, resume =
-        # _should_prefix_resume(...). On any turn at most one fires (COLD-resume vs
-        # warm-reuse are mutually exclusive; a channel-resume-over-prewarm warm turn
-        # can carry both — join them). Written UNCONDITIONALLY (None when neither
-        # fires) so a stale prior-turn prefix never leaks into full_text (Gate-1 P3).
+        # P1/P2). Gates MUST mirror the prefixers above so the captured block is
+        # exactly what was prepended, in the SAME order:
+        #   - terminal (Run 2) = UNCONDITIONAL on both paths — it has no
+        #     system-prompt sink, so it ALWAYS rides the query; captured FIRST
+        #     because _prepend_terminal_to_query runs LAST and is thus the
+        #     OUTERMOST/leading prefix in the delivered query_content.
+        #   - dynamic (recall + UI-SENSE) = gated _will_reuse_live.
+        #   - resume = gated _should_prefix_resume(...).
+        # The dynamic/resume PAIR is still "at most one fires" (COLD-resume vs
+        # warm-reuse are mutually exclusive; a channel-resume-over-prewarm warm
+        # turn can carry both — join them). Terminal is ORTHOGONAL to that pair —
+        # it co-occurs with whichever of them fires (or neither, on a plain cold
+        # non-resume spawn, which is exactly the case the old gated-only capture
+        # left with full_text=None and the terminal DATA invisible to the
+        # security-scan panel — Gate-1 BLOCK, now fixed). Written UNCONDITIONALLY
+        # (None when nothing fires) so a stale prior-turn prefix never leaks (P3).
         _prefix_parts: list[str] = []
+        _term = _build_terminal_prefix_block(terminal_context)
+        if _term:
+            _prefix_parts.append(_term)
         if _will_reuse_live:
             _dyn = _build_dynamic_prefix_block(
                 editor_context, getattr(unit, "_recall_query_block", None),
