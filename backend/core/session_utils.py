@@ -630,6 +630,7 @@ def _build_error_event(
     *,
     detail: Optional[str] = None,
     suggested_action: Optional[str] = None,
+    terminal: bool = False,
 ) -> dict:
     """Build a sanitized SSE error event dict.
 
@@ -638,8 +639,19 @@ def _build_error_event(
     is stripped of tracebacks, file paths with line numbers, and library
     version strings so that internal implementation details are never
     leaked to the frontend.
+
+    ``terminal=True`` marks the error as PERMANENTLY undeliverable — a
+    non-retriable failure (the caller has already run it past
+    ``_is_retriable_error``) for which re-sending the SAME request will only
+    reproduce the SAME error. The pending-drain finalize path reads this flag
+    to STOP rolling the message back to pending (which would re-drive it on
+    every IDLE edge forever). It does NOT affect how the event is shown to the
+    user — the code/message/error fields are unchanged, so a terminal error is
+    surfaced exactly like any other, never silently dropped.
     """
     event: dict = {"type": "error", "code": code, "message": message, "error": message}
+    if terminal:
+        event["terminal"] = True
     if suggested_action:
         event["suggested_action"] = suggested_action
     if detail:

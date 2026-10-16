@@ -3012,15 +3012,20 @@ class SessionRouter:
             # the set re-coalesces on the next clean IDLE (F4 — never lose a msg).
             delivered_ok = False
             saw_error: Optional[str] = None
+            saw_terminal = False
             async for _evt in agen:
                 _t = _evt.get("type") if isinstance(_evt, dict) else None
                 if _t == "error":
                     saw_error = (_evt.get("code") or "error") if isinstance(_evt, dict) else "error"
+                    # A permanent (non-retriable) error carries terminal=True — the
+                    # finalize must terminally-drop it, not re-drive it forever.
+                    if isinstance(_evt, dict) and _evt.get("terminal"):
+                        saw_terminal = True
                 elif _t == "result":
                     delivered_ok = True
             await self._finalize_pending_delivery(
                 session_id, seqs, delivered_ok=delivered_ok, saw_error=saw_error,
-                unit=unit,
+                terminal=saw_terminal, unit=unit,
             )
         except Exception as exc:
             await session_pending.rollback_claim_batch(session_id, seqs)
@@ -3037,6 +3042,7 @@ class SessionRouter:
         *,
         delivered_ok: bool,
         saw_error: Optional[str],
+        terminal: bool = False,
         unit: Optional[Any] = None,
     ) -> None:
         """Shared exactly-once close-out for a CLAIMED pending set (run_25d2b7b8).
@@ -3054,9 +3060,20 @@ class SessionRouter:
         - delivered (``result`` observed AND no ``error`` event) → ``mark_sent_batch``
           flips the claimed set sent=1 (guarded by ``claimed_at IS NOT NULL`` so a
           concurrently-reopened row is a no-op).
-        - otherwise (error event / no result) → ``rollback_claim_batch`` returns the
+        - TERMINAL error (``terminal=True`` — a PERMANENT, non-retriable failure the
+          orchestrator already classified past ``_is_retriable_error``, e.g. a 400
+          geo-block) → ``mark_sent_batch`` + loud log: terminally-undeliverable. We do
+          NOT roll back, because re-sending reproduces the SAME error — rolling back
+          re-drives it on every IDLE edge forever (the poison_guard 764x-recycle
+          engine, run_29959bcd). Mirrors the degenerate-empty-payload guard in
+          ``drain_pending`` which also mark_sents + loud-logs to break an identical
+          loop. The error event was already yielded to the user upstream, so the
+          failure is surfaced — mark_sent here only stops the infinite retry, it does
+          not hide anything.
+        - otherwise (TRANSIENT error / no result) → ``rollback_claim_batch`` returns the
           set to pending (sent=0, claimed_at cleared) so it re-coalesces later; no
-          message is lost.
+          message is lost. This preserves the existing exponential-retry behavior for
+          genuinely transient failures (throttle/5xx/timeout).
         """
         from . import session_pending
         if not seqs:
@@ -3075,6 +3092,17 @@ class SessionRouter:
                     unit._last_drained_seqs = list(seqs)
                 except Exception:
                     pass
+        elif saw_error is not None and terminal:
+            # Terminally-undeliverable: a permanent, non-retriable error. mark_sent
+            # (NOT rollback) so the row leaves the pending queue and is never
+            # re-drained — this is the cut that stops the infinite re-drive loop.
+            await session_pending.mark_sent_batch(session_id, seqs)
+            logger.warning(
+                "session_router.pending_terminally_undeliverable session_id=%s "
+                "seqs=%s error=%s — permanent (non-retriable) failure; marked sent "
+                "to stop infinite re-drive (error already surfaced to user)",
+                session_id, seqs, saw_error,
+            )
         else:
             await session_pending.rollback_claim_batch(session_id, seqs)
             logger.warning(
@@ -3854,6 +3882,7 @@ class SessionRouter:
 
         _coalesce_delivered_ok = False
         _coalesce_saw_error: Optional[str] = None
+        _coalesce_saw_terminal = False
         try:
             async for event in unit.send(
                 query_content=query_content,
@@ -3871,6 +3900,11 @@ class SessionRouter:
                             (event.get("code") or "error")
                             if isinstance(event, dict) else "error"
                         )
+                        # A permanent (non-retriable) error carries terminal=True —
+                        # mirror the serial-drain capture so this coalesce path ALSO
+                        # terminally-drops it instead of re-driving forever.
+                        if isinstance(event, dict) and event.get("terminal"):
+                            _coalesce_saw_terminal = True
                     elif _ev_t == "result":
                         _coalesce_delivered_ok = True
                         # FINALIZE-ON-RESULT, not after the loop (Gate-2 HIGH,
@@ -3892,7 +3926,7 @@ class SessionRouter:
                             session_id, _seqs_now,
                             delivered_ok=True,
                             saw_error=_coalesce_saw_error,
-                            unit=unit,
+                            terminal=_coalesce_saw_terminal, unit=unit,
                         )
                 # Stash the turn client_id on the unit so continuation paths
                 # (answer/permission), which run on THIS same unit, reuse it to key
@@ -4024,7 +4058,7 @@ class SessionRouter:
                             session_id, _coalesced_pending_seqs,
                             delivered_ok=_coalesce_delivered_ok,
                             saw_error=_coalesce_saw_error or "aborted",
-                            unit=unit,
+                            terminal=_coalesce_saw_terminal, unit=unit,
                         )
                         _coalesced_pending_seqs = []
                     return
@@ -4046,7 +4080,7 @@ class SessionRouter:
                     session_id, _seqs_to_finalize,
                     delivered_ok=_coalesce_delivered_ok,
                     saw_error=_coalesce_saw_error,
-                    unit=unit,
+                    terminal=_coalesce_saw_terminal, unit=unit,
                 )
         except Exception as send_err:
             # SessionBusyError: session is actively streaming, reject new send.

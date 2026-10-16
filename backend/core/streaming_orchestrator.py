@@ -1596,8 +1596,23 @@ class StreamingOrchestrator:
                         self._parent.session_id, is_error, subtype, error_text,
                     )
                     friendly, suggested = _sanitize_sdk_error(error_text)
+                    # terminal=True: this branch is reached ONLY for a NON-retriable
+                    # error — the retriable path raised at `if _is_retriable_error(...)`
+                    # above, and the zombie path raised before that. A permanent error
+                    # (e.g. 400 geo-block) will reproduce identically on re-send, so the
+                    # pending-drain finalize must NOT roll the message back to pending
+                    # (that re-drives it every IDLE edge forever, and poison_guard
+                    # recycles once PER re-drive — the 764x-recycle incident, run_29959bcd).
+                    # SCOPE: this cuts the drained-pending RE-DRIVE limb (the 764x driver).
+                    # It does NOT change _last_turn_clean, so poison_guard's own design
+                    # behavior — recycle-before-reuse ONCE on the next send to a session
+                    # whose last turn ended non-clean — is intentionally unchanged (that is
+                    # a single bounded recycle, not the unbounded loop this fix targets).
+                    # The event is still yielded to the user below, so the error is
+                    # surfaced, never silently dropped.
                     yield _build_error_event(
                         code="SDK_ERROR", message=friendly, suggested_action=suggested,
+                        terminal=True,
                     )
                     # Clear stale sub-agent progress (matches
                     # turn_limit_reached and interrupt paths).
