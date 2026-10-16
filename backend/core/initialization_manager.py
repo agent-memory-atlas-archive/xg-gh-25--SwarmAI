@@ -239,13 +239,13 @@ class InitializationManager:
         without needing to import initialization_manager.
         """
         try:
-            from core.app_config_manager import app_config_manager
-            if app_config_manager is not None:
-                existing = app_config_manager.get("workspace_path")
-                if existing != ws_path:
-                    app_config_manager.update({"workspace_path": ws_path})
-                    logger.info("Persisted workspace_path to config: %s", ws_path)
-        except (ImportError, Exception) as exc:
+            from core.app_config_manager import AppConfigManager
+            cfg = AppConfigManager.instance()
+            existing = cfg.get("workspace_path")
+            if existing != ws_path:
+                cfg.update({"workspace_path": ws_path})
+                logger.info("Persisted workspace_path to config: %s", ws_path)
+        except Exception as exc:
             logger.debug("Could not persist workspace_path to config: %s", exc)
 
 

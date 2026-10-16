@@ -2436,15 +2436,14 @@ class ContextHealthHook:
         # Secondary: also check swarmai repo path from config
         if transcripts_dir is None:
             try:
-                from core.app_config_manager import app_config_manager
-                if app_config_manager is not None:
-                    swarmai_dir = app_config_manager.get("swarmai_dir")
-                    if swarmai_dir:
-                        candidate = base / _path_to_slug(swarmai_dir)
-                        if candidate.is_dir():
-                            transcripts_dir = candidate
-            except (ImportError, Exception):
-                pass
+                from core.app_config_manager import AppConfigManager
+                swarmai_dir = AppConfigManager.instance().get("swarmai_dir")
+                if swarmai_dir:
+                    candidate = base / _path_to_slug(swarmai_dir)
+                    if candidate.is_dir():
+                        transcripts_dir = candidate
+            except Exception as exc:
+                logger.debug("swarmai_dir lookup skipped: %s", exc)
 
         if transcripts_dir is None:
             logger.debug(

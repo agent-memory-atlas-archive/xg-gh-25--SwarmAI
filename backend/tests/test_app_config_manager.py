@@ -393,3 +393,54 @@ class TestSecretStore:
         mgr2 = AppConfigManager(config_path=tmp_config)
         mgr2.load()
         assert mgr2.get("aws_bearer_token_bedrock") == "bedrock-durable"
+
+
+# ---------------------------------------------------------------------------
+# Accessor contract: the singleton is AppConfigManager.instance()
+# ---------------------------------------------------------------------------
+
+
+class TestSingletonAccessorContract:
+    """There is no module-level ``app_config_manager`` object.
+
+    Seven call sites once did ``from core.app_config_manager import
+    app_config_manager`` inside ``try/except Exception``. The symbol never existed,
+    so every one silently fell back (config thresholds never applied, workspace_path
+    never persisted, SkillMetrics priority always empty). This guard keeps the
+    phantom import from coming back.
+    """
+
+    def test_module_has_no_app_config_manager_attribute(self):
+        import core.app_config_manager as mod
+
+        assert not hasattr(mod, "app_config_manager")
+
+    def test_no_source_imports_the_phantom_symbol(self):
+        import re
+
+        backend = Path(__file__).resolve().parent.parent
+        pattern = re.compile(r"import\s+app_config_manager\b")
+        offenders = [
+            str(p.relative_to(backend))
+            for p in backend.rglob("*.py")
+            if "tests" not in p.parts
+            and ".venv" not in p.parts
+            and "node_modules" not in p.parts
+            and pattern.search(p.read_text(encoding="utf-8", errors="ignore"))
+        ]
+        assert offenders == [], f"use AppConfigManager.instance(): {offenders}"
+
+    def test_persist_workspace_path_writes_through_singleton(
+        self, tmp_config: Path, monkeypatch
+    ):
+        from core.initialization_manager import InitializationManager
+
+        mgr = AppConfigManager(config_path=tmp_config)
+        mgr.load()
+        monkeypatch.setattr(AppConfigManager, "_instance", mgr)
+
+        InitializationManager._persist_workspace_path("/tmp/ws-under-test")
+
+        assert mgr.get("workspace_path") == "/tmp/ws-under-test"
+        on_disk = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert on_disk["workspace_path"] == "/tmp/ws-under-test"

@@ -1,6 +1,6 @@
 ---
 inclusion: fileMatch
-fileMatchPattern: ["backend/skills/s_self-evolution/*", "backend/context/EVOLUTION.md", "backend/context/EVOLUTION_CHANGELOG.jsonl", "backend/core/evolution_optimizer.py", "backend/core/evolution/*.py", "backend/hooks/evolution_maintenance_hook.py", "backend/hooks/evolution_trigger_hook.py", "backend/jobs/run_evolution.py", "backend/jobs/system_jobs.py"]
+fileMatchPattern: ["backend/skills/s_self-evolution/*", "backend/context/EVOLUTION.md", "backend/context/EVOLUTION_CHANGELOG.jsonl", "backend/core/evolution_optimizer.py", "backend/core/evolution/*.py", "backend/hooks/evolution_maintenance_hook.py", "backend/jobs/run_evolution.py", "backend/jobs/system_jobs.py"]
 ---
 
 # Self-Evolution Guardrails
@@ -65,22 +65,22 @@ over-archives.
 `config.json["evolution"]`, read via `AppConfigManager.get("evolution")`.
 
 - NEVER change `auto_approve_skills/scripts/installs` defaults to `true`.
-- `max_llm_skills_per_cycle` is meant to be read by the cycle, but its read uses the same
-  non-existent `app_config_manager` import as several other sites, so it is always 5.
+- `max_llm_skills_per_cycle` (optional, default 5) is read via `AppConfigManager.instance()`.
+- SkillMetrics priority candidates (`get_evolution_candidates`) lower the eligibility bar
+  from 5 to 3 examples. This path only started working on 2026-10-17.
 - `max_triggers_per_session`, `max_retries`, `max_active_entries`,
   `same_type_cooldown_seconds` are NOT read by backend code. They are prompt-level limits
   only, and `deprecation_days` is not wired into the hook (it uses its constructor default
   of 30). Don't describe them as code-enforced.
 
-## Dead Code (don't build on it)
+## Removed Code (don't reintroduce)
 
 - The `<!-- EVOLUTION_EVENT -->` SSE marker chain was REMOVED on 2026-10-17 (no producer
   since 39756bd5). Don't reintroduce markers in agent text as a UI channel.
-- `ToolFailureTracker` (`hooks/evolution_trigger_hook.py`) is never instantiated. The live
-  repeated-failure hint is `create_error_pattern_detector` + `create_failure_tracker_reset`
-  in `core/runtime_hooks.py` (per-session `session_context["_failure_tracker"]`).
-
-Remove these in a dedicated change, or revive them deliberately — don't patch around them.
+- `ToolFailureTracker` (`hooks/evolution_trigger_hook.py`) was never instantiated and was
+  deleted on 2026-10-17. The live repeated-failure hint is `create_error_pattern_detector`
+  + `create_failure_tracker_reset` in `core/runtime_hooks.py` (per-session
+  `session_context["_failure_tracker"]`) — a generic hint, not an evolution trigger.
 
 ## Regression Checklist
 

@@ -430,7 +430,7 @@ The memory system forms a closed loop: conversations produce DailyActivity → D
 | Workspace auto-commit | `SessionLifecycleHookManager` → `WorkspaceAutoCommitHook` | No — code-enforced |
 | Distillation (primary) | `SessionLifecycleHookManager` → `DistillationTriggerHook` | No — code-enforced |
 | Evolution maintenance | `SessionLifecycleHookManager` → `EvolutionMaintenanceHook` | No — code-enforced |
-| Tool failure nudge | `ToolFailureTracker` in message loop | No — code-enforced |
+| Repeated-failure hint | `runtime_hooks.create_error_pattern_detector` (per session) | No — code-enforced |
 | Distillation (fallback) | `.needs_distillation` flag → system prompt injection | Yes — prompt-dependent |
 | MEMORY.md loading | `CONTEXT_FILES` P7 → `ContextDirectoryLoader` | No — code-enforced |
 | EVOLUTION.md loading | `CONTEXT_FILES` P8 → `ContextDirectoryLoader` | No — code-enforced |
@@ -694,8 +694,7 @@ backend/
 │   ├── daily_activity_hook.py       # DailyActivityExtractionHook
 │   ├── auto_commit_hook.py          # WorkspaceAutoCommitHook
 │   ├── distillation_hook.py         # DistillationTriggerHook
-│   ├── evolution_maintenance_hook.py# EvolutionMaintenanceHook
-│   └── evolution_trigger_hook.py    # ToolFailureTracker
+│   └── evolution_maintenance_hook.py# EvolutionMaintenanceHook
 ├── routers/
 │   └── memory.py                    # /api/memory-compliance, /api/memory/save-session
 ├── context/                         # Default templates

@@ -511,13 +511,12 @@ When a session resumes after a backend restart, `context_injector.build_resume_c
 
 ### 5.7.4 Tool Failure Evolution Trigger
 
-`ToolFailureTracker` (per-session, stored in `SessionUnit`) watches for repeated tool failures and injects evolution nudges:
-
-- Tracks failure signatures (tool_name + first 100 chars of error)
-- After `FAILURE_THRESHOLD` (2) consecutive failures with same signature → emits evolution nudge
-- Nudge cooldown: 120s per signature, max 3 nudges per session
-- On tool success → resets all failure signatures for that tool
-- Nudge is a system-level hint for the self-evolution skill, not user-visible
+`ToolFailureTracker` (`hooks/evolution_trigger_hook.py`) was never wired into production
+and was deleted on 2026-10-17. The live repeated-failure hint is
+`create_error_pattern_detector` + `create_failure_tracker_reset` in
+`core/runtime_hooks.py`: a per-session `session_context["_failure_tracker"]` that injects
+a "consider a different approach" hint after consecutive failures. It is not an
+evolution trigger.
 
 ### 5.8 Knowledge Directory
 

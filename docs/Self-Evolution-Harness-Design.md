@@ -208,7 +208,7 @@ Every session close triggers 9 hooks via the `BackgroundHookExecutor`. All hooks
 - **Executor:** `BackgroundHookExecutor` (async, serialized via `asyncio.Lock` for git-safe operations)
 - **Never blocks** the response path --- hooks fire after the session response is complete
 - **Exception isolation:** Each hook catches its own exceptions; one hook failure doesn't block others
-- **Evolution trigger** is the exception --- `ToolFailureTracker` runs synchronously mid-session to detect repeated tool failures and emit nudges
+- **Evolution trigger** was planned as the exception --- a mid-session `ToolFailureTracker` nudge --- but it was never wired into production and was deleted on 2026-10-17
 
 ### 3.3 What Each Hook Does
 
@@ -722,7 +722,7 @@ Each hook has a single responsibility and independent failure domain. Merging ho
 |------|------|-------|
 | DailyActivity | `hooks/daily_activity_hook.py` | 202 |
 | Distillation | `hooks/distillation_hook.py` | 1,568 |
-| EvolutionTrigger | `hooks/evolution_trigger_hook.py` | 168 |
+| EvolutionTrigger | ~~`hooks/evolution_trigger_hook.py`~~ (deleted 2026-10-17, never wired) | — |
 | EvolutionMaintenance | `hooks/evolution_maintenance_hook.py` | 398 |
 | SkillMetrics | `hooks/skill_metrics_hook.py` | 291 |
 | UserObserver | `hooks/user_observer_hook.py` | 135 |

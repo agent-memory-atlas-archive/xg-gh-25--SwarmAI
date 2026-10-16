@@ -931,15 +931,14 @@ class EvolutionOptimizer:
             evo_path = None
             # Preferred: resolve via app config (works regardless of skills_dir location)
             try:
-                from core.app_config_manager import app_config_manager
-                if app_config_manager is not None:
-                    ws_path = app_config_manager.get("workspace_path")
-                    if ws_path:
-                        candidate = Path(ws_path) / ".context" / "EVOLUTION.md"
-                        if candidate.is_file():
-                            evo_path = candidate
-            except (ImportError, Exception):
-                pass  # config not available — fall through to heuristics
+                from core.app_config_manager import AppConfigManager
+                ws_path = AppConfigManager.instance().get("workspace_path")
+                if ws_path:
+                    candidate = Path(ws_path) / ".context" / "EVOLUTION.md"
+                    if candidate.is_file():
+                        evo_path = candidate
+            except Exception as exc:
+                logger.debug("workspace_path not available, using heuristics: %s", exc)
 
             # Fallback: relative path heuristics from skills_dir
             if evo_path is None:
@@ -1164,19 +1163,24 @@ def _run_evolution_cycle_locked(
 
     # Consult SkillMetrics for priority candidates
     priority_skills: set[str] = set()
+    # (Was dead until 2026-10-17: an import of the non-existent
+    # `core.app_config_manager.app_config_manager` raised ImportError, and the store was
+    # handed a str although it needs a Path — so priority_skills was always empty.)
     try:
         from core.skill_metrics import SkillMetricsStore
-        from core.app_config_manager import app_config_manager
         from jobs.paths import DB_PATH as _db_path_evo
         db_path = _db_path_evo
         if db_path.exists():
-            store = SkillMetricsStore(str(db_path))
-            candidates = store.get_evolution_candidates()
+            store = SkillMetricsStore(db_path)
+            try:
+                candidates = store.get_evolution_candidates()
+            finally:
+                store.close()
             priority_skills = set(candidates)
             if priority_skills:
                 logger.info("SkillMetrics priority candidates: %s", priority_skills)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("SkillMetrics priority lookup skipped: %s", exc)
 
     # ── Phase 1: MINE (unchanged) ──
     all_examples = miner.mine_all()
@@ -1218,13 +1222,12 @@ def _run_evolution_cycle_locked(
     # ── LLM cost cap: limit how many skills get LLM optimization per cycle ──
     max_llm_skills = 5  # default
     try:
-        from core.app_config_manager import app_config_manager
-        if app_config_manager is not None:
-            evo = app_config_manager.get("evolution", {})
-            if isinstance(evo, dict):
-                max_llm_skills = int(evo.get("max_llm_skills_per_cycle", 5))
-    except (ImportError, Exception):
-        pass
+        from core.app_config_manager import AppConfigManager
+        evo = AppConfigManager.instance().get("evolution", {})
+        if isinstance(evo, dict):
+            max_llm_skills = int(evo.get("max_llm_skills_per_cycle", 5))
+    except Exception as exc:
+        logger.warning("Evolution config read failed, using max_llm_skills=5: %s", exc)
 
     # ── Read previous health for regression detection + trend ──
     previous_health: dict[str, dict] = {}
@@ -1790,14 +1793,12 @@ def _write_cycle_changelog(
         changelog_path = None
         # Preferred: resolve via app config
         try:
-            from core.app_config_manager import app_config_manager
-            if app_config_manager is not None:
-                ws_path = app_config_manager.get("workspace_path")
-                if ws_path:
-                    candidate = Path(ws_path) / ".context" / "EVOLUTION_CHANGELOG.jsonl"
-                    changelog_path = candidate
-        except (ImportError, Exception):
-            pass
+            from core.app_config_manager import AppConfigManager
+            ws_path = AppConfigManager.instance().get("workspace_path")
+            if ws_path:
+                changelog_path = Path(ws_path) / ".context" / "EVOLUTION_CHANGELOG.jsonl"
+        except Exception as exc:
+            logger.debug("workspace_path not available, using heuristics: %s", exc)
 
         if changelog_path is None:
             # Fallback: relative to evals_dir

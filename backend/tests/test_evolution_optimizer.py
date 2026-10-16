@@ -276,6 +276,51 @@ class TestRunEvolutionCycle:
         # Has examples but < 5 so not eligible
         assert summary["eligible"] == 0
 
+    def test_skillmetrics_priority_lowers_eligibility_to_three(self, tmp_path, monkeypatch):
+        """A SkillMetrics priority candidate with 3 examples IS eligible.
+
+        This path was dead until 2026-10-17 (phantom app_config_manager import +
+        str passed where SkillMetricsStore needs a Path), so priority never applied.
+        """
+        import json
+        import jobs.paths as paths
+        from core.evolution_optimizer import run_evolution_cycle
+        from core.skill_metrics import SkillMetricsStore
+
+        db_path = tmp_path / "data.db"
+        SkillMetricsStore(db_path).close()  # create a real DB file
+        monkeypatch.setattr(paths, "DB_PATH", db_path)
+        monkeypatch.setattr(
+            SkillMetricsStore, "get_evolution_candidates", lambda self: ["weather"]
+        )
+
+        skills_dir = tmp_path / "skills"
+        skill_dir = skills_dir / "s_weather"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: weather\ndescription: >\n  Get weather\n  TRIGGER: weather, forecast\n---\nCheck the weather.\n"
+        )
+        transcripts_dir = tmp_path / "transcripts"
+        transcripts_dir.mkdir()
+        records = []
+        # 6 user/assistant pairs mine to 3 examples (the keyword pass advances past
+        # the user turn after each response): below the normal 5-example bar, at the
+        # priority bar of 3.
+        for i in range(6):
+            records.append(json.dumps({"type": "user", "message": {"content": f"weather forecast {i}"}}))
+            records.append(json.dumps({"type": "assistant", "message": {"content": f"The weather is {i}C"}}))
+        (transcripts_dir / "session1.jsonl").write_text("\n".join(records))
+        evals_dir = tmp_path / "evals"
+        evals_dir.mkdir(parents=True, exist_ok=True)
+
+        result = run_evolution_cycle(skills_dir, transcripts_dir, evals_dir)
+        assert result.to_dict()["skills_checked"] == 1
+        assert result.to_dict()["eligible"] == 1
+
+        # Same data without the priority signal stays below the 5-example bar.
+        monkeypatch.setattr(SkillMetricsStore, "get_evolution_candidates", lambda self: [])
+        assert run_evolution_cycle(skills_dir, transcripts_dir, evals_dir).to_dict()["eligible"] == 0
+
     def test_cycle_returns_dict_keys(self, tmp_path):
         """Summary dict always has the expected keys."""
         from core.evolution_optimizer import run_evolution_cycle
