@@ -104,6 +104,91 @@ PREWARM_SESSION_PREFIX = "prewarm-"
 _recall_degraded_count: dict[str, int] = {}
 
 
+def _read_run_map(session_id: str) -> "tuple[str, float] | None":
+    """Pure sync read of the ``session_<sid>_run.map`` rendezvous → ``(run_id, ts)``
+    or ``None``. Does real filesystem I/O (stat + open + read + json parse), so the
+    async caller MUST dispatch it via ``asyncio.to_thread`` — it is NEVER called
+    inline on the event loop (Gate-2 concurrency H1: the write-side sibling
+    ``runtime_hooks._persist`` already offloads; the read side must match).
+
+    Returns ``None`` for: no session_id, missing/unreadable/corrupt .map, or a
+    .map whose ``run_id`` is empty/non-string (treat as absent — never hydrate a
+    falsy run_id, L1). ``ts`` is parsed leniently (``float()`` tolerates a numeric
+    string; non-numeric → 0.0). Never raises (fail-safe)."""
+    try:
+        if not session_id:
+            return None
+        from .runtime_hooks import _session_run_map_path
+        p = _session_run_map_path(session_id)
+        if not p.is_file():
+            return None
+        import json as _json
+        data = _json.loads(p.read_text(encoding="utf-8"))
+        map_run_id = data.get("run_id")
+        if not (isinstance(map_run_id, str) and map_run_id.strip()):
+            return None  # empty/missing run_id → treat as absent (L1)
+        raw_ts = data.get("ts")
+        try:
+            map_ts = float(raw_ts)  # tolerate numeric string "123.0" (Gate-2 LOW)
+        except (TypeError, ValueError):
+            map_ts = 0.0
+        return (map_run_id.strip(), map_ts)
+    except Exception:  # fail-safe: attribution read must never raise
+        return None
+
+
+async def _rehydrate_pipeline_run_id(ctx: dict, session_id: str) -> None:
+    """Keystone (R1.5a-fix): restore ``_active_pipeline_run_id`` into the session
+    hook-ctx on a RESUMED turn, so adversarial markers stay run-attributable.
+
+    THE BUG: ``_active_pipeline_run_id`` is set ONLY by the run-create PostToolUse
+    hook (``runtime_hooks``). A resumed session never re-runs run-create → the ctx
+    key stays unset → markers get ``run_id=None`` and the D7 gate (and the compaction
+    briefing) can't attribute them. The ``session_<sid>_run.map`` rendezvous written at
+    run-create was never read back into ctx (write-only dead state). This reads it back.
+
+    FRESHNESS, not presence (Gate-1 H1): ``_hook_session_context`` is unit-lifetime —
+    it is NEVER reset across turns — so a session that ran run_A then resumes mid-run_B
+    would keep stale run_A under a blanket "set only if absent" guard, re-attributing
+    run_B's markers to run_A (the IMPROVEMENT.md:119 wrong-run class). So we adopt the
+    .map's run_id when ctx has NO run_id OR the .map is strictly NEWER (ts-ordered),
+    mirroring the live hook's last-write-wins. The live hook also stamps
+    ``_active_pipeline_run_id_ts`` so the two writers order consistently.
+
+    CONCURRENCY (Gate-2 H1): the ``.map`` disk read is dispatched via
+    ``asyncio.to_thread`` (see ``_read_run_map``) so it never blocks the send hot
+    path; the ctx mutation stays on the loop (single-threaded, no ``await`` between
+    the two key writes → the marker reader can never observe a half-updated pair).
+
+    Called at ctx construction (every send); runs BEFORE this turn's own run-create
+    hook could fire, so it only ever competes with a PRIOR turn's stale value, never a
+    same-turn live write. Idempotent + fail-safe: a missing / corrupt / empty-run_id
+    .map is a no-op and NEVER raises.
+
+    KNOWN RESIDUAL (Gate-2 correctness HIGH, tracked as a follow-up — NOT fixed here):
+    the ``.map`` is never deleted at run completion, so a session that finished run_A
+    and then (post-eviction, empty ctx) runs an adversarial sub-agent before run_B's
+    run-create fires will re-hydrate the stale run_A. Blast radius is OVER-credit
+    (run_A's completed set gains an expert it didn't need) — it can only RELAX a
+    future D7 check, never false-block a commit, and D7 is not yet live. A clean fix
+    (run-completion .map invalidation, or a run-active guard) needs the project the
+    .map does not carry, so it is out of this keystone's scope."""
+    try:
+        result = await asyncio.to_thread(_read_run_map, session_id)
+        if result is None:
+            return
+        map_run_id, map_ts = result
+        ctx_run_id = ctx.get("_active_pipeline_run_id")
+        ctx_ts = ctx.get("_active_pipeline_run_id_ts")
+        ctx_ts = float(ctx_ts) if isinstance(ctx_ts, (int, float)) else float("-inf")
+        # Adopt the .map iff ctx has nothing, or the .map is strictly newer (H1).
+        if not ctx_run_id or map_ts > ctx_ts:
+            ctx["_active_pipeline_run_id"] = map_run_id
+            ctx["_active_pipeline_run_id_ts"] = map_ts
+    except Exception as e:  # fail-safe: attribution read must never break session start
+        logger.debug("pipeline_run_id re-hydration skipped: %s", e)
+
+
 def _clean_blocks_for_persist(blocks: list) -> list:
     """Return a NEW blocks list with raw tool-call leaks stripped from every text
     block — the single write-side clean (run_2bdec5c0, re-homed run_719886ee).
@@ -3421,6 +3506,13 @@ class SessionRouter:
             unit._hook_session_context = {"sdk_session_id": session_id}
         else:
             unit._hook_session_context["sdk_session_id"] = session_id
+        # Keystone (R1.5a-fix): a resumed session never re-runs run-create, so restore
+        # _active_pipeline_run_id from the session_<sid>_run.map rendezvous here (every
+        # send, BEFORE this turn's own run-create hook could fire). Freshness-ordered +
+        # fail-safe — see _rehydrate_pipeline_run_id. Without it, resumed-session
+        # adversarial markers get run_id=None and D7 can't attribute them. The .map
+        # disk read is off-loop (asyncio.to_thread); the ctx mutate stays on the loop.
+        await _rehydrate_pipeline_run_id(unit._hook_session_context, session_id)
 
         # PER-SESSION SYSTEM-PROMPT CACHE (run_1dc710db): a chat-tab session's
         # system prompt is essentially constant for its life; re-assembling the full

@@ -864,7 +864,12 @@ def create_pipeline_run_mapping_hook(session_context: Optional[dict] = None):
         session_id = ctx.get("sdk_session_id", "") or ""
         # Revive the in-process consumer immediately (marker writer + compaction
         # briefing read ctx['_active_pipeline_run_id']). This half needs no disk.
+        # Stamp the SAME ts into ctx and onto the disk .map so the two writers
+        # (this live hook + session_router's resume re-hydration) order consistently
+        # under last-write-wins (keystone R1.5a-fix / Gate-1 H1: freshness, not presence).
+        _now = time.time()
         ctx["_active_pipeline_run_id"] = run_id
+        ctx["_active_pipeline_run_id_ts"] = _now
 
         if not session_id:
             return {}  # no session to key the disk rendezvous on — ctx half still done
@@ -876,7 +881,7 @@ def create_pipeline_run_mapping_hook(session_context: Optional[dict] = None):
                 payload = json.dumps({
                     "session_id": session_id,
                     "run_id": run_id,
-                    "ts": time.time(),
+                    "ts": _now,
                 })
                 # Atomic: write a temp sibling then os.replace — a torn map read by
                 # the gate would be worse than a missing one.
@@ -1113,8 +1118,14 @@ def create_agent_tool_audit_hook(
                         "session_id": session_id,
                         "adversarial": True,
                         "agent_type": agent_type or "unknown",
+                        # R1.5b-ii: carry the owning run_id so the D7 commit-gate can
+                        # attribute this completed expert to the CORRECT run — a sibling
+                        # run in the SAME session must not satisfy a requirement it did
+                        # not review (Gate-1 cross-run finding). None/"unknown" when no
+                        # pipeline run owns this session (manual adversarial spawn).
+                        "run_id": run_id or None,
                         # R1.5b-i: carry WHICH expert ran (structured), not just THAT an
-                        # adversarial sub-agent ran — the D7 gate (R1.5b-ii) will match a
+                        # adversarial sub-agent ran — the D7 gate (R1.5b-ii) matches a
                         # run's declared required_experts against the expert_ids that
                         # actually completed. The id comes from the `EXPERT-ID:` anchor
                         # line WE injected into the spawn prompt (方案 Z, zero Claude
