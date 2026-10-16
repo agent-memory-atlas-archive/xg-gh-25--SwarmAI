@@ -134,6 +134,18 @@ class StreamingOrchestrator:
     # No __slots__ — allows unittest.mock.patch.object() on instances.
     # Memory cost is negligible (one instance per session).
 
+    # Leak dead-end continuation (see the ResultMessage branch). Consecutive
+    # in-process retries allowed without a real tool_use: one corrective
+    # message recovered ~90% of leaks in past transcripts, two ≈99%.
+    _MAX_LEAK_CONTINUATIONS = 2
+    # Descriptive only — it MUST NOT contain tool-call markup (that markup in
+    # context is what primes the leak). Modeled on the CLI's own message for
+    # the stop_reason=tool_use shape, which reliably gets a real tool_use.
+    _LEAK_CONTINUATION_PROMPT = (
+        "Your last tool call was written as plain text, so it was not "
+        "executed. Retry it now as a real tool call and continue the task."
+    )
+
     def __init__(self, parent: "SessionUnit") -> None:
         """Initialize with parent SessionUnit reference.
 
@@ -161,6 +173,28 @@ class StreamingOrchestrator:
         """
         async for event in self._stream_response(query_content):
             yield event
+
+    def _record_token_usage_bg(self, message: Any, usage: dict) -> None:
+        """Fire-and-forget token accounting for a response whose `result` is
+        not forwarded (leak continuation) — its tokens were still spent."""
+        if not usage:
+            return
+        try:
+            import database
+            asyncio.get_running_loop().create_task(
+                database.db.record_token_usage(
+                    session_id=self._parent.session_id,
+                    source="cli",
+                    input_tokens=usage.get("input_tokens") or 0,
+                    output_tokens=usage.get("output_tokens") or 0,
+                    cache_read_tokens=usage.get("cache_read_input_tokens") or 0,
+                    cache_create_tokens=usage.get("cache_creation_input_tokens") or 0,
+                    cost_usd=getattr(message, "total_cost_usd", None),
+                    model=self._parent._model_name,
+                )
+            )
+        except Exception:
+            pass  # fire-and-forget — never break streaming
 
     @property
     def stall_seconds(self) -> Optional[float]:
@@ -581,6 +615,21 @@ class StreamingOrchestrator:
         is_first_message = True
         saw_assistant_message = False  # Track if LLM actually responded
 
+        # ── Tool-call leak: live hiding + dead-end continuation ────
+        # Per content-block index: text streamed so far, and whether a leak
+        # onset was seen (later deltas for that block are not forwarded — the
+        # authoritative `assistant` event replaces the provisional text).
+        _delta_text_buf: dict[int, str] = {}
+        _delta_leak_hidden: set[int] = set()
+        # True while the most recent text/tool output of this response is a
+        # leaked tool call (cleared by any real tool_use or later real prose).
+        # If the turn ENDS in that state the model's action never ran — the
+        # CLI only self-retries when stop_reason=tool_use, not end_turn.
+        _leak_tail = False
+        # Consecutive continuations that produced no real tool_use. Bounds the
+        # retry so a model that keeps leaking cannot loop.
+        _leak_continuations = 0
+
         # ── Permission queue watcher ──────────────────────────────
         # The dangerous_command_gate hook blocks inside PreToolUse
         # awaiting a user decision.  While it blocks, the SDK cannot
@@ -918,7 +967,24 @@ class StreamingOrchestrator:
                     if delta.get("type") == "text_delta" and delta.get("text"):
                         self._parent._content_emitted = True
                         self._parent._last_progress_time = time.time()  # real content
-                        yield {"type": "text_delta", "text": delta["text"], "index": event_data.get("index", 0)}
+                        _idx = event_data.get("index", 0)
+                        _dtext = delta["text"]
+                        if _idx in _delta_leak_hidden:
+                            continue  # rest of a leaked tool call — never shown
+                        _prev = _delta_text_buf.get(_idx, "")
+                        _buf = _prev + _dtext
+                        _delta_text_buf[_idx] = _buf
+                        # Only run the onset check when "<invoke" can have just
+                        # completed (cheap gate on the hot per-token path).
+                        if "<invoke" in _buf[-(len(_dtext) + 7):]:
+                            from .session_utils import find_stream_leak_onset
+                            _onset = find_stream_leak_onset(_buf)
+                            if _onset != -1:
+                                _delta_leak_hidden.add(_idx)
+                                _dtext = _dtext[: max(0, _onset - len(_prev))]
+                                if not _dtext:
+                                    continue
+                        yield {"type": "text_delta", "text": _dtext, "index": _idx}
                     elif delta.get("type") == "thinking_delta" and delta.get("thinking"):
                         self._parent._last_progress_time = time.time()  # real thinking
                         yield {"type": "thinking_delta", "thinking": delta["thinking"], "index": event_data.get("index", 0)}
@@ -927,6 +993,9 @@ class StreamingOrchestrator:
                     if block.get("type") == "thinking":
                         yield {"type": "thinking_start", "index": event_data.get("index", 0)}
                     elif block.get("type") == "text":
+                        # New text block at this index — fresh leak-hiding state.
+                        _delta_text_buf.pop(event_data.get("index", 0), None)
+                        _delta_leak_hidden.discard(event_data.get("index", 0))
                         yield {"type": "text_start", "index": event_data.get("index", 0)}
                 elif event_type == "content_block_stop":
                     yield {"type": "content_block_stop", "index": event_data.get("index", 0)}
@@ -1059,6 +1128,12 @@ class StreamingOrchestrator:
                         # detector misses. This strip is a best-effort live-stream
                         # clean on top of those durable layers.
                         #
+                        # Strip removes the leak WITH its one-word opener line
+                        # and no placeholder (nothing of a failed call is shown).
+                        # `_leak_tail` marks it: if the turn ends right here the
+                        # ResultMessage branch continues the conversation in the
+                        # same warm process instead of dead-ending.
+                        #
                         # One path for BOTH shapes (pure-leak AND leak alongside a
                         # real tool_use) — the former `_has_real_tool_use` fork was
                         # removed with the kill()+raise it gated: strip + keep is
@@ -1078,10 +1153,16 @@ class StreamingOrchestrator:
                                 self._parent.session_id,
                                 len(block.text), len(cleaned_text),
                             )
+                            # Always yield the (possibly empty) cleaned block: the
+                            # frontend only drops its provisional streamed text
+                            # when the assistant event carries a text block.
                             content_blocks.append(
                                 {"type": "text", "text": cleaned_text}
                             )
+                            _leak_tail = True
                             continue
+                        if block.text.strip():
+                            _leak_tail = False  # model wrote real prose after it
                         content_blocks.append({"type": "text", "text": block.text})
                     elif isinstance(block, ThinkingBlock):
                         # Skip content-free thinking blocks. Bedrock CAN emit
@@ -1114,6 +1195,10 @@ class StreamingOrchestrator:
                             # answered.
                             self._parent._content_emitted = True
                     elif isinstance(block, ToolUseBlock):
+                        # A real tool call = the model is acting again; any
+                        # earlier leak in this response was recovered.
+                        _leak_tail = False
+                        _leak_continuations = 0
                         # ── Track EVERY open tool_use for hang detection (run_fb6e94a9) ──
                         # Records emission time; cleared when the matching
                         # ToolResultBlock arrives. The PID watchdog reads this
@@ -1804,6 +1889,46 @@ class StreamingOrchestrator:
                         f"duration={(streaming_dur or 0):.1f}s) — likely "
                         f"transient 429/503/timeout "
                         f"(session_id={self._parent.session_id})"
+                    )
+
+                # ── Leak dead-end → continue on the SAME warm subprocess ──
+                # The turn ended (stop_reason=end_turn) right after the model
+                # wrote its tool call as text, so the action never ran and the
+                # turn would stop with nothing done. The CLI already self-heals
+                # the stop_reason=tool_use shape in-process ("Your tool call was
+                # malformed…" → real tool_use); it misses this one. Do the same
+                # here: no kill, no respawn, no --resume, and no `result` to the
+                # frontend — just send a short corrective message into the live
+                # conversation and keep reading the same stream, so the user
+                # sees the action run. Bounded by _MAX_LEAK_CONTINUATIONS
+                # consecutive tries without a real tool_use (loop guard only —
+                # it never cuts off real work). A user Stop is respected.
+                if (
+                    _leak_tail
+                    and _leak_continuations < self._MAX_LEAK_CONTINUATIONS
+                    and not self._parent._interrupted
+                    and not getattr(self._parent, "_user_stopped_current_turn", False)
+                    and self._parent._client is not None
+                ):
+                    _leak_continuations += 1
+                    _leak_tail = False
+                    logger.warning(
+                        "session_unit.tool_call_leak_continue session_id=%s "
+                        "attempt=%d/%d stop_reason=%s — turn ended on a "
+                        "text-channel tool call; continuing in-process",
+                        self._parent.session_id, _leak_continuations,
+                        self._MAX_LEAK_CONTINUATIONS, stop_reason,
+                    )
+                    self._record_token_usage_bg(message, usage)
+                    await self._parent._client.query(self._LEAK_CONTINUATION_PROMPT)
+                    response_iter = self._parent._client.receive_response().__aiter__()
+                    is_first_message = True
+                    continue
+                if _leak_tail:
+                    logger.warning(
+                        "session_unit.tool_call_leak_unrecovered session_id=%s "
+                        "continuations=%d — ending turn",
+                        self._parent.session_id, _leak_continuations,
                     )
 
                 # run_cce6f4b9: the TURN-END git sweep (sweep_turn_delta) was DELETED —

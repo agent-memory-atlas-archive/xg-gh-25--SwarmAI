@@ -20,6 +20,11 @@ Key properties / invariants
   pure-leak and leak-alongside-real-tool_use (the former fork was removed)
 - INV4: the strip fires INSIDE the TextBlock branch, before persist — the raw
   leak never reaches a yielded ``assistant`` event (but the cleaned block does)
+- INV5: nothing of a leak is shown — no XML, no placeholder, no opener word,
+  and live text_delta forwarding stops at the leak onset
+- INV6: a turn that ENDS on a leak continues in-process (same client, one
+  corrective query, no kill, one final ``result``), bounded to
+  ``_MAX_LEAK_CONTINUATIONS`` consecutive tries and skipped after a user Stop
 """
 
 from __future__ import annotations
@@ -405,6 +410,16 @@ def _make_assistant_message(text, model="test-model"):
     return AssistantMessage(content=[TextBlock(text=text)], model=model)
 
 
+def _make_tool_use_message(tool_id="toolu_retry", model="test-model"):
+    """An AssistantMessage carrying a REAL tool_use (the recovered action)."""
+    from claude_agent_sdk import AssistantMessage, ToolUseBlock
+
+    return AssistantMessage(
+        content=[ToolUseBlock(id=tool_id, name="Bash", input={"command": "ls"})],
+        model=model,
+    )
+
+
 def _make_result_message():
     """A clean end-of-turn ResultMessage so the normal (non-zombie) result path
     runs after a clean text block."""
@@ -423,16 +438,31 @@ def _make_result_message():
     )
 
 
-async def _drive(orchestrator, messages):
+async def _drive(orchestrator, messages, followups=()):
     """Run _read_formatted_response against a stream of messages and collect
-    yielded events. Returns (events, raised_exc)."""
+    yielded events. Returns (events, raised_exc).
 
-    async def _stream():
-        for m in messages:
-            yield m
+    ``followups`` are the responses to successive in-process ``client.query()``
+    calls (the leak continuation); the prompts sent are recorded on
+    ``orchestrator._parent._client.queries``."""
+    rounds = [list(messages), *[list(r) for r in followups]]
 
     class _Client:
+        def __init__(self):
+            self.queries = []
+            self._round = 0
+
+        async def query(self, prompt):
+            self.queries.append(prompt)
+            self._round += 1
+
         def receive_response(self):
+            msgs = rounds[self._round] if self._round < len(rounds) else []
+
+            async def _stream():
+                for m in msgs:
+                    yield m
+
             return _stream()
 
     orchestrator._parent._client = _Client()
@@ -540,26 +570,32 @@ def test_orchestrator_strips_pure_leak_and_keeps_turn():
     msg = _make_assistant_message(leak)
 
     # A trailing ResultMessage so the turn ends via the normal result path —
-    # the turn is no longer aborted mid-stream, it completes naturally.
-    events, raised = asyncio.run(_drive(orch, [msg, _make_result_message()]))
+    # the turn is no longer aborted mid-stream, it completes naturally. The
+    # follow-up round is the model's reply to the in-process continuation.
+    events, raised = asyncio.run(_drive(
+        orch, [msg, _make_result_message()],
+        followups=[[_make_tool_use_message(), _make_result_message()]],
+    ))
 
     # Termination authority stays with the model: NO kill, NO raise.
     assert orch._parent._kill_calls["n"] == 0, "pure-leak must NOT kill (去容灾化)"
     assert raised is None, "pure-leak must NOT raise — turn completes naturally"
-    # The leak text was STRIPPED but the turn's assistant content was KEPT
-    # (not dropped) — strip+keep, identical to the former MIXED branch.
+    # The leak text was STRIPPED but the turn's prose was KEPT.
     assistant_evs = [ev for ev in events if ev.get("type") == "assistant"]
     assert assistant_evs, "the turn's assistant content must still be yielded (kept)"
-    for ev in assistant_evs:
-        for block in ev.get("content", []):
-            # raw leak XML is stripped from the kept content
-            assert "<invoke name=" not in block.get("text", "")
-    # and the strip placeholder proves the text was cleaned, not dropped wholesale
-    assert any(
-        "[tool-call omitted]" in block.get("text", "")
+    texts = [
+        block.get("text", "")
         for ev in assistant_evs
         for block in ev.get("content", [])
-    ), "stripped leak must leave the placeholder (content kept + cleaned, not dropped)"
+        if block.get("type") == "text"
+    ]
+    joined = "\n".join(texts)
+    assert "analysis text" in joined
+    # No residue of the failed call reaches the user: no XML, no placeholder,
+    # no dangling opener word.
+    assert "<invoke name=" not in joined
+    assert "[tool-call omitted]" not in joined
+    assert "call" not in joined.replace("analysis text", "")
 
 
 def test_orchestrator_passes_clean_text_block():
@@ -649,6 +685,178 @@ def test_orchestrator_strips_leak_but_keeps_prose_in_mixed_message():
     joined = "\n".join(asst_texts)
     assert "Rendering now." in joined
     assert "<invoke name=" not in joined
+
+
+# ── 3b. leak dead-end → in-process continuation ────────────────────────────
+# A turn that ENDS on a leaked tool call (stop_reason=end_turn, the shape the CLI
+# does not self-retry) must not dead-end: the orchestrator sends ONE corrective
+# message on the SAME client (no kill, no respawn) and keeps reading; the user
+# sees exactly one `result`, after the recovered action.
+
+_DEADEND_LEAK = (
+    "跑测试(GREEN 验证)。\n\ncount\n<invoke name=\"Bash\">\n"
+    "<parameter name=\"command\">ls</parameter>\n</invoke>"
+)
+
+
+def _results(events):
+    return [ev for ev in events if ev.get("type") == "result"]
+
+
+def test_leak_deadend_continues_in_process_once():
+    orch = _make_orchestrator()
+    orch._parent._streaming_start_time = 0.0
+    events, raised = asyncio.run(_drive(
+        orch,
+        [_make_assistant_message(_DEADEND_LEAK), _make_result_message()],
+        followups=[[_make_tool_use_message(), _make_result_message()]],
+    ))
+    client = orch._parent._client
+    assert raised is None
+    assert orch._parent._kill_calls["n"] == 0, "continuation must not kill"
+    assert client.queries == [orch._LEAK_CONTINUATION_PROMPT]
+    assert "<invoke" not in orch._LEAK_CONTINUATION_PROMPT  # no priming markup
+    # The dead-end round's `result` is swallowed; only the final one reaches the UI.
+    assert len(_results(events)) == 1
+    assert any(ev.get("type") == "tool_use" for ev in events) or any(
+        b.get("type") == "tool_use"
+        for ev in events if ev.get("type") == "assistant"
+        for b in ev.get("content", [])
+    ), "the recovered real tool_use must be streamed"
+
+
+def test_leak_continuation_is_bounded():
+    """A model that keeps leaking gets _MAX_LEAK_CONTINUATIONS retries, then
+    the turn ends normally (loop guard)."""
+    orch = _make_orchestrator()
+    orch._parent._streaming_start_time = 0.0
+    leak_round = [_make_assistant_message(_DEADEND_LEAK), _make_result_message()]
+    events, raised = asyncio.run(_drive(
+        orch, leak_round, followups=[leak_round] * 5,
+    ))
+    assert raised is None
+    assert len(orch._parent._client.queries) == orch._MAX_LEAK_CONTINUATIONS
+    assert len(_results(events)) == 1
+
+
+def test_leak_continuation_counter_resets_on_real_tool_use():
+    """The bound counts CONSECUTIVE unproductive tries: a real tool_use in
+    between resets it, so separate dead-ends in a long turn each recover."""
+    orch = _make_orchestrator()
+    orch._parent._streaming_start_time = 0.0
+    leak_round = [_make_assistant_message(_DEADEND_LEAK), _make_result_message()]
+    recover_then_leak = [
+        _make_tool_use_message("toolu_a"),
+        _make_assistant_message(_DEADEND_LEAK),
+        _make_result_message(),
+    ]
+    events, raised = asyncio.run(_drive(
+        orch, leak_round,
+        followups=[leak_round, recover_then_leak, leak_round,
+                   [_make_tool_use_message("toolu_b"), _make_result_message()]],
+    ))
+    assert raised is None
+    assert len(orch._parent._client.queries) == 4
+    assert len(_results(events)) == 1
+
+
+def test_leak_no_continuation_after_user_stop():
+    orch = _make_orchestrator()
+    orch._parent._streaming_start_time = 0.0
+    orch._parent._user_stopped_current_turn = True
+    events, raised = asyncio.run(_drive(
+        orch, [_make_assistant_message(_DEADEND_LEAK), _make_result_message()],
+    ))
+    assert raised is None
+    assert orch._parent._client.queries == []
+    assert len(_results(events)) == 1
+
+
+def test_leak_followed_by_real_tool_use_does_not_continue():
+    """CLI already recovered (leak, then a real tool_use): no extra query."""
+    orch = _make_orchestrator()
+    orch._parent._streaming_start_time = 0.0
+    events, raised = asyncio.run(_drive(orch, [
+        _make_assistant_message(_DEADEND_LEAK),
+        _make_tool_use_message(),
+        _make_assistant_message("Tests are green."),
+        _make_result_message(),
+    ]))
+    assert raised is None
+    assert orch._parent._client.queries == []
+    assert len(_results(events)) == 1
+
+
+def test_clean_turn_never_continues():
+    orch = _make_orchestrator()
+    orch._parent._streaming_start_time = 0.0
+    events, raised = asyncio.run(_drive(orch, [
+        _make_assistant_message("All done."), _make_result_message(),
+    ]))
+    assert raised is None
+    assert orch._parent._client.queries == []
+
+
+def _text_delta(text, index=0):
+    from claude_agent_sdk.types import StreamEvent
+
+    return StreamEvent(
+        uuid="u", session_id="sdk-test", parent_tool_use_id=None,
+        event={"type": "content_block_delta", "index": index,
+               "delta": {"type": "text_delta", "text": text}},
+    )
+
+
+def test_live_deltas_hide_leak_from_onset():
+    """Streamed tokens stop at the leak onset — the raw XML is never forwarded
+    to the UI while it streams (split mid-tag to exercise the buffer)."""
+    orch = _make_orchestrator()
+    orch._parent._streaming_start_time = 0.0
+    chunks = ["跑测试。\n\ncount\n<inv", 'oke name="Bash">\n<param',
+              'eter name="command">ls</parameter>']
+    msgs = [_text_delta(c) for c in chunks]
+    msgs += [_make_assistant_message("跑测试。\n\n" + "count\n" + chunks[0][-4:]
+                                     + "".join(chunks[1:])),
+             _make_result_message()]
+    events, raised = asyncio.run(_drive(
+        orch, msgs, followups=[[_make_tool_use_message(), _make_result_message()]],
+    ))
+    assert raised is None
+    streamed = "".join(ev["text"] for ev in events if ev.get("type") == "text_delta")
+    assert "<invoke" not in streamed and "<param" not in streamed
+    assert streamed.startswith("跑测试。")
+
+
+def test_live_deltas_keep_fenced_examples():
+    orch = _make_orchestrator()
+    orch._parent._streaming_start_time = 0.0
+    text = 'Example:\n```\n<invoke name="Bash">\n<parameter name="command">x</parameter>\n```\n'
+    events, raised = asyncio.run(_drive(orch, [
+        _text_delta(text[:20]), _text_delta(text[20:]),
+        _make_assistant_message(text), _make_result_message(),
+    ]))
+    streamed = "".join(ev["text"] for ev in events if ev.get("type") == "text_delta")
+    assert streamed == text
+    assert orch._parent._client.queries == []
+
+
+@pytest.mark.parametrize("buf,expected", [
+    ("hello\n\ncount\n<invoke name=\"Ba", 13),
+    ("ab\n<invoke name=\"", 3),
+    ("```\n<invoke name=\"X\"", -1),          # inside an open fence
+    ("```\nx\n```\n<invoke name=\"X\"", 10),  # after a closed fence
+    ("x `<invoke name=\"a\"` y", -1),          # inline code
+    ("no tags at all", -1),
+])
+def test_find_stream_leak_onset(buf, expected):
+    from core.session_utils import find_stream_leak_onset
+
+    assert find_stream_leak_onset(buf) == expected
+
+
+def test_strip_removes_opener_word_and_leaves_no_placeholder():
+    cleaned = strip_tool_call_leak(_DEADEND_LEAK)
+    assert cleaned == "跑测试(GREEN 验证)。\n\n"
 
 
 # ── 4. user-side persist strip (run_67250d95) ──────────────────────────────

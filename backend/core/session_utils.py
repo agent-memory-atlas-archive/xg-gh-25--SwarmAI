@@ -12,6 +12,8 @@ Public symbols:
 - ``fuzzy_title_matches_deliverable``    — Fuzzy text matching (shared by proactive + distillation).
 - ``read_owner_pid``                     — Read SWARMAI_OWNER_PID from a process's environment.
 - ``is_session_not_found_error``         — Detect stale --resume session ID failures.
+- ``detect_tool_call_leak`` / ``strip_tool_call_leak`` / ``find_stream_leak_onset``
+                                         — Tool-call-as-text leak detect / remove / live-stream onset.
 """
 from __future__ import annotations
 
@@ -485,12 +487,24 @@ _TOOL_CALL_LEAK_RE = re.compile(
 # catch the truncated residue, not only the complete live body. It greedily
 # consumes any complete ``<parameter>...</parameter>`` bodies + a trailing
 # ``</invoke>`` when they ARE present, so a complete leak is removed whole.
+#
+# OPENER LINE: in every observed leak the model writes a garbled one-word opener
+# line (``call`` / ``count`` / ``core`` / ``court``) right before ``<invoke``
+# (CLI transcripts 2026-10-16: 85/85 leaks). That word is part of the leak, not
+# prose, so the optional ``^word\n`` prefix is consumed with it — otherwise the
+# user sees a dangling ``count`` (MULTILINE only affects that ``^``).
 _TOOL_CALL_LEAK_STRIP_RE = re.compile(
+    r'(?:^[ \t]*[A-Za-z]{2,16}[ \t]*\r?\n[ \t]*)?'
     r'<invoke\s+name="[^"]*"\s*>'
     r'(?:\s*<parameter\s+name="[^"]*"\s*>.*?</parameter>)*'
     r'\s*(?:</invoke>)?',
-    re.DOTALL,
+    re.DOTALL | re.MULTILINE,
 )
+
+# STREAM onset: a raw ``<invoke name="`` at the START of a line, used on the
+# live text_delta buffer (before the body is complete) to stop forwarding the
+# leak to the UI while it streams. Line-anchored + applied to masked text only.
+_TOOL_CALL_LEAK_ONSET_RE = re.compile(r'^[ \t]*<invoke\s+name="', re.MULTILINE)
 
 # Sentinel used to MASK fenced / inline-code spans while operating on the raw
 # text, then restore them verbatim. \x00 cannot appear in normal assistant text,
@@ -610,18 +624,46 @@ def strip_tool_call_leak(text: str) -> str:
         text: assistant text that may contain a raw leak fragment.
 
     Returns:
-        The text with raw leak fragments replaced by a short placeholder; fenced /
+        The text with raw leak fragments (and their one-word opener line)
+        REMOVED — no placeholder: a leak is a failed tool call, not content, so
+        nothing of it is shown to the user or fed back on resume. Fenced /
         inline-code references preserved verbatim.
     """
     if not text or "<invoke" not in text:
         return text  # fast path — the overwhelming majority of blocks
     masked, spans = _mask_doc_contexts(text)
-    cleaned, n = _TOOL_CALL_LEAK_STRIP_RE.subn("[tool-call omitted]", masked)
+    cleaned, n = _TOOL_CALL_LEAK_STRIP_RE.subn("", masked)
     if n == 0:
         # Nothing matched outside code spans — restore and return unchanged
         # (preserves the original byte-for-byte, incl. the masked spans).
         return _restore_doc_contexts(masked, spans)
     return _restore_doc_contexts(cleaned, spans)
+
+
+def find_stream_leak_onset(buf: str) -> int:
+    """Return the offset in ``buf`` where a raw tool-call leak STARTS, else -1.
+
+    For the live text_delta path: ``buf`` is the text streamed so far for one
+    content block, so the leak body may still be incomplete (the full-body
+    ``detect_tool_call_leak`` cannot fire yet). The onset is a line-start
+    ``<invoke name="`` outside code spans; text inside an unclosed ``` fence
+    (still streaming) is treated as documentation, never as a leak.
+
+    A false positive only hides provisional streamed text: the authoritative
+    ``assistant`` event that follows replaces it on the frontend.
+    """
+    if not buf or "<invoke" not in buf:
+        return -1
+    # An odd ``` count = a fence is still open: everything after its opener is
+    # documentation-in-progress. Cut on the RAW text (the inline-code branch of
+    # the mask would otherwise eat the lone opener as an empty `` span).
+    if buf.count("```") % 2 == 1:
+        buf = buf[: buf.rfind("```")]
+    masked, spans = _mask_doc_contexts(buf)
+    m = _TOOL_CALL_LEAK_ONSET_RE.search(masked)
+    if m is None:
+        return -1
+    return len(_restore_doc_contexts(masked[: m.start()], spans))
 
 
 def _build_error_event(
