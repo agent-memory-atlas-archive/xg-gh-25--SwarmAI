@@ -2933,28 +2933,10 @@ class SessionRouter:
                     saw_error = (_evt.get("code") or "error") if isinstance(_evt, dict) else "error"
                 elif _t == "result":
                     delivered_ok = True
-            if delivered_ok and saw_error is None:
-                await session_pending.mark_sent_batch(session_id, seqs)
-                logger.info(
-                    "session_router.drained session_id=%s count=%d seqs=%s",
-                    session_id, len(seqs), seqs,
-                )
-                # Record the drained seqs on the unit so the streaming-state read
-                # API (L5) can surface "these pending rows were delivered" to the
-                # frontend mirror (2A). Best-effort; FE also learns via count→0.
-                try:
-                    unit._last_drained_seqs = list(seqs)
-                except Exception:
-                    pass
-            else:
-                # Not actually delivered (error event or no result) — roll back to
-                # pending so it re-coalesces, exactly like the raised-exception path.
-                await session_pending.rollback_claim_batch(session_id, seqs)
-                logger.warning(
-                    "session_router.drain_not_delivered session_id=%s seqs=%s "
-                    "error=%s delivered_ok=%s — rolled back to pending",
-                    session_id, seqs, saw_error, delivered_ok,
-                )
+            await self._finalize_pending_delivery(
+                session_id, seqs, delivered_ok=delivered_ok, saw_error=saw_error,
+                unit=unit,
+            )
         except Exception as exc:
             await session_pending.rollback_claim_batch(session_id, seqs)
             logger.warning(
@@ -2962,6 +2944,120 @@ class SessionRouter:
                 "rolled back to pending",
                 session_id, seqs, exc,
             )
+
+    async def _finalize_pending_delivery(
+        self,
+        session_id: str,
+        seqs: list[int],
+        *,
+        delivered_ok: bool,
+        saw_error: Optional[str],
+        unit: Optional[Any] = None,
+    ) -> None:
+        """Shared exactly-once close-out for a CLAIMED pending set (run_25d2b7b8).
+
+        ONE lifecycle, two triggers: both the serial IDLE-edge drain
+        (``drain_pending``) and the new cold-spawn coalesce path
+        (``run_conversation``) call this after observing the delivery outcome of
+        the coalesced turn, so the F4 mark/rollback decision lives in exactly one
+        place and cannot drift between the two triggers.
+
+        Operates ONLY on the claimed pending ``seqs`` — NEVER the arriving user
+        row (Gate-1 constraint #2: the cold-spawn path is a normal send that
+        persists the new message itself; mark_sent/rollback must not touch it).
+
+        - delivered (``result`` observed AND no ``error`` event) → ``mark_sent_batch``
+          flips the claimed set sent=1 (guarded by ``claimed_at IS NOT NULL`` so a
+          concurrently-reopened row is a no-op).
+        - otherwise (error event / no result) → ``rollback_claim_batch`` returns the
+          set to pending (sent=0, claimed_at cleared) so it re-coalesces later; no
+          message is lost.
+        """
+        from . import session_pending
+        if not seqs:
+            return
+        if delivered_ok and saw_error is None:
+            await session_pending.mark_sent_batch(session_id, seqs)
+            logger.info(
+                "session_router.pending_delivered session_id=%s count=%d seqs=%s",
+                session_id, len(seqs), seqs,
+            )
+            # Record the delivered seqs on the unit so the streaming-state read
+            # API (L5) can surface "these pending rows were delivered" to the
+            # frontend mirror. Best-effort; FE also learns via count→0.
+            if unit is not None:
+                try:
+                    unit._last_drained_seqs = list(seqs)
+                except Exception:
+                    pass
+        else:
+            await session_pending.rollback_claim_batch(session_id, seqs)
+            logger.warning(
+                "session_router.pending_not_delivered session_id=%s seqs=%s "
+                "error=%s delivered_ok=%s — rolled back to pending",
+                session_id, seqs, saw_error, delivered_ok,
+            )
+
+    async def _claim_cold_spawn_pending(
+        self, unit: Any, session_id: str,
+    ) -> list:
+        """Claim the pending set for a turn that is ABOUT to cold-spawn (run_25d2b7b8).
+
+        The IDLE-only serial drain worker (``enqueue_drain`` on the IDLE
+        transition) loses a TOCTOU race on the self-heal path: when a user resend
+        re-spawns a COLD session, ``send()`` passes through a TRANSIENT IDLE and
+        advances to STREAMING before the serial worker gets the loop, so
+        ``drain_pending``'s ``state != IDLE`` guard no-ops and the row strands.
+        This claims the set at the reliable point — the router, before
+        ``unit.send()`` — so the imminent send can coalesce it into its own turn.
+
+        No-op (returns ``[]``) unless the unit is genuinely about to cold-spawn
+        (``state == COLD``): on an IDLE/STREAMING/WAITING_INPUT unit the existing
+        IDLE-edge drain owns delivery, so claiming here would double-handle.
+
+        Exactly-once: ``claim_pending_batch`` is atomic (sent=0 AND
+        claimed_at IS NULL under the per-session lock); if the serial worker
+        already claimed, this gets ``[]`` and vice-versa — never a double-deliver.
+        """
+        from . import session_pending
+        if unit is None or getattr(unit, "state", None) != SessionState.COLD:
+            return []
+        return await session_pending.claim_pending_batch(session_id)
+
+    def _merge_pending_into_query(self, claimed: list, query_content: Any) -> Any:
+        """Merge a claimed pending set INTO the arriving turn's query_content
+        (run_25d2b7b8), pending FIFO FIRST, the arriving message LAST.
+
+        Latest-last mirrors ``combine_pending``'s product decision: a correction
+        reads as the most-salient (final) instruction. Text and multimodal are
+        handled the same way ``combine_pending`` does — a text-only set joins with
+        ``\\n\\n``; any multimodal row flattens the whole thing to a block list.
+
+        The arriving ``query_content`` is appended as the final element so the two
+        shapes compose: str + str → joined text; any list present → block list.
+        """
+        from . import session_pending
+        if not claimed:
+            return query_content
+        pending_text, pending_blocks = session_pending.combine_pending(claimed)
+        arriving_is_list = isinstance(query_content, list)
+        # Multimodal on either side → unify to a block list (pending first, last).
+        if pending_blocks is not None or arriving_is_list:
+            blocks: list[dict] = []
+            if pending_blocks is not None:
+                blocks.extend(pending_blocks)
+            elif pending_text:
+                blocks.append({"type": "text", "text": pending_text})
+            if arriving_is_list:
+                blocks.extend(query_content)
+            elif isinstance(query_content, str) and query_content:
+                blocks.append({"type": "text", "text": query_content})
+            return blocks
+        # Pure text path: pending first, arriving last.
+        arriving_text = query_content if isinstance(query_content, str) else ""
+        if pending_text and arriving_text:
+            return f"{pending_text}\n\n{arriving_text}"
+        return pending_text or arriving_text
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -3595,6 +3691,77 @@ class SessionRouter:
         # (recall=n/a) turns the old recall-only residual left opaque. Pure local,
         # no control-flow effect (observability-only, same contract as _ttft_t0).
         _ttft_presend_ms = (time.perf_counter() - _ttft_t0) * 1000.0
+
+        # ── Cold-spawn pending coalesce (run_25d2b7b8) ──────────────────────
+        # The server-side pending queue is drained ONLY on a SessionState.IDLE
+        # transition edge (enqueue_drain). A session that reaches COLD WITHOUT a
+        # clean IDLE edge — e.g. a TOOL_CALL_LEAK_UNRECOVERED terminal
+        # (streaming→dead→cold) — strands its pending rows: the self-heal path
+        # (this very resend re-spawning COLD→IDLE→STREAMING) is a TOCTOU race the
+        # serial drain worker loses (by the time it runs, send() has advanced the
+        # unit past IDLE → drain_pending's state!=IDLE guard no-ops). So claim the
+        # pending set HERE — at the router, before unit.send() spawns — and
+        # COALESCE it into THIS turn's query_content (pending FIFO first, the
+        # arriving message last). unit.state is still COLD at this point (the
+        # COLD→IDLE→STREAMING spawn happens INSIDE unit.send()), which is exactly
+        # the window _claim_cold_spawn_pending requires. Exactly-once vs the serial
+        # worker is held by claim_pending_batch atomicity; delivery is confirmed
+        # (mark_sent) / rolled back by _finalize_pending_delivery AFTER the stream.
+        # NOT a _drained_pending turn: this is a normal send that persists its OWN
+        # arriving row — the finalize touches ONLY the claimed pending seqs, never
+        # the arriving row (Gate-1 constraint #2). The ONLY exclusion is a
+        # `_drained_pending` turn: that is the serial IDLE-edge drain worker's own
+        # nested run_conversation, which has ALREADY claimed its set — re-claiming
+        # here would double-handle it. A channel/desktop cold-spawn resend is NOT
+        # excluded: a claimed pending row is the same user-content category whether
+        # the resend arrives from a tab or a channel, so coalescing is correct for
+        # both. Steady-state (nothing claimed) returns [] fast → zero added cost.
+        _coalesced_pending_seqs: list[int] = []
+        try:
+            if not _drained_pending:
+                _claimed_pending = await self._claim_cold_spawn_pending(unit, session_id)
+                if _claimed_pending:
+                    query_content = self._merge_pending_into_query(
+                        _claimed_pending, query_content,
+                    )
+                    # MULTIMODAL CONVERSION (Gate-2 MEDIUM, 2nd adversarial round):
+                    # the arriving message was block→path-hint converted at ~3509,
+                    # BEFORE this merge. If a claimed pending row carries multimodal
+                    # blocks, _merge_pending_into_query flattens the whole turn to a
+                    # block list — so the pending blocks would reach the SDK UNCON-
+                    # VERTED (an unsupported image/doc → SDK/API rejection) unless we
+                    # re-run the identical conversion over the merged result. Re-run
+                    # it here; it is idempotent on already-converted (path-hint/text)
+                    # blocks, so the arriving portion is untouched.
+                    if isinstance(query_content, list):
+                        if not _SDK_SUPPORTS_MULTIMODAL:
+                            query_content = await _convert_unsupported_blocks_to_path_hints(
+                                query_content, session_id,
+                            )
+                        else:
+                            query_content = await _convert_non_native_blocks_to_path_hints(
+                                query_content, session_id,
+                            )
+                    _coalesced_pending_seqs = [c.pending_seq for c in _claimed_pending]
+                    logger.info(
+                        "session_router.cold_spawn_coalesce session_id=%s "
+                        "count=%d seqs=%s — merged pending into cold-spawn turn",
+                        session_id, len(_coalesced_pending_seqs),
+                        _coalesced_pending_seqs,
+                    )
+        except Exception as _coalesce_exc:  # noqa: BLE001 — never block the turn
+            # A claim failure must not strand the turn; the pending rows stay
+            # sent=0 (unclaimed, since claim is atomic) and the serial worker
+            # remains their fallback owner. Log loud, proceed with the plain turn.
+            logger.warning(
+                "session_router.cold_spawn_coalesce_failed session_id=%s: %s — "
+                "proceeding without coalesce (pending stays queued)",
+                session_id, _coalesce_exc,
+            )
+            _coalesced_pending_seqs = []
+
+        _coalesce_delivered_ok = False
+        _coalesce_saw_error: Optional[str] = None
         try:
             async for event in unit.send(
                 query_content=query_content,
@@ -3602,6 +3769,39 @@ class SessionRouter:
                 app_session_id=session_id,
                 config=self._config,
             ):
+                # Observe the coalesced pending set's delivery outcome (F4): a
+                # terminal `result` with no `error` → mark_sent; else roll back.
+                # Only tracked when we actually claimed something this turn.
+                if _coalesced_pending_seqs:
+                    _ev_t = event.get("type") if isinstance(event, dict) else None
+                    if _ev_t == "error":
+                        _coalesce_saw_error = (
+                            (event.get("code") or "error")
+                            if isinstance(event, dict) else "error"
+                        )
+                    elif _ev_t == "result":
+                        _coalesce_delivered_ok = True
+                        # FINALIZE-ON-RESULT, not after the loop (Gate-2 HIGH,
+                        # 2nd adversarial round): a terminal `result` is observed
+                        # here, but the `result` frame is then handed to the
+                        # downstream `yield event` below. If the SSE consumer
+                        # disconnects AT that yield, GeneratorExit (BaseException,
+                        # not caught by `except Exception`) skips the post-loop
+                        # finalize at 3907 → the `finally` sees a non-empty set and
+                        # ROLLS BACK an ALREADY-DELIVERED set → the user re-sends and
+                        # the same content double-delivers. Marking sent the instant
+                        # `result` is seen (BEFORE yielding the frame) closes that
+                        # window: once delivery is confirmed the set is sent=1 and no
+                        # later disconnect can reopen it. Clear first so neither the
+                        # post-loop finalize nor the `finally` double-acts.
+                        _seqs_now = _coalesced_pending_seqs
+                        _coalesced_pending_seqs = []
+                        await self._finalize_pending_delivery(
+                            session_id, _seqs_now,
+                            delivered_ok=True,
+                            saw_error=_coalesce_saw_error,
+                            unit=unit,
+                        )
                 # Stash the turn client_id on the unit so continuation paths
                 # (answer/permission), which run on THIS same unit, reuse it to key
                 # their persisted rows with the SAME `{client_id}-asst` as the
@@ -3724,12 +3924,46 @@ class SessionRouter:
                 # sentinel, so terminating here delivers the error and drops only
                 # the sentinel. (Gate-2 correctness finding, run_c9fa2382.)
                 if event.get("_abort"):
+                    # Internal bail before/after a user-facing error frame. Finalize
+                    # the coalesced pending set so a claimed-but-undelivered set is
+                    # rolled back (not stranded in the claimed phase) before we stop.
+                    if _coalesced_pending_seqs:
+                        await self._finalize_pending_delivery(
+                            session_id, _coalesced_pending_seqs,
+                            delivered_ok=_coalesce_delivered_ok,
+                            saw_error=_coalesce_saw_error or "aborted",
+                            unit=unit,
+                        )
+                        _coalesced_pending_seqs = []
                     return
 
                 yield event
+            # Stream completed normally — finalize the coalesced pending set
+            # (mark_sent on an observed result + no error, else roll back). ONE
+            # lifecycle shared with the serial drain worker (_finalize_pending_delivery).
+            # Clear the tracker FIRST so a raise INSIDE finalize (e.g. a partial
+            # mark_sent that commits some rows then throws) does NOT fall through to
+            # the `finally` and double-act on the SAME seqs (Gate-2 HIGH #2: a
+            # delivered set rolled back → double-delivery on the next cold-spawn).
+            # finalize owns its own outcome; the finally is ONLY for sets that never
+            # reached a finalize call at all.
+            if _coalesced_pending_seqs:
+                _seqs_to_finalize = _coalesced_pending_seqs
+                _coalesced_pending_seqs = []
+                await self._finalize_pending_delivery(
+                    session_id, _seqs_to_finalize,
+                    delivered_ok=_coalesce_delivered_ok,
+                    saw_error=_coalesce_saw_error,
+                    unit=unit,
+                )
         except Exception as send_err:
             # SessionBusyError: session is actively streaming, reject new send.
             # Yield structured error so frontend can queue the message.
+            # NOTE: a claimed-but-unfinalized coalesced set is rolled back by the
+            # `finally` below (covers this Exception path AND the BaseException
+            # paths — GeneratorExit on SSE disconnect, CancelledError — that an
+            # `except Exception` cannot catch, Gate-2 HIGH #1). Do NOT roll back
+            # here: that would race the finally's single-owner rollback.
             from .exceptions import SessionBusyError
             if isinstance(send_err, SessionBusyError):
                 logger.info(
@@ -3786,6 +4020,36 @@ class SessionRouter:
                 yield busy_event
                 return
             raise  # Re-raise non-SessionBusyError exceptions
+        finally:
+            # SINGLE-OWNER safety net for a claimed-but-unfinalized coalesced set
+            # (Gate-2 HIGH #1). run_conversation is an async generator; if the SSE
+            # consumer disconnects mid-turn the generator is CLOSED → GeneratorExit
+            # (a BaseException, NOT caught by `except Exception`) raises at the
+            # suspended `yield event`. CancelledError is the same shape. Without
+            # this finally, the claimed set stays sent=0/claimed_at=SET forever —
+            # the serial drain (claim requires claimed_at IS NULL) can NEVER re-pick
+            # it → permanent silent message loss (STEERING #20) of exactly the
+            # messages this fix exists to deliver. Every path that FINALIZED cleared
+            # _coalesced_pending_seqs first, so a non-empty value here means NO
+            # finalize ran (abandoned generator / cancellation / pre-finalize raise)
+            # → roll back so the set re-coalesces on the next cold-spawn / IDLE edge.
+            if _coalesced_pending_seqs:
+                try:
+                    from . import session_pending
+                    await session_pending.rollback_claim_batch(
+                        session_id, _coalesced_pending_seqs,
+                    )
+                    logger.warning(
+                        "session_router.cold_spawn_coalesce_abandoned session_id=%s "
+                        "seqs=%s — turn ended without finalize (disconnect/cancel/"
+                        "error); rolled back to pending (no message lost)",
+                        session_id, _coalesced_pending_seqs,
+                    )
+                except Exception:
+                    logger.exception(
+                        "session_router.cold_spawn_rollback_failed session_id=%s "
+                        "seqs=%s", session_id, _coalesced_pending_seqs,
+                    )
 
     async def interrupt_session(self, session_id: str) -> dict:
         """Delegate to SessionUnit.interrupt()."""

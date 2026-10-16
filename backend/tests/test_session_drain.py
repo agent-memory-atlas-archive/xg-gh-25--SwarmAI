@@ -483,3 +483,343 @@ async def test_interrupt_stale_preserves_pending():
     assert unit._pending_tool_use_id == "tool-new-turn", \
         "stale interrupt must NOT wipe pending state owned by the new turn"
     assert unit._pending_question is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Cold-spawn coalesce (run_25d2b7b8) — the IDLE-only drain trigger strands a
+# pending message when a session reaches COLD without a clean IDLE edge (e.g.
+# after TOOL_CALL_LEAK_UNRECOVERED: streaming→dead→cold). These tests FORCE the
+# new cold-spawn coalesce path: when the next send cold-spawns a session that
+# has pending rows, those rows are merged INTO that send's own turn (not left
+# for a transient IDLE edge the serial drain worker loses the race to).
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _make_cold_unit(session_id: str):
+    """A MagicMock SessionUnit that looks alive but COLD (about to spawn)."""
+    unit = MagicMock()
+    unit.session_id = session_id
+    unit.agent_id = "agent-1"
+    unit.is_alive = True
+    unit.state = SessionState.COLD
+    unit.has_outstanding_tool_use = False
+    unit._last_drained_seqs = []
+    return unit
+
+
+@pytest.mark.asyncio
+async def test_cold_spawn_claims_pending_when_cold_and_pending_exist(wired):
+    """AC1: a COLD unit with pending rows → _claim_cold_spawn_pending claims the
+    whole set (FIFO) so the imminent send can coalesce them into its own turn."""
+    router, sp = wired
+    sid = "sess-cold-claim"
+    router._units[sid] = _make_cold_unit(sid)
+    await sp.persist_pending(sid, user_message="stranded-1", content=None, agent_id="a")
+    await sp.persist_pending(sid, user_message="stranded-2", content=None, agent_id="a")
+
+    claimed = await router._claim_cold_spawn_pending(router._units[sid], sid)
+    assert [c.user_message for c in claimed] == ["stranded-1", "stranded-2"]
+    # Claimed (claimed_at set) but NOT yet sent — delivery confirms sent later.
+    assert await sp.count_pending(sid) == 2  # still sent=0 until mark_sent
+
+
+@pytest.mark.asyncio
+async def test_cold_spawn_noop_when_not_cold(wired):
+    """AC4 guard: an IDLE/STREAMING unit is NOT a cold-spawn — the claim is a
+    no-op so the existing serial-worker IDLE-edge drain owns that path."""
+    router, sp = wired
+    sid = "sess-not-cold"
+    unit = _make_cold_unit(sid)
+    unit.state = SessionState.IDLE  # not a cold-spawn turn
+    router._units[sid] = unit
+    await sp.persist_pending(sid, user_message="idle-path", content=None, agent_id="a")
+
+    claimed = await router._claim_cold_spawn_pending(unit, sid)
+    assert claimed == []
+    assert await sp.count_pending(sid) == 1  # untouched, serial worker will drain
+
+
+@pytest.mark.asyncio
+async def test_cold_spawn_merge_puts_pending_first_arriving_last(wired):
+    """AC1: pending FIFO first, the arriving user message LAST (a correction
+    reads most-salient-last — the existing combine_pending semantics)."""
+    router, sp = wired
+    sid = "sess-merge"
+    router._units[sid] = _make_cold_unit(sid)
+    await sp.persist_pending(sid, user_message="older-pending", content=None, agent_id="a")
+    claimed = await router._claim_cold_spawn_pending(router._units[sid], sid)
+
+    merged = router._merge_pending_into_query(claimed, "arriving-now")
+    # text path: pending joined before the arriving message, latest-last.
+    assert merged == "older-pending\n\narriving-now"
+
+
+@pytest.mark.asyncio
+async def test_cold_spawn_finalize_marks_sent_on_success(wired):
+    """AC2: after the coalesced send delivers (result observed, no error), the
+    shared finalize helper flips ONLY the claimed seqs to sent=1."""
+    router, sp = wired
+    sid = "sess-finalize-ok"
+    router._units[sid] = _make_cold_unit(sid)
+    await sp.persist_pending(sid, user_message="deliver-me", content=None, agent_id="a")
+    claimed = await router._claim_cold_spawn_pending(router._units[sid], sid)
+    seqs = [c.pending_seq for c in claimed]
+
+    await router._finalize_pending_delivery(sid, seqs, delivered_ok=True, saw_error=None)
+    assert await sp.count_pending(sid) == 0  # flipped sent=1
+
+
+@pytest.mark.asyncio
+async def test_cold_spawn_finalize_rolls_back_on_error(wired):
+    """AC2: a failed/aborted coalesced turn (error event or no result) rolls the
+    claimed set back to pending (sent=0) so nothing is lost."""
+    router, sp = wired
+    sid = "sess-finalize-fail"
+    router._units[sid] = _make_cold_unit(sid)
+    await sp.persist_pending(sid, user_message="must-survive", content=None, agent_id="a")
+    claimed = await router._claim_cold_spawn_pending(router._units[sid], sid)
+    seqs = [c.pending_seq for c in claimed]
+
+    await router._finalize_pending_delivery(sid, seqs, delivered_ok=False, saw_error="SESSION_BUSY")
+    assert await sp.count_pending(sid) == 1  # still pending
+    reclaim = await sp.claim_pending_batch(sid)
+    assert len(reclaim) == 1, "rolled-back row must be re-claimable"
+
+
+@pytest.mark.asyncio
+async def test_cold_spawn_claim_atomic_no_double_delivery(wired):
+    """AC3: the cold-spawn claim and the serial drain worker cannot both deliver
+    the same seqs — claim_pending_batch is atomic, the second claimant gets []."""
+    router, sp = wired
+    sid = "sess-atomic"
+    router._units[sid] = _make_cold_unit(sid)
+    await sp.persist_pending(sid, user_message="only-once", content=None, agent_id="a")
+
+    first = await router._claim_cold_spawn_pending(router._units[sid], sid)
+    assert len(first) == 1
+    # A concurrent serial-worker claim now sees the rows already claimed → [].
+    second = await sp.claim_pending_batch(sid)
+    assert second == [], "claimed rows must not be re-claimable (no double-delivery)"
+
+
+@pytest.mark.asyncio
+async def test_cold_spawn_coalesce_integration_delivers_and_marks_sent(wired, monkeypatch):
+    """R28 forced-execution INTEGRATION: drive the REAL run_conversation cold-spawn
+    path end-to-end — a COLD unit with pending rows, a stubbed unit.send that yields
+    a terminal result. Assert (1) the pending text was COALESCED into the delivered
+    query_content (pending FIFO first, arriving msg last), (2) the pending rows flip
+    sent=1 via the finalize helper. This is the wiring test the per-helper unit tests
+    cannot give — it proves run_conversation actually calls claim→merge→send→finalize.
+
+    Mutation-proof: revert the coalesce block in run_conversation and this goes RED
+    (pending text absent from delivered query_content + rows stay sent=0).
+    """
+    from unittest.mock import AsyncMock, patch
+    router, sp = wired
+    sid = "sess-cold-integ"
+
+    # A real COLD unit (get_or_create then force COLD — the pre-send state).
+    unit = router.get_or_create_unit(sid, "default")
+    unit._transition(SessionState.COLD) if unit.state != SessionState.COLD else None
+
+    # Two rows stranded in the pending queue (sent=0) — the strand this fix targets.
+    await sp.persist_pending(sid, user_message="stranded-older", content=None, agent_id="a")
+    await sp.persist_pending(sid, user_message="stranded-newer", content=None, agent_id="a")
+    assert await sp.count_pending(sid) == 2
+
+    # Capture what unit.send actually receives as query_content, yield a result.
+    seen = {}
+    async def _capture_send(**kwargs):
+        seen["query_content"] = kwargs.get("query_content")
+        yield {"type": "result", "sessionId": sid}
+
+    router._prompt_builder = MagicMock()
+    router._prompt_builder.build_options = AsyncMock(
+        return_value=MagicMock(model="test", system_prompt="test")
+    )
+
+    with patch.object(unit, "send", side_effect=_capture_send), \
+         patch("core.agent_defaults.build_agent_config", new_callable=AsyncMock, return_value={"model": "test"}):
+        events = []
+        async for ev in router.run_conversation(
+            session_id=sid, agent_id="default", user_message="arriving-now",
+        ):
+            events.append(ev)
+
+    # (1) pending was coalesced INTO the delivered turn, FIFO + arriving last.
+    qc = seen.get("query_content")
+    assert isinstance(qc, str), f"expected text query_content, got {type(qc)}"
+    assert "stranded-older" in qc and "stranded-newer" in qc, \
+        "pending messages were NOT coalesced into the cold-spawn turn (strand bug)"
+    assert qc.index("stranded-older") < qc.index("arriving-now"), \
+        "pending must come BEFORE the arriving message (FIFO, correction-reads-last)"
+    assert qc.endswith("arriving-now"), "the arriving message must be LAST"
+
+    # (2) the coalesced pending rows were delivered → flipped sent=1 (not stranded).
+    assert await sp.count_pending(sid) == 0, \
+        "coalesced pending rows must be marked sent after a delivered turn"
+
+
+@pytest.mark.asyncio
+async def test_cold_spawn_rollback_on_abandoned_generator(wired):
+    """R28 recovery-path (Gate-2 HIGH #1): if the SSE consumer disconnects mid-turn,
+    run_conversation (an async generator) is CLOSED → GeneratorExit raises at the
+    suspended `yield event`. GeneratorExit is a BaseException (not caught by
+    `except Exception`), so WITHOUT the finally the claimed coalesced set would strand
+    forever (sent=0, claimed_at SET, never re-claimable by the serial drain). This
+    FORCES that path (aclose() the generator mid-stream) and asserts the pending set
+    is rolled back to pending (re-claimable), not stranded.
+
+    Mutation-proof: remove the finally block in run_conversation and this goes RED
+    (count_pending stays correct but the row is claimed_at-SET → the re-claim assert
+    at the end fails because claim_pending_batch skips claimed_at!=NULL rows).
+    """
+    from unittest.mock import AsyncMock, patch
+    router, sp = wired
+    sid = "sess-abandon"
+    unit = router.get_or_create_unit(sid, "default")
+    unit._transition(SessionState.COLD) if unit.state != SessionState.COLD else None
+
+    await sp.persist_pending(sid, user_message="dont-strand-me", content=None, agent_id="a")
+
+    # unit.send yields one event then WAITS — we abandon the generator at that yield.
+    async def _hang_send(**kwargs):
+        yield {"type": "assistant", "content": []}
+        yield {"type": "result", "sessionId": sid}  # never reached (we aclose first)
+
+    router._prompt_builder = MagicMock()
+    router._prompt_builder.build_options = AsyncMock(
+        return_value=MagicMock(model="test", system_prompt="test")
+    )
+
+    with patch.object(unit, "send", side_effect=_hang_send), \
+         patch("core.agent_defaults.build_agent_config", new_callable=AsyncMock, return_value={"model": "test"}):
+        agen = router.run_conversation(session_id=sid, agent_id="default", user_message="arriving")
+        # Cold resume yields pre-send events (queued / session_resuming) BEFORE the
+        # claim+send-loop. Consume until the first send-loop event ("assistant"): by
+        # then the claim has run and we're suspended INSIDE the send loop's `yield
+        # event` — the exact GeneratorExit window the finally must cover.
+        saw_assistant = False
+        for _ in range(10):
+            ev = await agen.__anext__()
+            if ev.get("type") == "assistant":
+                saw_assistant = True
+                break
+        assert saw_assistant, "never reached the send-loop yield (claim window)"
+        # Simulate the SSE consumer disconnecting: close the generator → GeneratorExit.
+        await agen.aclose()
+
+    # The claimed set must have been ROLLED BACK by the finally — not stranded.
+    # Proof it's re-claimable (claimed_at was reset to NULL):
+    reclaim = await sp.claim_pending_batch(sid)
+    assert len(reclaim) == 1, "abandoned-generator claimed set was STRANDED (not rolled back) — data loss!"
+    assert reclaim[0].user_message == "dont-strand-me"
+
+
+@pytest.mark.asyncio
+async def test_cold_spawn_result_then_disconnect_keeps_sent(wired):
+    """Gate-2 HIGH (2nd adversarial round): a terminal `result` is observed, then the
+    SSE consumer disconnects AT the trailing yield (before the post-loop finalize).
+    WITHOUT finalize-on-result, the `finally` would see a non-empty coalesced set and
+    ROLL BACK an already-delivered set → the user re-sends → double-delivery. With the
+    fix, `result` marks the set sent=1 immediately, so a later disconnect can NEVER
+    reopen it.
+
+    Mutation-proof: remove the finalize-on-result block (revert to post-loop-only
+    finalize) and this goes RED — count_pending becomes 1 (rolled back) and the
+    re-claim at the end returns the row, which this test asserts must NOT happen.
+    """
+    from unittest.mock import AsyncMock, patch
+    router, sp = wired
+    sid = "sess-result-disconnect"
+    unit = router.get_or_create_unit(sid, "default")
+    unit._transition(SessionState.COLD) if unit.state != SessionState.COLD else None
+
+    await sp.persist_pending(sid, user_message="deliver-me-once", content=None, agent_id="a")
+
+    # send yields a result (delivery confirmed) then a TRAILING frame — we disconnect
+    # at the trailing frame, i.e. AFTER result was observed but at a later yield.
+    async def _result_then_trailing(**kwargs):
+        yield {"type": "assistant", "content": []}
+        yield {"type": "result", "sessionId": sid}
+        yield {"type": "assistant", "content": [{"type": "text", "text": "trailing"}]}
+
+    router._prompt_builder = MagicMock()
+    router._prompt_builder.build_options = AsyncMock(
+        return_value=MagicMock(model="test", system_prompt="test")
+    )
+
+    with patch.object(unit, "send", side_effect=_result_then_trailing), \
+         patch("core.agent_defaults.build_agent_config", new_callable=AsyncMock, return_value={"model": "test"}):
+        agen = router.run_conversation(session_id=sid, agent_id="default", user_message="arriving")
+        # Consume PAST the result frame (so finalize-on-result has run), stop at the
+        # trailing frame, then disconnect there.
+        saw_result = False
+        for _ in range(10):
+            ev = await agen.__anext__()
+            if ev.get("type") == "result":
+                saw_result = True
+                # pull ONE more (the trailing frame) then abandon at that yield
+                await agen.__anext__()
+                break
+        assert saw_result, "never observed the result frame"
+        await agen.aclose()
+
+    # The delivered set must STAY sent=1 — NOT rolled back by the finally.
+    assert await sp.count_pending(sid) == 0, \
+        "delivered set was rolled back after result+disconnect → DOUBLE-DELIVERY risk"
+    reclaim = await sp.claim_pending_batch(sid)
+    assert len(reclaim) == 0, "delivered row became re-claimable → it would double-deliver"
+
+
+@pytest.mark.asyncio
+async def test_cold_spawn_multimodal_pending_gets_converted(wired):
+    """Gate-2 MEDIUM (2nd adversarial round): the arriving message is block→path-hint
+    converted BEFORE the coalesce merge. A claimed pending row carrying multimodal
+    blocks flattens the whole turn to a block list, so WITHOUT a re-run of conversion
+    the pending blocks reach the SDK UNCONVERTED (unsupported image/doc → rejection).
+    This asserts the conversion runs AGAIN over the merged block list and sees the
+    pending block.
+
+    Mutation-proof: remove the post-merge conversion re-run and this goes RED (the
+    conversion mock is never called with the pending block).
+    """
+    from unittest.mock import AsyncMock, patch
+    router, sp = wired
+    sid = "sess-mm-pending"
+    unit = router.get_or_create_unit(sid, "default")
+    unit._transition(SessionState.COLD) if unit.state != SessionState.COLD else None
+
+    # A pending row carrying a multimodal (image) block.
+    img_block = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "ZZ"}}
+    await sp.persist_pending(sid, user_message=None, content=[img_block], agent_id="a")
+
+    captured = {}
+    async def _fake_convert(blocks, session_id):
+        captured["blocks"] = blocks
+        # return a path-hint-ified copy (shape doesn't matter for the assert)
+        return [{"type": "text", "text": "[image path hint]"}]
+
+    sent_query = {}
+    async def _capture_send(**kwargs):
+        sent_query["query_content"] = kwargs.get("query_content")
+        yield {"type": "assistant", "content": []}
+        yield {"type": "result", "sessionId": sid}
+
+    router._prompt_builder = MagicMock()
+    router._prompt_builder.build_options = AsyncMock(
+        return_value=MagicMock(model="test", system_prompt="test")
+    )
+
+    with patch.object(unit, "send", side_effect=_capture_send), \
+         patch("core.session_router._convert_unsupported_blocks_to_path_hints",
+               new=AsyncMock(side_effect=_fake_convert)), \
+         patch("core.agent_defaults.build_agent_config", new_callable=AsyncMock, return_value={"model": "test"}):
+        agen = router.run_conversation(session_id=sid, agent_id="default", user_message="arriving-text")
+        async for _ in agen:
+            pass
+
+    # The conversion must have run over the merged block list containing the pending image.
+    assert "blocks" in captured, "post-merge conversion was NOT called on the multimodal set"
+    assert any(b.get("type") == "image" for b in captured["blocks"]), \
+        "pending image block never reached the conversion → it would hit the SDK raw"
