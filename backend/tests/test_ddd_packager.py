@@ -2227,3 +2227,72 @@ class TestGate2ProvenanceHardening:
         (b / "sub" / "b").write_bytes(b"")
         assert pk.compute_source_hash(a) != pk.compute_source_hash(b), (
             "distinct trees must not collide — file bytes can contain the delimiter")
+
+
+# ---------------------------------------------------------------------------
+# Run B (G5): scan_context — the backend/(skills|scripts)/ dev-command pattern
+# is a leak for a shipped PACKAGE (consumer has no backend/ tree, run_aaa50c56)
+# but a FALSE POSITIVE for a REPORT committed into the SwarmAI SOURCE repo (where
+# backend/skills/ IS the real tree). scan_context distinguishes the two; the 4
+# real host-path patterns fire in BOTH contexts (fail-safe).
+# ---------------------------------------------------------------------------
+class TestScanContext:
+    def test_dev_command_path_flagged_in_package_context(self):
+        # backend/skills/foo in a shipped package = dev-command leak → flagged.
+        findings = pk._scan_text("doc.md", "see backend/skills/s_foo/SKILL.md",
+                                 external=False, scan_context="package")
+        kinds = {(f.kind) for f in findings}
+        assert "host-path" in kinds, f"backend/skills/ must flag in package context: {findings}"
+
+    def test_dev_command_path_allowed_in_source_repo_context(self):
+        # The SAME path in a REPORT committed into the source repo = legit content → NOT flagged.
+        findings = pk._scan_text("REPORT.md", "see backend/skills/s_foo/SKILL.md",
+                                 external=True, scan_context="source-repo")
+        assert findings == [], f"backend/skills/ must NOT flag in source-repo context: {findings}"
+
+    def test_real_host_path_flagged_in_BOTH_contexts(self):
+        # The 4 real host-path patterns are destination-independent → flag everywhere.
+        line = "path /Users/gawan/.swarm-ai/SwarmWS and SwarmAI-Workspace/x"
+        for ctx in ("package", "source-repo"):
+            findings = pk._scan_text("f.md", line, external=True, scan_context=ctx)
+            kinds = [f.kind for f in findings]
+            assert kinds.count("host-path") >= 2, (
+                f"real host-path must flag in {ctx} context (dest-independent): {findings}")
+
+    def test_default_context_is_package_failsafe(self):
+        # A caller that forgets scan_context gets the STRICTEST behavior (over-flag,
+        # never miss a leak). backend/skills/ flags under the default.
+        findings = pk._scan_text("doc.md", "backend/scripts/foo.py", external=False)
+        assert any(f.kind == "host-path" for f in findings), (
+            f"default scan_context must be 'package' (fail-safe over-flag): {findings}")
+
+    def test_content_safety_scan_threads_context(self, tmp_path):
+        # content_safety_scan must pass scan_context through to _scan_text.
+        (tmp_path / "REPORT.md").write_text("refs backend/skills/s_foo/SKILL.md\n")
+        pkg = pk.content_safety_scan(tmp_path, external=True, scan_context="package")
+        src = pk.content_safety_scan(tmp_path, external=True, scan_context="source-repo")
+        assert any(f.kind == "host-path" for f in pkg), "package context must flag"
+        assert not any(f.kind == "host-path" for f in src), "source-repo context must not flag the dev-command path"
+
+    def test_package_leak_catch_preserved_in_package_ddd(self, tmp_path):
+        # run_aaa50c56 regression guard: a real DDD package carrying a backend/skills/
+        # path must STILL abort the publish (dev-command leak on a consumer machine).
+        # Plant the dev-command path in a shipped corpus doc (fixture's own param — no rglob).
+        import pytest
+        ddd = build_fixture_ddd(
+            tmp_path, name="LeakFixture", targets=["open-plugin"], visibility="external",
+            corpus_docs={"notes.md": "Run `backend/scripts/foo.py` to rebuild.\n"},
+        )
+        with pytest.raises(pk.PackagingError, match="content-safety"):
+            pk.package_ddd(ddd, tmp_path / "out", publish=True)
+
+    def test_unknown_scan_context_fails_closed(self):
+        # Gate-2 run_03c40277: the gate is fail-CLOSED — ONLY the known-safe value
+        # "source-repo" suppresses the dev-command scan. A typo'd/unknown value must
+        # run the STRICT scan (over-flag), never silently skip it (RP46/RP49 fail-open).
+        for bad_ctx in ("packages", "souce-repo", "repo", "", "SOURCE-REPO"):
+            findings = pk._scan_text("doc.md", "backend/skills/s_foo/SKILL.md",
+                                     external=False, scan_context=bad_ctx)
+            assert any(f.kind == "host-path" for f in findings), (
+                f"unknown scan_context {bad_ctx!r} must fail-CLOSED (strict scan), "
+                f"not silently skip the dev-command pattern: {findings}")

@@ -84,12 +84,22 @@ _HOST_PATH_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\.swarm-ai/SwarmWS"),            # ~/.swarm-ai/SwarmWS, /home/x/.swarm-ai/…, bare
     re.compile(r"/(?:Users|home)/[^/\s\"']+/\.swarm-ai"),
     re.compile(r"SwarmAI-Workspace"),             # any host: /Users/…, /home/…, or bare relative (Gate-2 H2)
-    # SwarmAI-repo dev-command leak (run_aaa50c56): a `backend/skills/…` / `backend/scripts/…`
-    # path in a shipped doc is a source-repo dev command that has no meaning on a consumer
-    # machine (there is no backend/ tree). Anchored to these two SwarmAI-internal subtrees so
-    # a consumer's own generic `backend/` (e.g. a web app dir) is NOT false-flagged.
-    re.compile(r"\bbackend/(?:skills|scripts)/"),
 )
+# SwarmAI-repo dev-command leak (run_aaa50c56): a `backend/skills/…` / `backend/scripts/…`
+# path in a shipped doc is a source-repo dev command that has no meaning on a consumer
+# machine (there is no backend/ tree). Anchored to these two SwarmAI-internal subtrees so
+# a consumer's own generic `backend/` (e.g. a web app dir) is NOT false-flagged.
+#
+# scan_context (run_03c40277, G5): UNLIKE the 4 host-path patterns above — which are
+# host-specific literals that leak on ANY destination — this pattern is a leak ONLY when
+# the destination LACKS a backend/ tree (a shipped PACKAGE). When the destination IS the
+# SwarmAI source repo (a REPORT-B committed by run-commit), `backend/skills/` is correct
+# repo-relative content, NOT a leak. So `_scan_text` fires this pattern UNLESS
+# scan_context == "source-repo" (fail-closed: default/typo/unknown all scan strictly;
+# only the one known-safe value suppresses). Kept a SEPARATE module-level constant (not inside
+# _HOST_PATH_PATTERNS) precisely so the context gate applies to it ALONE and can never
+# weaken a real host-path pattern. Finding kind stays "host-path" (no ScanFinding.kind churn).
+_DEV_COMMAND_PATH_PATTERN: re.Pattern[str] = re.compile(r"\bbackend/(?:skills|scripts)/")
 _PORTABLE_WORKSPACE_VAR = "${SWARM_WORKSPACE}"
 
 # Internal-org strings: forbidden in an EXTERNAL (public) package only.
@@ -241,7 +251,14 @@ def split_skills(ddd_dir: Path) -> tuple[list[str], list[str], list[str]]:
 # ---------------------------------------------------------------------------
 # Content-safety scan — over the EMITTED tree (Gate-1 H2). scan ≠ rewrite (M2).
 # ---------------------------------------------------------------------------
-def _scan_text(rel: str, text: str, *, external: bool) -> list[ScanFinding]:
+def _scan_text(rel: str, text: str, *, external: bool, scan_context: str = "package") -> list[ScanFinding]:
+    # scan_context ∈ {"package", "source-repo"} (default "package" = fail-safe: a caller
+    # that forgets the arg gets the STRICTEST scan — over-flag the dev-command path, never
+    # miss a leak). The dev-command gate is FAIL-CLOSED: only an explicit "source-repo"
+    # suppresses it; the default, a typo, or any unknown value all run the strict scan.
+    # Only the dev-command pattern (_DEV_COMMAND_PATH_PATTERN) is gated by it;
+    # the 4 real host-path patterns + secrets + internal-strings are destination-independent
+    # and fire regardless. See _DEV_COMMAND_PATH_PATTERN's definition for the rationale.
     findings: list[ScanFinding] = []
     # Prose files (.md/.rst/.txt) suppress the all-letter unquoted-secret false positive,
     # but NARROWLY (Gate-2 run_6e4bced6): the real FP is a SENTENCE — "a shared token =
@@ -286,6 +303,18 @@ def _scan_text(rel: str, text: str, *, external: bool) -> list[ScanFinding]:
             m = pat.search(line)
             if m:
                 findings.append(ScanFinding(rel, "host-path", m.group(0)[:60], i))
+        # dev-command path (backend/skills|scripts/) — a leak ONLY for a shipped PACKAGE
+        # (consumer has no backend/ tree); correct repo-relative content for a source-repo
+        # destination. Gated by scan_context so run-commit's REPORT-B is not false-flagged.
+        # FAIL-CLOSED (Gate-2 run_03c40277): suppress ONLY for the single known-safe value
+        # "source-repo"; EVERY other value (default "package", a typo, an unknown future
+        # context) runs the STRICT dev-command scan. An == "package" allowlist would
+        # silently fail-OPEN on a typo'd/unknown value (RP46/RP49) — the inverse of the
+        # fail-safe default this scan promises. Only an explicit "source-repo" suppresses.
+        if scan_context != "source-repo":
+            m = _DEV_COMMAND_PATH_PATTERN.search(line)
+            if m:
+                findings.append(ScanFinding(rel, "host-path", m.group(0)[:60], i))
         if external:
             for pat in _INTERNAL_STRING_PATTERNS:
                 m = pat.search(line)
@@ -294,12 +323,18 @@ def _scan_text(rel: str, text: str, *, external: bool) -> list[ScanFinding]:
     return findings
 
 
-def content_safety_scan(tree: Path, *, external: bool) -> list[ScanFinding]:
+def content_safety_scan(tree: Path, *, external: bool, scan_context: str = "package") -> list[ScanFinding]:
     """Walk the ENTIRE emitted tree, return findings. Pure — does not mutate (M2).
 
     ``external=True`` also flags internal-org strings (forbidden in a public package);
     secrets + host-paths are flagged on ANY target (a host-path breaks even a private
     install; a secret must never ship).
+
+    ``scan_context`` ∈ {"package", "source-repo"} (default "package", fail-safe) selects
+    whether the dev-command path pattern (backend/skills|scripts/) fires — a leak for a
+    shipped PACKAGE, legit content for a REPORT committed into the SwarmAI SOURCE repo.
+    See _DEV_COMMAND_PATH_PATTERN. The 4 real host-path patterns + secrets are
+    destination-independent and unaffected by this flag.
     """
     findings: list[ScanFinding] = []
     for path in sorted(tree.rglob("*")):
@@ -316,7 +351,7 @@ def content_safety_scan(tree: Path, *, external: bool) -> list[ScanFinding]:
             # Truly unreadable → fail LOUD: surface as a finding, never silent-skip.
             findings.append(ScanFinding(rel, "unreadable", "could not read file for scan", 0))
             continue
-        findings.extend(_scan_text(rel, text, external=external))
+        findings.extend(_scan_text(rel, text, external=external, scan_context=scan_context))
     return sorted(findings, key=lambda f: (f.file, f.line, f.kind))
 
 
@@ -644,6 +679,11 @@ def rewrite_host_paths(tree: Path) -> int:
     """Explicit, opt-in remediation (M2): rewrite host-path literals to the portable
     workspace var across the emitted tree. Returns the count of files changed.
     Separate from ``content_safety_scan`` on purpose — mutation is never implicit.
+
+    This remediation is a PACKAGE-emit path, so it rewrites the dev-command pattern too
+    (run_03c40277: _DEV_COMMAND_PATH_PATTERN was split out of _HOST_PATH_PATTERNS for the
+    scan_context gate; it stays in THIS rewrite set so remediation keeps its pre-split
+    semantics — a shipped package should carry neither real host-paths NOR dev-commands).
     """
     changed = 0
     for path in sorted(tree.rglob("*")):
@@ -654,7 +694,7 @@ def rewrite_host_paths(tree: Path) -> int:
         except OSError:
             continue
         new = text
-        for pat in _HOST_PATH_PATTERNS:
+        for pat in (*_HOST_PATH_PATTERNS, _DEV_COMMAND_PATH_PATTERN):
             new = pat.sub(_PORTABLE_WORKSPACE_VAR, new)
         if new != text:
             path.write_text(new, encoding="utf-8")
@@ -1903,9 +1943,12 @@ def package_ddd(
         else:  # pragma: no cover - permitted is filtered to known targets
             continue
 
-        # Content-safety scan over the EMITTED tree.
+        # Content-safety scan over the EMITTED tree. scan_context="package": the output
+        # is a SHIPPED package (consumer has no backend/ tree), so the dev-command path
+        # pattern IS a leak here and must fire (run_aaa50c56 preserved). Explicit, not the
+        # default, so the destination contract is on record (run_03c40277).
         external = pol.visibility == policy.VISIBILITY_EXTERNAL
-        findings = content_safety_scan(out_dir, external=external)
+        findings = content_safety_scan(out_dir, external=external, scan_context="package")
         # Zone policy (XG decision A): the deliverables/ zone holds human-facing artifacts
         # (decks, diagrams), NOT agent-consumed context. A host-path in a deliverable does
         # not "break the package" the way it breaks recall corpus — so it is DOWNGRADED to a
