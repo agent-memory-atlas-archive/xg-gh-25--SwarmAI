@@ -218,7 +218,7 @@ single assistant turn** so they execute in parallel. Each sub-agent reads the
 changeset + relevant DDD docs independently.
 
 ```
-Sub-agent prompts are in: backend/skills/s_autonomous-pipeline/backend/experts/code/
+Sub-agent prompts are in: backend/experts/code/
 
 [Already completed before fan-out — see Spec Compliance Gate above]
   Spec Compliance Agent (backend/experts/code/spec-compliance.md)
