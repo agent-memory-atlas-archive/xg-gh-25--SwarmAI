@@ -3517,6 +3517,88 @@ def _generate_review_deliverable(
     return created, warnings
 
 
+def _d7_completed_expert_ids(run_id: str) -> "set[str] | None":
+    """Collect the set of expert_ids that COMPLETED an adversarial review FOR THIS run.
+
+    R1.5b-ii — the D7 "declared ⊆ completed" check, landed in run-commit (NOT the
+    reverted PreToolUse gate — see test_run_commit_d7.py header for why).
+
+    Reads the daemon's adversarial markers (`state/pipeline_agent_audit/*_adv_*.marker`,
+    written by runtime_hooks SubagentStop), keeps only markers whose payload `run_id`
+    matches THIS run (sibling-run isolation — a review done for another run must not
+    satisfy this one), and takes each marker's structured `expert_id`. A marker with no
+    `expert_id` (pre-R1.5b-i format) contributes nothing. The CLI process has only the
+    run_id (no session_id), so filtering is purely run_id-keyed — no session→run map.
+
+    RETURN CONTRACT (Gate-2 correctness HIGH — the store-UNREADABLE vs store-EMPTY
+    distinction is load-bearing for fail-open):
+      • ``None``  → the marker STORE could not be read (missing/unreadable dir, or any
+        infra exception). The caller MUST treat this as "cannot determine coverage" and
+        FAIL-OPEN (allow the commit) — a broken audit store must never self-lock a commit.
+      • ``set()`` → the store WAS readable but no marker matched this run (genuinely zero
+        experts completed). The caller SHOULD refuse if experts were declared — this is
+        the real "you declared experts but none ran" case, NOT an infra failure.
+    An empty set and None were previously indistinguishable (both `set()`), so an
+    unreadable dir masqueraded as "no experts ran" and WRONGLY refused — the exact
+    fail-open violation this contract fixes.
+
+    Never raises: a single unreadable/parse-bad marker is skipped per-file; a store-level
+    failure returns None (fail-open), never propagates.
+    """
+    if not run_id:
+        return set()
+    try:
+        from config import get_app_data_dir  # local import: mirrors ws-resolve pattern
+        audit = get_app_data_dir() / "state" / "pipeline_agent_audit"
+        if not audit.is_dir():
+            return None  # store unreadable/absent → fail-open signal (NOT empty-coverage)
+        completed: set[str] = set()
+        for p in audit.glob("*_adv_*.marker"):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue  # one unreadable marker → skip it, never abort the whole scan
+            if data.get("run_id") != run_id:
+                continue  # sibling-run isolation
+            eid = data.get("expert_id")
+            if isinstance(eid, str) and eid.strip():  # old/empty expert_id → not counted
+                # lowercase: the marker-writer forces a lowercase registry id
+                # (runtime_hooks `^EXPERT-ID:\s*([a-z][a-z0-9-]*)`), so the required
+                # side MUST lowercase too or a declared "Correctness" never matches
+                # (false self-lock → trains the --force bypass D7 exists to kill).
+                completed.add(eid.strip().lower())
+        return completed  # readable store (possibly empty = genuine zero-coverage)
+    except Exception:
+        return None  # store-level infra error → fail-open signal, never self-lock
+
+
+def _d7_missing_required_experts(required_experts, run_id: str) -> "list[str]":
+    """Return the sorted list of declared-required experts that did NOT complete a
+    review for THIS run (`declared - completed`). Empty list = D7 satisfied.
+
+    `required_experts` is normalized (strip + LOWERCASE, drop non-str/empty) to match
+    the completed-set normalization in `_d7_completed_expert_ids` — BOTH sides lowercase
+    because the marker-writer forces a lowercase registry id, so an asymmetry here would
+    be a false self-lock (declared "Correctness" vs marker "correctness" — Gate-1 MED).
+    The CALLER decides fail-open: this returns the raw shortfall; `cmd_run_commit` only
+    ENFORCES when required_experts is a non-empty list present on run.json (a missing/
+    empty key → caller skips D7 entirely).
+
+    FAIL-OPEN on an unreadable store (Gate-2 correctness HIGH): if
+    `_d7_completed_expert_ids` returns None (the marker store could not be read), there
+    is NO shortfall to report — return [] (allow). Only a READABLE store that genuinely
+    lacks a declared expert's marker produces a non-empty shortfall (real refuse)."""
+    if not isinstance(required_experts, list):
+        return []
+    required = sorted({str(e).strip().lower() for e in required_experts if isinstance(e, str) and str(e).strip()})
+    if not required:
+        return []
+    completed = _d7_completed_expert_ids(run_id)
+    if completed is None:
+        return []  # store unreadable → fail-open: never self-lock a commit on infra error
+    return [e for e in required if e not in completed]
+
+
 def cmd_run_commit(args, reg: ArtifactRegistry) -> None:
     """Auto local-commit THIS run's files after PUSH-READY (A1, run_76932250).
 
@@ -3567,6 +3649,70 @@ def cmd_run_commit(args, reg: ArtifactRegistry) -> None:
                      "Nothing to commit (this run tracked zero files).",
         }), file=sys.stderr)
         sys.exit(2)
+
+    # ── Gate 3: D7 expert-coverage (declared ⊆ completed) — R1.5b-ii ─────────
+    # Enforce that every expert the run DECLARED required (at PLAN, append-only)
+    # actually completed an adversarial review FOR THIS RUN. This is the structural
+    # answer to "an IC cannot skip a specified expert" that prose (AGENT R1) could not
+    # hold. It lands HERE — inside run-commit, the pipeline's canonical commit path —
+    # NOT in a PreToolUse gate: run-commit's `git commit` is a direct subprocess that
+    # BYPASSES Claude's PreToolUse hook, so a PreToolUse D7 would never fire on a
+    # pipeline commit (Gate-2 adversarial finding; the PreToolUse attempt was reverted).
+    #
+    # Fail-open (never self-lock the pipeline), in priority order:
+    #   • run.json has NO `required_experts` key (legacy in-flight run, e.g. a
+    #     daemon-restart-revived run from before this field existed) → skip D7.
+    #   • `required_experts` is an empty list → skip D7 (nothing declared).
+    #   • marker store unreadable / any infra error → _d7_* swallow it, completed is
+    #     whatever was collected; a genuinely-empty completed with a non-empty declared
+    #     set DOES refuse (that is the real "you declared experts but none ran" case).
+    # Only a run that DECLARED a non-empty required_experts AND is missing at least one
+    # is refused. `--force` (operator override) bypasses, mirroring the push_ready gate.
+    _required = run_state.get("required_experts")
+    # A present-but-malformed required_experts (dict/str, not a list) silently skips D7
+    # under the isinstance guard below — make that LOUD (Gate-1 LOW): a MISDECLARED run
+    # differs from a legacy run; never let a malformed-but-present gate field skip quietly.
+    if _required is not None and not isinstance(_required, list):
+        print(json.dumps({
+            "warning": "required_experts is present but not a list (%s) — D7 "
+                       "coverage gate SKIPPED. A malformed declaration bypasses the "
+                       "gate; fix it to a list[str] to enforce." % type(_required).__name__,
+        }), file=sys.stderr)
+    # Gate-2 security+state-machine HIGH: a --force that SKIPS a would-be-D7-refusal
+    # must leave an audit trail — else "committed with full expert coverage" and
+    # "committed despite declared experts never reviewing" are indistinguishable, the
+    # exact integrity hole D7 exists to close. Compute the shortfall EVEN under --force
+    # so we can record it; only the sys.exit(2) is suppressed by --force.
+    _d7_forced_missing: "list[str]" = []
+    if isinstance(_required, list) and _required:
+        _missing = _d7_missing_required_experts(_required, args.run_id)
+        if _missing:
+            if getattr(args, "force", False):
+                # Override honored, but recorded (intervention written post-commit in the
+                # fresh-reread transaction below) + a loud WARN now.
+                _d7_forced_missing = _missing
+                print(json.dumps({
+                    "warning": "D7 coverage gate FORCE-BYPASSED: declared expert(s) with "
+                               "no adversarial marker this run were skipped via --force: "
+                               + ", ".join(_missing) + ". Recorded as a d7_force_bypass "
+                               "intervention on run.json for audit.",
+                    "forced_missing_experts": _missing,
+                }), file=sys.stderr)
+            else:
+                print(json.dumps({
+                    "blocked": True,
+                    "error": (
+                        "run-commit refused (D7): this run declared required expert(s) that "
+                        "did NOT run an adversarial review this run: " + ", ".join(_missing)
+                        + ". Spawn the missing specialist expert(s) to review the diff (each "
+                        "writes an EXPERT-ID marker on completion), THEN re-run run-commit. A "
+                        "declared expert cannot be skipped — that is the purpose of the run's "
+                        "required_experts. (Genuinely not enforceable? Re-run with --force.)"
+                    ),
+                    "missing_experts": _missing,
+                    "declared": sorted(_required),
+                }), file=sys.stderr)
+                sys.exit(2)
 
     # ── Resolve each file to its git repo root; group so multi-repo runs get
     #    one commit per repo. Never `git add -A`. (Resolver is module-level
@@ -3821,6 +3967,17 @@ def cmd_run_commit(args, reg: ArtifactRegistry) -> None:
                 warnings.append(
                     f"codefix intervention inferred: {len(codefix_files)} committed "
                     f"file(s) absent from files_touched (human edit → autonomy−)"
+                )
+
+            # Gate-2 HIGH: persist the D7 force-bypass so a later audit can tell this
+            # commit did NOT satisfy its declared expert coverage. Same fresh-reread
+            # transaction (no stale clobber). avoidable=True — a forced skip of a
+            # declared expert is an avoidable autonomy deduction, not a clean commit.
+            if _d7_forced_missing:
+                _append_intervention(
+                    fresh, stage="deliver", kind="d7_force_bypass", avoidable=True,
+                    note=("committed via --force despite declared expert(s) with no "
+                          "adversarial marker this run: " + ", ".join(_d7_forced_missing[:8])),
                 )
 
             tmp = run_file.with_suffix(".commits.tmp")
