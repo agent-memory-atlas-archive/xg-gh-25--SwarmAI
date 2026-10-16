@@ -356,3 +356,84 @@ def test_human_deliverables_unaffected_by_job_rule(swarmws: Path):
         v = needs_human_review(str(p.resolve()), "written", swarmws_root=swarmws)
         assert v.kind == expected, f"{rel}: expected {expected}, got {v.kind} (job rule over-reached)"
         assert v.review_worthy is True, f"{rel} must stay review_worthy"
+
+
+# ── Overflow/decay ARCHIVE shards never surface (the IMPROVEMENT-archive.md leak) ──
+#
+# A SwarmAI .gitignore layers `Projects/*` then `!Projects/SwarmAI/`, so the SwarmAI
+# DDD's archive shards are TRACKED + not-ignored and would classify as `knowledge`
+# via the `2-understanding` path — auto-popping decay sediment to the Canvas. The
+# `swarmws` fixture's .gitignore does NOT ignore Projects/, so a 2-understanding .md
+# is not-ignored there either (same not-ignored state the real SwarmAI un-ignore
+# layer produces) — making it the correct reproduction of the leak.
+
+@pytest.fixture
+def _archive_cases():
+    """(rel_path, expected_kind, review_worthy) for the archive leak + its guards.
+
+    The archive paths MUST become process; the live DDD docs + live knowledge
+    basenames MUST stay knowledge (no over-match)."""
+    return [
+        # overflow archives → must NOT surface
+        ("Projects/SwarmAI/2-understanding/IMPROVEMENT-archive.md", "process", False),
+        ("Projects/SwarmAI/2-understanding/TECH-archive.md", "process", False),
+        ("Projects/SwarmAI/2-understanding/knowledge/MEMORY-archive-2026-10.md", "process", False),
+        (".context/EVOLUTION-archive-2026-08.md", "process", False),  # also dot-seg, idempotent
+        # live DDD docs → MUST still surface as knowledge (no over-match on the stem)
+        ("Projects/SwarmAI/2-understanding/IMPROVEMENT.md", "knowledge", True),
+        ("Projects/SwarmAI/2-understanding/TECH.md", "knowledge", True),
+        # live knowledge basenames carry no -archive → unaffected
+        (".context/MEMORY.md", "knowledge", True),
+        # incidental mid-name "-archive" that is NOT a shard suffix → unaffected (anchor guard)
+        ("Knowledge/Reports/2026-08-15-overlay-archive-browse.md", "content", True),
+    ]
+
+
+def test_overflow_archive_single_path(swarmws: Path, _archive_cases):
+    """needs_human_review (single) blocks overflow-archive shards, preserves live docs."""
+    for rel, kind, worthy in _archive_cases:
+        p = _write(swarmws, rel)
+        v = needs_human_review(str(p.resolve()), "written", swarmws_root=swarmws)
+        assert v.kind == kind, f"{rel}: expected kind={kind}, got {v.kind}"
+        assert v.review_worthy is worthy, f"{rel}: expected review_worthy={worthy}, got {v.review_worthy}"
+
+
+def test_overflow_archive_batch_parity(swarmws: Path, _archive_cases):
+    """needs_human_review_batch returns the SAME verdict per path as the single
+    function for every archive case — the two surface paths must not drift."""
+    from core.needs_human_review import needs_human_review_batch
+    paths = []
+    for rel, _kind, _worthy in _archive_cases:
+        _write(swarmws, rel)
+        paths.append(str((swarmws / rel).resolve()))
+    batch = needs_human_review_batch(paths, "written", swarmws_root=swarmws)
+    assert len(batch) == len(paths)
+    for (rel, kind, worthy), p in zip(_archive_cases, paths):
+        single = needs_human_review(p, "written", swarmws_root=swarmws)
+        assert batch[p].review_worthy == single.review_worthy, f"batch/single mismatch {rel}"
+        assert batch[p].kind == single.kind, f"batch/single kind mismatch {rel}"
+        assert batch[p].kind == kind, f"{rel}: batch expected {kind}, got {batch[p].kind}"
+        assert batch[p].review_worthy is worthy, f"{rel}: batch review_worthy {worthy}"
+
+
+def test_is_overflow_archive_anchoring():
+    """Unit: the predicate is ANCHORED (IMPROVEMENT.md 2026-08-15 loose-substring
+    lesson). Matches <STEM>-archive.md and monthly -YYYY-MM shards; rejects an
+    incidental mid-name '-archive' and the live knowledge basenames."""
+    from core.needs_human_review import _is_overflow_archive
+    for p in [
+        "Projects/SwarmAI/2-understanding/IMPROVEMENT-archive.md",
+        "x/TECH-archive.md",
+        "x/MEMORY-archive-2026-10.md",
+        ".context/EVOLUTION-archive-2026-08.md",
+    ]:
+        assert _is_overflow_archive(p) is True, f"should match: {p}"
+    for p in [
+        "Projects/SwarmAI/2-understanding/IMPROVEMENT.md",
+        "x/TECH.md",
+        ".context/MEMORY.md",
+        "x/2026-08-15-overlay-archive-browse.md",  # -archive mid-name, not the suffix
+        "x/archive.md",                              # no stem-dash-archive, bare word
+        "x/IMPROVEMENT-archive.txt",                 # not .md
+    ]:
+        assert _is_overflow_archive(p) is False, f"should NOT match: {p}"

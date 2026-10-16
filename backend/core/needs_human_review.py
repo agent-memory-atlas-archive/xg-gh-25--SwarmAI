@@ -66,12 +66,21 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
 
 logger = logging.getLogger(__name__)
+
+# Overflow/decay ARCHIVE shard basenames (``<STEM>-archive.md`` or a monthly
+# ``<STEM>-archive-YYYY-MM.md`` shard). ANCHORED — the ``-archive`` segment sits
+# immediately before the optional ``-YYYY-MM`` suffix and the terminal ``.md`` — so
+# an incidental mid-name ``-archive`` (e.g. ``...-overlay-archive-browse.md``) does
+# NOT match. See ``_is_overflow_archive`` for the full rationale + the loose-substring
+# lesson (IMPROVEMENT.md 2026-08-15) this anchoring deliberately avoids.
+_ARCHIVE_BASENAME_RE = re.compile(r"-archive(-\d{4}-\d{2})?\.md$")
 
 __all__ = ["needs_human_review", "ReviewVerdict", "Kind"]
 
@@ -120,6 +129,38 @@ def _is_surfaceable_knowledge(rel_path: str) -> bool:
     if base == "REPORT.md" and ".artifacts" in parts and "runs" in parts:
         return True
     return False
+
+
+def _is_overflow_archive(rel_path: str) -> bool:
+    """True if this path is a decay/overflow ARCHIVE shard (``<STEM>-archive.md`` /
+    ``<STEM>-archive-YYYY-MM.md``) — recall-only sediment that is NEVER a human-review
+    deliverable, so it must never reach the Canvas / Artifacts surface.
+
+    The leak this closes: ``Projects/SwarmAI/2-understanding/IMPROVEMENT-archive.md`` and
+    ``TECH-archive.md`` are TRACKED + not-ignored in the SwarmWS tree (``.gitignore``
+    layers ``Projects/*`` + ``!Projects/SwarmAI/``), carry no dot-segment, and their path
+    contains ``2-understanding`` — so ``_classify_kind`` returns ``knowledge`` and they
+    auto-pop to Canvas. An overflow archive is overflow sediment (MEMORY/EVOLUTION/
+    IMPROVEMENT/TECH size-valve + decay), not a deliverable (AGENT R30 — recall-only).
+
+    ANCHORED, not a loose substring (IMPROVEMENT.md 2026-08-15 lesson, run_a456640f:
+    a fail-closed classifier goes fail-OPEN when a loose SUBSTRING marker mis-matches —
+    ``REPLACEABLE`` markers must be ``endswith``/exact, never substring). The archive
+    SEGMENT is anchored as ``-archive`` optionally followed by a ``-YYYY-MM`` monthly
+    shard suffix, then ``.md`` at end — so ``IMPROVEMENT-archive.md`` and
+    ``MEMORY-archive-2026-10.md`` match, while an incidental like
+    ``2026-08-15-cm-overlay-archive-browse.md`` (``-archive`` mid-name, not the suffix)
+    does NOT.
+
+    ⚠️ Intentionally STRICTER than the ``knowledge_store.py`` chunking predicate
+    (``'-archive' in base and base.endswith('.md')``, a loose substring). Different
+    blast radius by design: a chunking false-positive merely over-chunks (harmless); a
+    SURFACE false-positive would wrongly HIDE a real deliverable — so this door anchors
+    where the chunking door can afford not to (P8: same concept, door-appropriate rule).
+    """
+    parts = [p for p in Path(rel_path).parts if p not in (".", "")]
+    base = parts[-1] if parts else ""
+    return bool(_ARCHIVE_BASENAME_RE.search(base))
 
 
 def _is_automated_job_output(rel_path: str) -> bool:
@@ -382,6 +423,15 @@ def needs_human_review(
         if _is_surfaceable_knowledge(rel_path):
             return ReviewVerdict(True, "knowledge", repo)
 
+        # Overflow/decay archive shard → never a review deliverable (recall-only
+        # sediment). Checked AFTER the surfaceable-knowledge allowlist (so an
+        # overflow archive OVERRIDES the knowledge classification it would otherwise
+        # get from the 2-understanding path) and before the git/dot layers. A
+        # .context archive is already process via dot-segment below — this returning
+        # process earlier is the SAME verdict (idempotent).
+        if _is_overflow_archive(rel_path):
+            return ReviewVerdict(False, "process", repo)
+
         # Layer 2: dot-segment on the TREE-RELATIVE path (the seam trap fix).
         if _has_dot_segment(rel_path):
             return ReviewVerdict(False, "process", repo)
@@ -464,6 +514,13 @@ def needs_human_review_batch(
             tree_root, rel_path, repo = owning
             if _is_surfaceable_knowledge(rel_path):
                 out[p] = ReviewVerdict(True, "knowledge", repo)
+                continue
+            if _is_overflow_archive(rel_path):
+                # Overflow/decay archive shard → process (recall-only sediment).
+                # Same precedence as the single-path function above: after the
+                # surfaceable-knowledge allowlist, before dot/git — overrides the
+                # knowledge classification a 2-understanding archive would get.
+                out[p] = ReviewVerdict(False, "process", repo)
                 continue
             if _has_dot_segment(rel_path):
                 out[p] = ReviewVerdict(False, "process", repo)
