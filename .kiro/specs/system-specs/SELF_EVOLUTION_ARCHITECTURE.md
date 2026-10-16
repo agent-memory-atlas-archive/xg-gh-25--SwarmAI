@@ -1,5 +1,11 @@
 # SwarmAI Self-Evolution — End-to-End Architecture
 
+> **Partly historical.** For the current, code-verified guardrails read
+> `.kiro/steering/self-evolution-guardrails.md`. Notably: the EVOLUTION_EVENT SSE
+> marker chain was removed (2026-10-17), confidence thresholds are code constants only
+> (`HIGH_CONFIDENCE = 0.15`, `MED_CONFIDENCE = 0.08`), and the evolution cycle runs
+> only from the weekly `evolution-cycle` job.
+
 ## Overview
 
 SwarmAI's self-evolution system enables the agent to detect capability gaps, learn from mistakes, and build new capabilities (skills, scripts, knowledge) that persist across sessions. The architecture is **prompt-driven** — the core logic lives in a skill (`s_self-evolution/SKILL.md`) that instructs the agent how to detect triggers, execute evolution loops, and persist results. Backend code provides infrastructure: EVOLUTION.md in the system prompt, `locked_write.py` for atomic field updates, SSE event parsing for frontend rendering, and config defaults.
@@ -336,68 +342,14 @@ Embedded in `s_self-evolution/SKILL.md` (previously a separate GROWTH_PRINCIPLES
 
 ---
 
-## SSE Event Flow (Detailed)
+## SSE Event Flow — REMOVED (2026-10-17)
 
-```
-Agent text output contains:
-  "I'll try a different approach <!-- EVOLUTION_EVENT: {"event":"evolution_start","data":{"triggerType":"stuck",...}} -->"
-       │
-       ▼
-Backend: _format_message() → assistant content block with text (marker embedded)
-       │
-       ▼
-Backend: sse_with_heartbeat() yields formatted message as SSE data line
-       │
-       ▼
-Backend: _extract_evolution_events(item) → regex parses marker → JSON payload
-       │  Normalizes "event" → "type" for frontend compatibility
-       ▼
-Backend: yields evolution event as SEPARATE SSE data line
-       │
-       ▼
-Frontend: chat.ts SSE handler parses both data lines
-       │
-       ▼
-Frontend: useChatStreamingLifecycle.createStreamHandler()
-       │  Checks: event.type?.startsWith('evolution_')
-       │  Creates Message with evolutionEvent property
-       │  Adds to tab messages array
-       ▼
-Frontend: ChatPage.tsx renders via EvolutionMessage component
-       │  Trigger-type styling (⚡🔍🔄), expandable details
-       ▼
-User sees evolution event inline in chat stream
-```
-
-Note: Evolution markers remain in the original text content saved to DB (as HTML comments, invisible in rendered markdown). The extracted evolution events are frontend-only — not persisted separately to DB.
-
----
-
-## Help Request Flow
-
-When all 3 evolution attempts fail:
-
-```
-Agent generates structured Help Request:
-  "I need your help. Here's what happened:
-   Original Task: {description}
-   Trigger: {type} — {details}
-   Attempts:
-   1. Strategy: {s1} — Failed: {reason1}
-   2. Strategy: {s2} — Failed: {reason2}
-   3. Strategy: {s3} — Failed: {reason3}
-   My Assessment: {why blocked}
-   Suggested Next Step: {what user could do}"
-       │
-       ▼
-Agent emits: <!-- EVOLUTION_EVENT: {"event":"evolution_help_request","data":{...}} -->
-       │
-       ▼
-Backend parses → SSE event → Frontend renders as 🆘 styled message
-       │
-       ▼
-User provides guidance → Agent incorporates and optionally retries
-```
+The `<!-- EVOLUTION_EVENT: {...} -->` marker chain is gone. No skill had emitted the
+marker since 39756bd5 (2026-05-19), so the backend parser (`_extract_evolution_events`
+in `routers/chat.py`), the frontend `evolution_*` SSE branch, `EvolutionMessage`,
+`services/evolution.ts`, `EvolutionBadge`, and `Message.evolutionEvent` were deleted as
+dead code. Help requests are plain assistant text. Old markers that remain inside
+persisted assistant text are HTML comments and stay invisible when rendered.
 
 ---
 

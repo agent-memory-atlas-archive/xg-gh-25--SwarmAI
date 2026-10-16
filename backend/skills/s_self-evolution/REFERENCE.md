@@ -2,7 +2,7 @@
 
 This file provides additional detail beyond SKILL.md. SKILL.md is self-contained
 and sufficient for all operations. Read this only when you need deeper context
-on VFM scoring, SSE event fields, or entry revision operations.
+on VFM scoring or entry revision operations.
 
 ## VFM Scoring Detail
 
@@ -22,65 +22,6 @@ Score across four dimensions (each 0-10):
 | >=70 | Promote immediately |
 | 50-69 | Promote if 3+ occurrences confirm the pattern |
 | <50 | Keep in EVOLUTION.md, do not promote |
-
-## SSE Event Field Details
-
-### evolution_start
-```json
-{
-  "event": "evolution_start",
-  "data": {
-    "triggerType": "reactive|proactive|stuck",
-    "description": "What triggered it",
-    "strategySelected": "compose_existing|build_new|...",
-    "attemptNumber": 1,
-    "principleApplied": "Reuse before you build"
-  }
-}
-```
-
-### evolution_result
-```json
-{
-  "event": "evolution_result",
-  "data": {
-    "outcome": "success|failure",
-    "durationMs": 5000,
-    "capabilityCreated": "E006",
-    "evolutionId": "E006",
-    "failureReason": null
-  }
-}
-```
-
-### evolution_stuck_detected
-```json
-{
-  "event": "evolution_stuck_detected",
-  "data": {
-    "detectedSignals": ["repeated_error", "cosmetic_retry"],
-    "triedSummary": "Tried X and Y, both failed",
-    "escapeStrategy": "completely_different"
-  }
-}
-```
-
-### evolution_help_request
-```json
-{
-  "event": "evolution_help_request",
-  "data": {
-    "taskSummary": "What was being attempted",
-    "triggerType": "reactive",
-    "attempts": [
-      {"strategy": "compose_existing", "failureReason": "No matching capability"},
-      {"strategy": "build_new", "failureReason": "Script failed verification"},
-      {"strategy": "research_and_build", "failureReason": "No relevant docs found"}
-    ],
-    "suggestedNextStep": "Install X manually or provide API key"
-  }
-}
-```
 
 ## Entry Revision Operations
 

@@ -41,7 +41,6 @@ vi.mock('../MessageBubble', () => ({
 }));
 vi.mock('../WelcomeScreen', () => ({ WelcomeScreen: () => <div data-testid="welcome" /> }));
 vi.mock('../../../../components/chat', () => ({
-  EvolutionMessage: () => <div />,
   ChatErrorMessage: () => <div />,
 }));
 vi.mock('../../../../components/common', () => ({ Spinner: () => <div /> }));

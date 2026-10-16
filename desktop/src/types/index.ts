@@ -321,11 +321,6 @@ export interface Message {
   suggestedAction?: string;
   /** Ephemeral — renders "Queued" badge. Never persisted to DB. */
   isQueued?: boolean;
-  /** When set, this message represents an evolution SSE event and should be rendered with EvolutionMessage. */
-  evolutionEvent?: {
-    eventType: string;
-    data: Record<string, unknown>;
-  };
   /** Backend correlation metadata — carries `client_id` so a reconcile can match
    *  this message to its DB counterpart EVEN AFTER its display `id` has been
    *  renamed from the optimistic `local-*` id to the canonical DB id. This is a

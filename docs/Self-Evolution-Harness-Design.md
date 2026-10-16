@@ -322,7 +322,7 @@ Confidence classification: `confidence = evidence x max(density, need)`
 | **MED** | 0.08--0.15 | Some evidence, pattern emerging --- recommend |
 | **LOW** | < 0.08 | Insufficient data or low fitness signal --- log only |
 
-Thresholds are defined in `evolution_optimizer.py:50-51` (`HIGH_CONFIDENCE = 0.15`, `MED_CONFIDENCE = 0.08`) and are overridable via `config.evolution.high_confidence` / `med_confidence`. See §5.5 for why they are this low.
+Thresholds are defined in `evolution_optimizer.py:50-51` (`HIGH_CONFIDENCE = 0.15`, `MED_CONFIDENCE = 0.08`). They are not configurable: the old `config.evolution.high_confidence` / `med_confidence` override never took effect and was removed on 2026-10-17. See §5.5 for why they are this low.
 
 ### 5.3 Phase 3: ACT
 

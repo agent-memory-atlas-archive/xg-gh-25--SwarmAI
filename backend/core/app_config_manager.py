@@ -115,8 +115,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_active_entries": 30,
         "deprecation_days": 30,
         "optimizer": "auto",           # "auto" | "llm" | "heuristic"
-        "high_confidence": 0.35,       # Deploy threshold
-        "med_confidence": 0.15,        # Recommend threshold
+        # Confidence thresholds are NOT config: they live only in
+        # evolution_optimizer.HIGH_CONFIDENCE / MED_CONFIDENCE (data-calibrated).
     },
 }
 

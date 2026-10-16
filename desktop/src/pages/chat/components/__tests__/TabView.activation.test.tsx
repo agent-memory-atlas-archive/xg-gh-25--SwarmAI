@@ -28,7 +28,7 @@ vi.mock('../MessageBubble', () => ({
   MessageBubble: ({ message }: { message: Message }) => <div data-testid={`bubble-${message.id}`}>{message.id}</div>,
 }));
 vi.mock('../WelcomeScreen', () => ({ WelcomeScreen: () => <div data-testid="welcome" /> }));
-vi.mock('../../../../components/chat', () => ({ EvolutionMessage: () => <div />, ChatErrorMessage: () => <div /> }));
+vi.mock('../../../../components/chat', () => ({ ChatErrorMessage: () => <div /> }));
 vi.mock('../../../../components/common', () => ({ Spinner: () => <div /> }));
 vi.mock('../../../hooks/useStreamingActivity', () => ({
   useStreamingActivity: () => ({ displayedActivity: null, elapsedSeconds: 0 }),

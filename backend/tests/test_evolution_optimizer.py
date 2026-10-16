@@ -478,6 +478,22 @@ class TestHighConfidenceThreshold:
             f"threshold is unreachable with real data"
         )
 
+    def test_thresholds_have_one_source(self):
+        """The module constants are the only threshold source.
+
+        DEFAULT_CONFIG used to advertise high/med = 0.35/0.15 while the optimizer
+        ran on 0.15/0.08 (its config read imported a non-existent symbol). A second
+        source must not come back: any persisted 0.35 would re-freeze ACT.
+        """
+        import core.evolution_optimizer as eo
+        from core.app_config_manager import DEFAULT_CONFIG
+
+        evo_defaults = DEFAULT_CONFIG["evolution"]
+        assert "high_confidence" not in evo_defaults
+        assert "med_confidence" not in evo_defaults
+        assert not hasattr(eo, "_get_confidence_thresholds")
+        assert (eo.HIGH_CONFIDENCE, eo.MED_CONFIDENCE) == (0.15, 0.08)
+
 
 class TestAtomicDeploy:
     """Tests for the atomic_deploy function."""

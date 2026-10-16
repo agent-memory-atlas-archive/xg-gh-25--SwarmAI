@@ -153,93 +153,10 @@ from core.exceptions import (
 import json
 import asyncio
 import logging
-import re as _re
 import time
 from typing import AsyncIterator, List, Optional
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Evolution marker parsing
-# ---------------------------------------------------------------------------
-
-_EVOLUTION_MARKER_RE = _re.compile(
-    r"<!--\s*EVOLUTION_EVENT:\s*(.+?)\s*-->",
-    _re.DOTALL,
-)
-
-# Per-token streaming fragments — a complete `<!-- EVOLUTION_EVENT: {...} -->`
-# marker can NEVER appear in one of these (the SDK splits text across many
-# text_delta events, one token each; thinking_delta carries redacted thinking).
-# Scanning them with `_EVOLUTION_MARKER_RE.finditer` on EVERY token is pure dead
-# cost on the hottest path in the stream — the marker only ever arrives whole,
-# inside an `assistant` message's complete `content` blocks. A DENYLIST (not an
-# allowlist) is deliberate: it excludes ONLY proven-fragment types, so a future
-# marker-bearing message type is scanned by default rather than silently dropped.
-_EVOLUTION_SKIP_TYPES = frozenset({"text_delta", "thinking_delta"})
-
-
-def _should_scan_for_evolution(msg_type: str) -> bool:
-    """Whether an SSE event of ``msg_type`` can carry a complete evolution marker.
-
-    Returns False for per-token streaming fragments (text_delta / thinking_delta)
-    whose payload is a single token — a full HTML-comment marker cannot fit in one.
-    Returns True for every other type (assistant content blocks, result, etc.) so
-    the scan is never skipped for a type that might legitimately carry a marker.
-
-    Args:
-        msg_type: the ``type`` field of the SSE event dict ("" if absent).
-
-    Returns:
-        True to run the marker scan, False to skip it (hot-path fragment).
-    """
-    return msg_type not in _EVOLUTION_SKIP_TYPES
-
-
-def _extract_evolution_events(message: dict) -> list[dict]:
-    """Extract evolution event markers from a message's text content.
-
-    Searches for ``<!-- EVOLUTION_EVENT: {...} -->`` patterns in the
-    message text and returns parsed JSON payloads as event dicts.
-    Malformed markers are silently ignored.
-
-    Args:
-        message: SSE message dict from the agent.
-
-    Returns:
-        List of evolution event dicts (may be empty).
-    """
-    events: list[dict] = []
-    # Look for text content in common message fields
-    text = ""
-    if isinstance(message.get("content"), str):
-        text = message["content"]
-    elif isinstance(message.get("text"), str):
-        text = message["text"]
-    elif isinstance(message.get("content"), list):
-        # Content blocks format
-        for block in message["content"]:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text += block.get("text", "")
-
-    if not text:
-        return events
-
-    for match in _EVOLUTION_MARKER_RE.finditer(text):
-        try:
-            payload = json.loads(match.group(1))
-            if isinstance(payload, dict) and "event" in payload:
-                # Normalize "event" → "type" so the frontend SSE handler
-                # (which switches on event.type) recognises evolution events.
-                payload["type"] = payload.pop("event")
-                events.append(payload)
-        except (json.JSONDecodeError, KeyError):
-            logger.debug(
-                "Ignoring malformed evolution marker: %s",
-                match.group(0)[:100],
-            )
-
-    return events
 
 router = APIRouter()
 chat_threads_router = APIRouter()
@@ -418,17 +335,6 @@ async def sse_with_heartbeat(
                         # For simplicity: any text-producing event ends thinking
                         if msg_type in ("text_start", "text_delta", "result", "assistant"):
                             thinking_active = False
-
-                    # Check for evolution event markers embedded in agent output.
-                    # Skip per-token fragments (text_delta/thinking_delta) — a
-                    # complete marker cannot fit in one token, so scanning every
-                    # delta is dead cost on the hottest path (reuses msg_type above).
-                    if _should_scan_for_evolution(msg_type):
-                        for evo_event in _extract_evolution_events(item):
-                            try:
-                                yield f"data: {json.dumps(evo_event)}\n\n"
-                            except (TypeError, ValueError):
-                                pass  # Skip non-serializable evolution events
                 elif item_type == "error":
                     raise item
 

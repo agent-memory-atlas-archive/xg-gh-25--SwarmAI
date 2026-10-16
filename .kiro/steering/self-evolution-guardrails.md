@@ -31,10 +31,9 @@ budget and re-fired every session (run_6ac3fc0b).
 - Regression gate: a deployed skill whose fitness dropped >0.1 is auto-reverted from
   `SKILL.md.bak`. Deploys are atomic (tmp + `os.replace` + verify + rollback).
 - Freshness re-read before applying changes (the skill may have changed since MINE).
-- **Known drift:** module constants are HIGH=0.15 / MED=0.08, but
-  `AppConfigManager` defaults are `high_confidence: 0.35` / `med_confidence: 0.15`, and
-  `_get_confidence_thresholds()` reads the config first. Decide which is intended before
-  touching thresholds.
+- Thresholds: `HIGH_CONFIDENCE = 0.15`, `MED_CONFIDENCE = 0.08` in `evolution_optimizer.py`
+  are the ONLY source (not configurable; a test guards against a second source).
+  Recalibrate them there, with data.
 
 ## Maintenance Hook Order (EvolutionMaintenanceHook.execute)
 
@@ -66,7 +65,8 @@ over-archives.
 `config.json["evolution"]`, read via `AppConfigManager.get("evolution")`.
 
 - NEVER change `auto_approve_skills/scripts/installs` defaults to `true`.
-- `high_confidence`, `med_confidence`, `max_llm_skills_per_cycle` are consumed by the cycle.
+- `max_llm_skills_per_cycle` is meant to be read by the cycle, but its read uses the same
+  non-existent `app_config_manager` import as several other sites, so it is always 5.
 - `max_triggers_per_session`, `max_retries`, `max_active_entries`,
   `same_type_cooldown_seconds` are NOT read by backend code. They are prompt-level limits
   only, and `deprecation_days` is not wired into the hook (it uses its constructor default
@@ -74,10 +74,8 @@ over-archives.
 
 ## Dead Code (don't build on it)
 
-- The `<!-- EVOLUTION_EVENT -->` marker chain: no skill emits the marker any more
-  (39756bd5). The parser in `routers/chat.py` (`_extract_evolution_events`), the frontend
-  `evolution_*` SSE branch, `EvolutionMessage`, and the unimported `EvolutionBadge` are
-  unreachable.
+- The `<!-- EVOLUTION_EVENT -->` SSE marker chain was REMOVED on 2026-10-17 (no producer
+  since 39756bd5). Don't reintroduce markers in agent text as a UI channel.
 - `ToolFailureTracker` (`hooks/evolution_trigger_hook.py`) is never instantiated. The live
   repeated-failure hint is `create_error_pattern_detector` + `create_failure_tracker_reset`
   in `core/runtime_hooks.py` (per-session `session_context["_failure_tracker"]`).

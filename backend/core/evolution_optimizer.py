@@ -41,30 +41,19 @@ from utils.file_lock import flock_exclusive, flock_exclusive_nb, flock_unlock
 
 logger = logging.getLogger(__name__)
 
-# Confidence thresholds — defaults, overridable via config.evolution.high_confidence / med_confidence
+# Confidence thresholds — the SINGLE source of truth (not configurable).
 # v2.1 (2026-04-12): lowered from 0.7/0.3 — old thresholds were unreachable with real data.
 # v2.2 (2026-05-03): lowered HIGH from 0.35 to 0.15 — real data (autonomous-pipeline: 5 corrections,
 #   64 examples, conf=0.16) couldn't reach 0.35. ACT phase was permanently frozen.
 #   0.15 allows skills with genuine correction evidence to deploy. Safety: atomic rollback
 #   + regression detection (>0.1 fitness drop auto-reverts). MED lowered proportionally.
+# 2026-10-17: removed the config.evolution.high_confidence/med_confidence override. It
+#   imported a non-existent `app_config_manager` symbol, so it always hit ImportError and
+#   fell back to these constants — while DEFAULT_CONFIG still advertised the pre-v2.2
+#   0.35/0.15. Making the override "work" would have silently re-frozen ACT on every
+#   install whose config.json had 0.35 persisted. Calibrate here, with data, instead.
 HIGH_CONFIDENCE = 0.15
 MED_CONFIDENCE = 0.08
-
-
-def _get_confidence_thresholds() -> tuple[float, float]:
-    """Read thresholds from app config, falling back to module defaults."""
-    try:
-        from core.app_config_manager import app_config_manager
-        if app_config_manager is not None:
-            evo = app_config_manager.get("evolution", {})
-            if isinstance(evo, dict):
-                return (
-                    float(evo.get("high_confidence", HIGH_CONFIDENCE)),
-                    float(evo.get("med_confidence", MED_CONFIDENCE)),
-                )
-    except (ImportError, Exception):
-        pass
-    return HIGH_CONFIDENCE, MED_CONFIDENCE
 
 
 @dataclass
@@ -1249,7 +1238,7 @@ def _run_evolution_cycle_locked(
         pass  # No previous data — skip regression check
 
     # ── Regression gate: revert previously-deployed skills that degraded ──
-    high_threshold, med_threshold = _get_confidence_thresholds()
+    high_threshold, med_threshold = HIGH_CONFIDENCE, MED_CONFIDENCE
 
     # ── Phase 2: ASSESS ──
     high_count = 0

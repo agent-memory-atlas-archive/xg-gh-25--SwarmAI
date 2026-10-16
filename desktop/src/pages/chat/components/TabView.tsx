@@ -3,7 +3,7 @@
  *
  * Renders a single tab's scrollable message list: the "Load earlier messages"
  * control, the `WelcomeScreen` empty-state, the per-message bubble map
- * (MessageBubble / EvolutionMessage / system divider / ChatErrorMessage), the
+ * (MessageBubble / system divider / ChatErrorMessage), the
  * streaming activity indicators (reconnecting / resuming / running-tool /
  * thinking, the fallback spinner, the SESSION_BUSY recovery spinner, and the
  * sticky bottom indicator), and the `messagesEndRef` scroll anchor.
@@ -37,9 +37,8 @@ import { useMessageStore } from '../../../stores/useMessageStore';
 import { useStreamingActivity } from '../../../hooks/useStreamingActivity';
 import type { StreamingActivity, ContextWarning } from '../../../hooks/useChatStreamingLifecycle';
 import { formatElapsed, ELAPSED_DISPLAY_THRESHOLD_MS } from '../../../hooks/useChatStreamingLifecycle';
-import type { EvolutionEventType } from '../../../services/evolution';
 import { Spinner } from '../../../components/common';
-import { EvolutionMessage, ChatErrorMessage } from '../../../components/chat';
+import { ChatErrorMessage } from '../../../components/chat';
 import type { PendingQuestion } from '../types';
 import { resolvePendingToolUseId } from '../utils';
 import { MessageBubble } from './MessageBubble';
@@ -487,16 +486,6 @@ function TabViewImpl({
         // only ever renders the active tab's messages).
         const resolvedPendingToolUseId = resolvePendingToolUseId(pendingQuestion, activeTabPendingQuestion);
         return messages.map((msg, idx) => {
-          // Evolution events get their own renderer
-          if (msg.evolutionEvent) {
-            return (
-              <EvolutionMessage
-                key={msg.id}
-                eventType={msg.evolutionEvent.eventType as EvolutionEventType}
-                data={msg.evolutionEvent.data}
-              />
-            );
-          }
           // System messages render as divider lines. Three variants by id prefix:
           //   'compact-' → autocompact notice: shows the full backend notice TEXT
           //                (context was summarized) as a persistent, reviewable
