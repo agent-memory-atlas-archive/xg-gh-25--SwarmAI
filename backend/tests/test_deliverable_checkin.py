@@ -598,6 +598,7 @@ class TestReviewProjection:
         "# Autonomous Pipeline Report: thing\n"
         "## TL;DR\ndone\n"
         "## 1. Requirement\nmake it true\n"
+        "## Requirements\n| ID | status |\n| FR-1 | confirmed |\n### 澄清问答\nQ1: self-answered\n"
         "## 需求溯源审计 (Requirement Provenance Audit)\n### 原始意图\n> intent\nFR-1\n"
         "## 2. Evaluation\nGO scope complex\n"
         "## 3. Design & Approach\nwhitelist projection\n"
@@ -623,10 +624,16 @@ class TestReviewProjection:
 
     def test_AC1_whitelist_sections_kept(self):
         out = self._project(["a.py"])
-        for title in ("## TL;DR", "## 1. Requirement", "需求溯源审计", "## 2. Evaluation",
-                      "## 3. Design & Approach", "## 6. Decision Log", "## 7. Quality Gates",
-                      "## 8. Files Changed", "## 9. Lessons", "## 10. Known Gaps & Attention Flags"):
+        for title in ("## TL;DR", "## 1. Requirement", "## Requirements", "需求溯源审计",
+                      "## 2. Evaluation", "## 3. Design & Approach", "## 6. Decision Log",
+                      "## 7. Quality Gates", "## 8. Files Changed", "## 9. Lessons",
+                      "## 10. Known Gaps & Attention Flags"):
             assert title in out, f"whitelist section must survive: {title!r}\n{out}"
+        # The intent→requirement table + clarifications (the North-Star-critical content).
+        assert "FR-1 | confirmed" in out and "澄清问答" in out
+        # Prefix-match must NOT conflate the two distinct requirement sections.
+        assert "## 1. Requirement\nmake it true" in out  # §1 kept as itself
+        assert "## Requirements\n" in out                # the table section kept as itself
 
     def test_AC2_process_stats_sections_dropped(self):
         out = self._project(["a.py"])

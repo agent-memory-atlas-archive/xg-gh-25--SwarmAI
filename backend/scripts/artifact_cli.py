@@ -287,6 +287,10 @@ def _report_section9_is_degenerate(report_md: str) -> bool:
 _B_REVIEW_SECTION_WHITELIST = (
     "## TL;DR",
     "## 1. Requirement",
+    # The intent→requirement derivation table + clarifications + "what the AI decided
+    # for you" — the single most reviewer-critical content per the North Star. Rendered
+    # by pipeline_validator.render_requirements_md as a top-level ``## Requirements``.
+    "## Requirements",
     "## 需求溯源审计",
     "## 2. Evaluation",
     "## 3. Design & Approach",
