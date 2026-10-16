@@ -88,6 +88,52 @@ function StreamingMarkdownText({ text }: { text: string }) {
   return <MarkdownRenderer content={throttledText} />;
 }
 
+/**
+ * Thinking block — a quiet collapsible panel (streaming-simplification Run 1).
+ *
+ * A separate component (not an inline branch) so its hooks obey the Rules of
+ * Hooks — ContentBlockRenderer early-returns per block type and cannot host
+ * hooks itself (same reason as StreamingMarkdownText above).
+ *
+ * Default OPEN while actively streaming (a user watching the model reason sees
+ * the thinking land live), then auto-collapses once the turn becomes historical
+ * (the quiet default the whole Run 1 is about). Genuinely CONTROLLED: a user
+ * toggle during streaming STICKS (we don't force it back open on every render),
+ * and only the stream→historical transition auto-collapses — avoiding the
+ * uncontrolled-`<details>` footgun where a prop-driven `open` silently reopens a
+ * panel the user closed, or force-closes one they're still reading.
+ */
+function ThinkingBlock({ text, isStreaming }: { text: string; isStreaming: boolean }) {
+  const [open, setOpen] = useState<boolean>(isStreaming);
+  // When the turn finishes streaming, collapse to the quiet resting state. This
+  // fires ONLY on the streaming→historical edge, so a user's manual toggle while
+  // streaming is preserved until that single transition.
+  const wasStreamingRef = useRef<boolean>(isStreaming);
+  useEffect(() => {
+    if (wasStreamingRef.current && !isStreaming) {
+      setOpen(false);
+    }
+    wasStreamingRef.current = isStreaming;
+  }, [isStreaming]);
+
+  return (
+    <details
+      open={open}
+      onToggle={(e) => setOpen((e.currentTarget as HTMLDetailsElement).open)}
+      className="group border border-[var(--color-border)] rounded-lg overflow-hidden text-sm"
+    >
+      <summary className="px-3 py-2 cursor-pointer bg-[var(--color-card)] text-[var(--color-text-muted)] hover:text-[var(--color-text)] select-none flex items-center gap-1.5">
+        <span className="text-xs">💭</span>
+        <span>Thinking</span>
+        <span className="ml-auto text-xs opacity-60">{text.length > 200 ? `~${Math.ceil(text.length / 4)} tokens` : ''}</span>
+      </summary>
+      <div className="px-3 py-2 border-t border-[var(--color-border)] bg-[var(--color-bg)] text-[var(--color-text-muted)] italic text-xs leading-relaxed whitespace-pre-wrap max-h-64 overflow-y-auto">
+        {text}
+      </div>
+    </details>
+  );
+}
+
 interface ContentBlockRendererProps {
   block: ContentBlock;
   /** Pre-built map from toolUseId → ToolResultContent for O(1) pairing. */
@@ -253,18 +299,7 @@ export function ContentBlockRenderer({
   if (block.type === 'thinking') {
     const thinkingText = (block as { thinking?: string }).thinking || '';
     if (!thinkingText) return null;
-    return (
-      <details open className="group border border-[var(--color-border)] rounded-lg overflow-hidden text-sm">
-        <summary className="px-3 py-2 cursor-pointer bg-[var(--color-card)] text-[var(--color-text-muted)] hover:text-[var(--color-text)] select-none flex items-center gap-1.5">
-          <span className="text-xs">💭</span>
-          <span>Thinking</span>
-          <span className="ml-auto text-xs opacity-60">{thinkingText.length > 200 ? `~${Math.ceil(thinkingText.length / 4)} tokens` : ''}</span>
-        </summary>
-        <div className="px-3 py-2 border-t border-[var(--color-border)] bg-[var(--color-bg)] text-[var(--color-text-muted)] italic text-xs leading-relaxed whitespace-pre-wrap max-h-64 overflow-y-auto">
-          {thinkingText}
-        </div>
-      </details>
-    );
+    return <ThinkingBlock text={thinkingText} isStreaming={!!isStreaming} />;
   }
 
   return null;

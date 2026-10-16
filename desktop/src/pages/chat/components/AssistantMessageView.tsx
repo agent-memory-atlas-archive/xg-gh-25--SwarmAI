@@ -27,6 +27,8 @@ import clsx from 'clsx';
 import type { Message, ToolResultContent } from '../../../types';
 import type { ContextWarning } from '../../../hooks/useChatStreamingLifecycle';
 import { ContentBlockRenderer } from './ContentBlockRenderer';
+import { ToolGroup } from './ToolGroup';
+import { groupConsecutiveTools } from '../utils';
 import { AssistantHeader } from './AssistantHeader';
 import { useMemorySave } from '../../../hooks/useMemorySave';
 import { chatService } from '../../../services/chat';
@@ -89,6 +91,22 @@ export const AssistantMessageView: React.FC<AssistantMessageViewProps> = ({
   readOnly,
 }) => {
   const [copied, setCopied] = useState(false);
+  // Expanded tool-GROUP ids, keyed by the group's CONTENT-STABLE groupId (first
+  // member's tool_use id), NOT its positional startIndex. Lifted to this
+  // component (not inside ToolGroup) so a tab-switch remount keeps a group the
+  // user opened OPEN — the M4 anti-jump fix from the Gate-1 review. Keying by a
+  // stable id (not startIndex) also means a content shift (load-older prepend /
+  // stream-end reconcile) can't re-point an expanded entry at a DIFFERENT run —
+  // the Gate-2 correctness finding. Default: not present = collapsed.
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  const toggleGroup = useCallback((groupId: string) => {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupId)) next.delete(groupId);
+      else next.add(groupId);
+      return next;
+    });
+  }, []);
   const { addToast } = useToast();
 
   // Sub-agent progress observability (polls only for last streaming message)
@@ -209,11 +227,18 @@ export const AssistantMessageView: React.FC<AssistantMessageViewProps> = ({
     });
   }
 
-  const contentBlocks = message.content.map((block, index) => {
-    // Use block-specific IDs for stable keys to prevent state mix-ups
-    // when multiple tool blocks are rendered consecutively
+  // Render ONE block via ContentBlockRenderer. Shared by the top level and by an
+  // expanded ToolGroup's children, so grouping is a PURE DISPLAY WRAPPER — the
+  // underlying 1:1 tool_use↔result pairing, stable `tu-${id}` key, spinner, and
+  // permission wiring are IDENTICAL whether a block renders standalone or inside
+  // a group (the H3 "nothing-breaks" guarantee from the Gate-1 review).
+  const renderBlock = (block: typeof message.content[number], index: number) => {
     const key = block.type === 'tool_use' ? `tu-${block.id || index}`
       : block.type === 'tool_result' ? `tr-${block.toolUseId || index}`
+      // Thinking carries LOCAL open-state (ThinkingBlock); a distinct `th-`
+      // prefix stops it from ever reusing a text block's `cb-` slot at the same
+      // positional index — the Gate-2 state-bleed finding.
+      : block.type === 'thinking' ? `th-${index}`
       : `cb-${index}`;
     return (
       <ContentBlockRenderer
@@ -231,6 +256,30 @@ export const AssistantMessageView: React.FC<AssistantMessageViewProps> = ({
         readOnly={readOnly}
         sessionId={sessionId}
       />
+    );
+  };
+
+  // Group consecutive same-category clean tool_use runs into one collapsed row.
+  // Mixed-state (error/pending/streaming) runs are downgraded to individual
+  // blocks UPSTREAM by groupConsecutiveTools, so a group here is always safe to
+  // collapse — this view never has to hide an error or a spinner.
+  const renderUnits = groupConsecutiveTools(message.content, resultMap, !!isStreaming);
+  const contentBlocks = renderUnits.map((unit) => {
+    if (unit.kind === 'block') {
+      return renderBlock(unit.block, unit.index);
+    }
+    // tool-group: collapsed summary row; expanded → the original per-tool blocks.
+    // Keyed + expansion-tracked by the content-stable groupId (not startIndex).
+    return (
+      <ToolGroup
+        key={unit.groupId}
+        category={unit.category}
+        count={unit.blocks.length}
+        expanded={expandedGroups.has(unit.groupId)}
+        onToggle={() => toggleGroup(unit.groupId)}
+      >
+        {unit.blocks.map((item) => renderBlock(item.block, item.index))}
+      </ToolGroup>
     );
   });
 
