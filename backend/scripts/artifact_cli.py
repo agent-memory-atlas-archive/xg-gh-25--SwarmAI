@@ -304,16 +304,46 @@ _B_REVIEW_SECTION_WHITELIST = (
 )
 
 
-def _render_review_files_section(source_files: list[str]) -> str:
+def _render_review_files_section(
+    source_files: list[str], repo_root: "str | None" = None
+) -> str:
     """Render B's ``## 8. Files Changed`` from the LIVE staging set (the real
     git-committed source files), NOT A's agent-self-reported ``files_changed``.
     source_files is the caller's live staging list at run-commit time (``by_repo``);
-    an empty list is reported HONESTLY (no fabricated file list, no stat noise)."""
+    an empty list is reported HONESTLY (no fabricated file list, no stat noise).
+
+    ``repo_root`` (optional): when set, each path is rendered REPO-RELATIVE. This is
+    load-bearing — the committed B-copy lands in a possibly-PUBLIC repo, but
+    ``source_files`` (= ``by_repo``'s ``files_touched``) are ABSOLUTE machine-local
+    paths (build.md tells BUILD to 'prefer ABSOLUTE' so run-commit's cross-repo
+    ``git add`` can resolve each file to its own git root). Rendering those verbatim
+    leaks ``/Users/<name>/...`` into git (R30#7 — a published path a stranger cannot
+    resolve). Relativizing HERE (the read-only projection consumer) fixes the leak
+    without touching the ABSOLUTE staging paths ``git add`` needs.
+
+    Relativization is fail-safe and uses ``Path.resolve()`` on BOTH sides before
+    comparing: ``git rev-parse --show-toplevel`` (the source of ``repo_root``)
+    canonicalizes symlinks (macOS ``/tmp`` → ``/private/tmp``), but a ``files_touched``
+    entry may be the UNRESOLVED form — a naive ``relative_to`` would then raise, the
+    fail-safe would keep the ABSOLUTE path, and the leak would survive in exactly the
+    temp/CI environment it matters most (Gate-1 catch). ``resolve()`` both sides closes
+    that. A path genuinely OUTSIDE the root, or an already-relative path, still raises
+    ``ValueError`` → keep the original verbatim (both are correct 'keep original' cases;
+    never emit a ``../..`` chain). ``repo_root=None`` → legacy verbatim pass-through."""
     out = "## 8. Files Changed\n"
     real = [f for f in (source_files or []) if f]
     if real:
         for f in real:
-            out += f"- `{f}`\n"
+            rendered = f
+            if repo_root:
+                try:
+                    rendered = str(Path(f).resolve().relative_to(Path(repo_root).resolve()))
+                except (ValueError, OSError):
+                    # Outside-root / already-relative / unresolvable → keep original
+                    # verbatim (never a ../.. chain). Fail-safe: a path we cannot
+                    # relativize is left as-is, not mangled.
+                    rendered = f
+            out += f"- `{rendered}`\n"
     else:
         out += "_(无 committed 文件 / no committed source files recorded for this run)_\n"
     # Trailing blank line so the next ``## `` section is separated like every other
@@ -346,7 +376,9 @@ def _strip_quality_gate_stats(section_lines: list[str]) -> list[str]:
     return [section_lines[0]] + section_lines[first_sub:]
 
 
-def _project_report_for_review(report_md: str, source_files: list[str]) -> str:
+def _project_report_for_review(
+    report_md: str, source_files: list[str], repo_root: "str | None" = None
+) -> str:
     """Project ledger A's full REPORT.md into the committed review deliverable B.
 
     B keeps ONLY the reviewer-facing whitelist sections (``_B_REVIEW_SECTION_WHITELIST``,
@@ -380,7 +412,7 @@ def _project_report_for_review(report_md: str, source_files: list[str]) -> str:
             if header_stripped.startswith("## 8. Files Changed"):
                 # Replace §8 wholesale with the live-staging render (drops A's
                 # self-reported file list + lines-count stat noise).
-                out_parts.append(_render_review_files_section(source_files))
+                out_parts.append(_render_review_files_section(source_files, repo_root))
             elif header_stripped.startswith("## 7. Quality Gates"):
                 # Keep §7 but strip its leading stat table — only the §7.5 adversarial
                 # verdict + §7.6 completion audit (the reviewer-critical facts) survive.
@@ -3562,7 +3594,7 @@ def _generate_review_deliverable(
         # Keep only the whitelist sections; re-render §8 from the LIVE staging set
         # (source_files) so committed B reflects git truth, not A's self-reported
         # counts. A on disk is untouched (read-only above). (run_d8321b43)
-        projected = _project_report_for_review(report_content, source_files or [])
+        projected = _project_report_for_review(report_content, source_files or [], target_repo_root)
         (dest / "REPORT.md").write_text(projected, encoding="utf-8")
         created.append(str(dest / "REPORT.md"))
     except (OSError, UnicodeDecodeError) as e:
@@ -3583,7 +3615,11 @@ def _generate_review_deliverable(
     # LOCAL commit — the warning + the human's push gate is the control.
     try:
         from core.ddd_packager import content_safety_scan
-        scan_findings = content_safety_scan(dest, external=True)
+        # scan_context="source-repo": REPORT-B is committed INTO the SwarmAI source repo,
+        # where `backend/skills/…` is correct repo-relative content, NOT a dev-command leak.
+        # The 4 real host-path patterns + secrets still fire (destination-independent); only
+        # the dev-command false-positive is suppressed for this destination (run_03c40277, G5).
+        scan_findings = content_safety_scan(dest, external=True, scan_context="source-repo")
         if scan_findings:
             detail = "; ".join(
                 f"{f.file}:{f.line} [{f.kind}]" for f in scan_findings[:8]

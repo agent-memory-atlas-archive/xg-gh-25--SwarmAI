@@ -677,3 +677,69 @@ class TestReviewProjection:
         assert "self_reported.py" not in out
         assert ("无 committed" in out or "no committed" in out.lower()
                 or "No committed" in out), f"empty staging must be honest, got §8:\n{out}"
+
+
+class TestSection8Relativization:
+    """§8 Files Changed must render REPO-RELATIVE paths, never machine-local absolute
+    ones — the committed B-copy lands in a possibly-PUBLIC repo (R30#7). `files_touched`
+    holds ABSOLUTE paths (build.md 'prefer ABSOLUTE' for run-commit's cross-repo git add),
+    so the renderer MUST relativize against the repo root. Threaded via an optional
+    repo_root param; repo_root=None preserves legacy pass-through behavior."""
+
+    _A = (
+        "# Report\n"
+        "## 8. Files Changed\n- `PLACEHOLDER`\n\n**+0 / -0 lines** | 1 files\n"
+        "## 9. Lessons\n- x\n"
+    )
+
+    def _render(self, source_files, repo_root=None):
+        from scripts.artifact_cli import _render_review_files_section
+        return _render_review_files_section(source_files, repo_root)
+
+    def test_absolute_path_relativized(self):
+        # AC1: an absolute path under repo_root → repo-relative, no absolute prefix.
+        out = self._render(["/abs/repo/backend/core/x.py"], "/abs/repo")
+        assert "- `backend/core/x.py`" in out
+        assert "/abs/repo" not in out, f"absolute prefix must not leak:\n{out}"
+
+    def test_symlinked_root_still_relativized(self, tmp_path):
+        # Gate-1 REQUIRED change: git rev-parse --show-toplevel canonicalizes symlinks,
+        # but files_touched may be the UNRESOLVED form. A naive relative_to raises
+        # ValueError → fail-safe keeps ABSOLUTE → the leak survives in exactly the CI/temp
+        # env where it matters. .resolve() both sides fixes it.
+        #
+        # Build the symlink mismatch EXPLICITLY (not via the platform's /tmp) so the test
+        # is non-vacuous on EVERY platform — on Linux CI /tmp is a real dir, so relying on
+        # it would make this a no-op there (REVIEW spec-compliance caveat). Here: a real
+        # symlink `link` → real dir `canonical`; repo_root is the CANONICAL path (what
+        # git rev-parse returns), the file is addressed via the SYMLINK path (unresolved).
+        import os
+        canonical = tmp_path / "canonical" / "myrepo"
+        canonical.mkdir(parents=True)
+        link = tmp_path / "link"
+        os.symlink(tmp_path / "canonical", link)
+        canonical_root = str(canonical)                       # git-toplevel (resolved) form
+        unresolved_file = str(link / "myrepo" / "backend" / "core" / "y.py")  # via symlink
+        out = self._render([unresolved_file], canonical_root)
+        assert "- `backend/core/y.py`" in out, f"symlinked-root file must relativize:\n{out}"
+        assert str(link) not in out and str(canonical) not in out, (
+            f"absolute (symlink OR canonical) must not leak:\n{out}"
+        )
+
+    def test_outside_root_fail_safe_keeps_original(self):
+        # AC2: a path NOT under repo_root cannot be relativized → keep original, never '../..'.
+        out = self._render(["/other/place/z.py"], "/abs/repo")
+        assert "- `/other/place/z.py`" in out
+        assert ".." not in out, f"must not emit ../.. garbage:\n{out}"
+
+    def test_already_relative_passes_through(self):
+        # AC2: an already-relative path → keep as-is (resolve-against-cwd then relative_to
+        # repo raises ValueError → fail-safe), never mangled to a cwd-relative ../.. chain.
+        out = self._render(["backend/core/w.py"], "/abs/repo")
+        assert "- `backend/core/w.py`" in out
+        assert ".." not in out, f"already-relative must pass through clean:\n{out}"
+
+    def test_repo_root_none_is_legacy_passthrough(self):
+        # AC3: repo_root=None (default / legacy callers) → render verbatim, no relativization.
+        out = self._render(["/abs/repo/backend/core/x.py"], None)
+        assert "- `/abs/repo/backend/core/x.py`" in out
