@@ -1278,18 +1278,16 @@ Output formatting MUST NOT degrade execution quality. Rules:
 4. **Validator: suppress when valid** — only show on failure
 5. **DDD reads: batch at EVALUATE** — don't re-read per-stage
 6. **Commit messages: HEREDOC, no preview**
-7. **NO per-tool-call planning narration — the single worst attention-drain.** Do
-   NOT emit a line of plan before each tool call ("care,改切换 map", "care — 先加
-   helper", "先 Read 整文件", "加 experts 视图分支", or any "下一步我要做 X" micro-step).
-   That inner monologue belongs in your reasoning, NEVER in the visible stream. The
-   ONLY things the user may see per stage are: the phase header, the circled-number
-   landmark, a gate verdict, and a decision that genuinely needs them. A tool call
-   is self-describing (the harness shows `Reading/Writing/Running`) — narrating it
-   first is pure noise. Measured failure shape: a pipeline run emitting dozens of
-   `care,<plan>` fragments into chat, visible ONLY during pipeline runs (zero in
-   normal conversation) — the compressed-output mode made the agent leak its
-   step-by-step planning as telegraphic fragments. Silence between tool calls is
-   correct; the landmark is the only narration.
+7. **NO text before tool calls (AGENT R20 "Tool calls are silent").** Do NOT emit a
+   line of plan before a tool call ("先 Read 整文件", "加 experts 视图分支", or any
+   "下一步我要做 X" micro-step). That belongs in your reasoning, NEVER in the visible
+   stream. The ONLY things the user may see per stage are: the phase header, the
+   circled-number landmark, a gate verdict, and a decision that genuinely needs them.
+   A tool call is self-describing (the harness shows `Reading/Writing/Running`).
+   Root cause, corrected: the one-word fragments seen at the start of such lines were
+   NOT leaked planning — they are the model's tool-call glitch (a corrupted call
+   opener), which lands in pre-call text and is then copied from history. No pre-call
+   text = nowhere for it to land. Silence between tool calls is correct.
 
 **Token targets:**
 

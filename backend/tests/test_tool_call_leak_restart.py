@@ -12,7 +12,7 @@ What is tested
 
 Key invariants
 --------------
-- INV1: only assistant text blocks with a line-start raw ``<invoke`` change;
+- INV1: only assistant text blocks with a line-start raw ``‹invoke`` change;
   fenced examples, tool results and user messages are byte-identical.
 - INV2: a block that was only a leak keeps a non-empty filler (the API rejects
   empty text blocks in history).
@@ -22,6 +22,7 @@ Key invariants
 """
 from __future__ import annotations
 
+from tests._tool_markup import tc
 import asyncio
 import json
 
@@ -85,14 +86,14 @@ def test_find_transcript_rejects_non_uuid(tmp_path, monkeypatch, bad):
 
 
 def test_clean_strips_assistant_leak_only(tmp_path, monkeypatch):
-    fenced = 'Example:\n```\ncount\n<invoke name="Bash">\n<parameter name="command">x</parameter>\n```\n'
+    fenced = tc('Example:\n```\ncount\n‹invoke name="Bash">\n‹parameter name="command">x‹/parameter>\n```\n')
     user_paste = {"type": "user", "uuid": "u1",
                   "message": {"role": "user", "content": _DEADEND_LEAK}}
     tool_result = {"type": "user", "uuid": "u2", "message": {"role": "user", "content": [
         {"type": "tool_result", "tool_use_id": "t", "content": _DEADEND_LEAK}]}}
     p = _write_transcript(tmp_path, monkeypatch, [
         _asst(_DEADEND_LEAK, "m1"),
-        _asst('count\n<invoke name="Read">\n<parameter name="file_path">/x</parameter>\n</invoke>', "m2"),
+        _asst(tc('count\n‹invoke name="Read">\n‹parameter name="file_path">/x‹/parameter>\n‹/invoke>'), "m2"),
         _asst(fenced, "m3"),
         user_paste,
         tool_result,
@@ -269,7 +270,7 @@ async def test_restart_kills_cleans_resumes_and_continues(tmp_path, monkeypatch)
     assert calls[2] == ("query", StreamingOrchestrator._LEAK_CONTINUATION_PROMPT)
     assert events[-1] == {"_recovered": True}
     assert u._leak_restart_done is True and u._leak_count == 0
-    assert "<invoke" not in p.read_text()
+    assert tc("‹invoke") not in p.read_text()
 
 
 async def test_restart_without_transcript_still_resumes(tmp_path, monkeypatch):

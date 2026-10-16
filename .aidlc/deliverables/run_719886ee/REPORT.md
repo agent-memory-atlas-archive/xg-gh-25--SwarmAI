@@ -43,8 +43,8 @@
 
 **Acceptance Criteria:**
 1. AC1(2d消除): persist 写路径不再无条件跑有损宽清洗;DB 存的 assistant text 与 stream yield 的字节一致 —— 构造一条含泄漏文本的消息,断言 persist 的 content == event 原文(同字节),reload 与实时显示一致。
-2. AC2(2a修复): strip_tool_call_leak 对『单反引号 + 代码块 + 泄漏』输入必须保留代码块且输出零 \x00 —— 喂 Don`t ... ```python\nx=1\n``` ... <invoke name=Bash> ... that`s it,断言代码块原样保留、输出不含 \x00。
-3. AC3(2b修复): strip 不得改写『仅讨论该语法的正常 prose』—— 喂一句纯文本讨论 <invoke name=...>/<parameter name=...> 的 prose(无真泄漏上下文),断言输出 == 输入(不出现 [tool-call omitted])。
+2. AC2(2a修复): strip_tool_call_leak 对『单反引号 + 代码块 + 泄漏』输入必须保留代码块且输出零 \x00 —— 喂 Don`t ... ```python\nx=1\n``` ... ‹invoke name=Bash> ... that`s it,断言代码块原样保留、输出不含 \x00。
+3. AC3(2b修复): strip 不得改写『仅讨论该语法的正常 prose』—— 喂一句纯文本讨论 ‹invoke name=...>/‹parameter name=...> 的 prose(无真泄漏上下文),断言输出 == 输入(不出现 [tool-call omitted])。
 4. AC4(统一matcher+读出口): 所有喂回模型的读出口(context_injector.build_resume_context + session_recall 读回)都经过同一个修好的无损 strip;re-induction loop 的两个通道都被切断 —— grep 确认两处都调用 strip,且各有一个 RED-on-revert 测试。
 5. AC5(#4a): strip 不再同步占用 asyncio event loop(to_thread 或 size-cap);注意 review 的『312KB→6.9s 平方』已实测证伪(~15ms 线性),只去掉同步占用,不去优化不存在的平方。
 6. AC6(meta/P7): 本 run 新增测试用 from core.… 导入、能在裸 checkout 自验的进 bvt_manifest.txt;NUL/无损加固必须有一个 mutation-proof 用例(revert 加固代码→测试 RED)。
@@ -52,8 +52,8 @@
 
 ## 3. Design & Approach
 **Research Findings (THINK):**
-- matcher 窄/宽分叉是刻意且正确的(session_utils.py:461-481):窄 _TOOL_CALL_LEAK_RE 用于 KILL 决策(要求 <invoke> 后紧跟 <parameter/</invoke>,窄=不误杀讨论该语法的正常轮次);宽 _TOOL_CALL_LEAK_STRIP_RE 用于清洗(后继可选,宽=抓 mid-stream SIGKILL 落库的截断残留)。清洗比 kill 破坏性小→对模糊输入『不 kill 但清洗』是正确非对称。⇒ EVALUATE AC4『统一 matcher』撤销:保留分叉。
-- 2b 不是正则 bug,是宽 anchor 的固有歧义:截断泄漏 `court\n<invoke name="Bash">` 与未加 fence 的 prose 讨论 `<invoke name="Bash">` 词法完全相同,regex 无法区分。宽 strip 必然误削这类 prose。⇒ 不能靠『改好正则』消除 2b,只能控制 blast radius(把有损变换放在可恢复的消费边界,不放永久存储)。
+- matcher 窄/宽分叉是刻意且正确的(session_utils.py:461-481):窄 _TOOL_CALL_LEAK_RE 用于 KILL 决策(要求 ‹invoke> 后紧跟 ‹parameter/‹/invoke>,窄=不误杀讨论该语法的正常轮次);宽 _TOOL_CALL_LEAK_STRIP_RE 用于清洗(后继可选,宽=抓 mid-stream SIGKILL 落库的截断残留)。清洗比 kill 破坏性小→对模糊输入『不 kill 但清洗』是正确非对称。⇒ EVALUATE AC4『统一 matcher』撤销:保留分叉。
+- 2b 不是正则 bug,是宽 anchor 的固有歧义:截断泄漏 `court\n‹invoke name="Bash">` 与未加 fence 的 prose 讨论 `‹invoke name="Bash">` 词法完全相同,regex 无法区分。宽 strip 必然误削这类 prose。⇒ 不能靠『改好正则』消除 2b,只能控制 blast radius(把有损变换放在可恢复的消费边界,不放永久存储)。
 - 2a 是真 bug:_mask_doc_contexts(session_utils.py:510/517-518)先 mask fence(```)再 mask inline-code(`...`),单反引号跨 \x00 sentinel 配对→代码块恢复失败+残留 \x00。实测复现(早先 agent):输出含 \x000\x00、代码块消失。
 - 2d 真 bug:_persist_assistant_blocks(session_router.py:1846)persist 写 cleaned,但 streaming handler yield event['content'] 原文→同一消息 UI 显原文、reload 显清洗版,字节分叉。
 - 调用点穷举(agent 核验,R27):WRITE=1(session_router.py:1846 无条件);READ/喂模型=2(context_injector.py:146 _format_message + :215 _extract_text,resume-context,已设防);STREAM/KILL=1 处 2 调用(streaming_orchestrator.py:1088 detect-gated kill + :1117 MIXED 分支 per-block strip);UNGUARDED GAP=1(session_recall.py:440 recall_about 读 DB 原文无 strip)。
@@ -63,7 +63,7 @@
 - QUALITY — effort: M / 1 session
 - SIMPLICITY — effort: M / 1 session
 
-**Chosen Approach:** Arch-3 保留 persist-side 单一 chokepoint + 修无损(XG-chosen A,Gate-1 BLOCK 后修正):Gate-1 证明删 persist-strip 会漏 memory_extractor.py + summarization.py 两条 re-induction 通道(都读持久化 content 喂 Bedrock,都不 strip),故 persist-side strip 是唯一覆盖全部 4+ 下游 reader 的单写入 chokepoint——保留它(撤销原 PLAN 的删除),只修:(1) 2a 无损——_mask_doc_contexts fence/inline 改单遍 alternation(fence 优先),消除单反引号跨 NUL sentinel 配对;(2) 2d 无分叉——strip 一次并把 cleaned blocks 写回 event['content'] IN PLACE,再 persist+yield 用同一份→UI==DB;(3) #4a——strip 挪 to_thread(或确认已不在热路径同步大输入)。保留窄/宽 matcher 分叉。2b(宽 anchor 对裸 prose 讨论的固有误削)记为 known-limitation(词法不可区分,修好 2a 后至少代码块无损,只影响模型吐裸<invoke> opener 的极罕见轮次)。
+**Chosen Approach:** Arch-3 保留 persist-side 单一 chokepoint + 修无损(XG-chosen A,Gate-1 BLOCK 后修正):Gate-1 证明删 persist-strip 会漏 memory_extractor.py + summarization.py 两条 re-induction 通道(都读持久化 content 喂 Bedrock,都不 strip),故 persist-side strip 是唯一覆盖全部 4+ 下游 reader 的单写入 chokepoint——保留它(撤销原 PLAN 的删除),只修:(1) 2a 无损——_mask_doc_contexts fence/inline 改单遍 alternation(fence 优先),消除单反引号跨 NUL sentinel 配对;(2) 2d 无分叉——strip 一次并把 cleaned blocks 写回 event['content'] IN PLACE,再 persist+yield 用同一份→UI==DB;(3) #4a——strip 挪 to_thread(或确认已不在热路径同步大输入)。保留窄/宽 matcher 分叉。2b(宽 anchor 对裸 prose 讨论的固有误削)记为 known-limitation(词法不可区分,修好 2a 后至少代码块无损,只影响模型吐裸‹invoke> opener 的极罕见轮次)。
 
 **Success Criteria:**
 - strip 对代码块/反引号输入无损(零 NUL、代码块保留)mutation-proof

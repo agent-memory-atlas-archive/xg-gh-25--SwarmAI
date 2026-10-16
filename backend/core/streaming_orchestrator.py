@@ -1007,7 +1007,7 @@ class StreamingOrchestrator:
                         _prev = _delta_text_buf.get(_idx, "")
                         _buf = _prev + _dtext
                         _delta_text_buf[_idx] = _buf
-                        # Only run the onset check when "<invoke" can have just
+                        # Only run the onset check when "‹invoke" can have just
                         # completed (cheap gate on the hot per-token path).
                         if "<invoke" in _buf[-(len(_dtext) + 7):]:
                             from .session_utils import find_stream_leak_onset
@@ -1141,7 +1141,7 @@ class StreamingOrchestrator:
                     if isinstance(block, TextBlock):
                         # ── Tool-call XML leak guard (strip, never terminate) ──
                         # The model occasionally emits tool-call SYNTAX
-                        # (<invoke name=...><parameter ...>) as RAW plain text
+                        # (‹invoke name=...>‹parameter ...>) as RAW plain text
                         # instead of a real tool_use block. The SDK hands it over
                         # as a TextBlock. Disposition (XG-directed, 去容灾化):
                         # STRIP the raw leak text (best-effort pollution

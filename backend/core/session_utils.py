@@ -424,12 +424,12 @@ def _is_retriable_error(raw_error: str, tb_str: str = "") -> bool:
 # cases, 2026-06-24) the leak takes the harness's literal call body:
 #
 #     call
-#     <invoke name="Bash">
-#     <parameter name="command">...
+#     ‹invoke name="Bash">
+#     ‹parameter name="command">...
 #
 # DISCRIMINATION — the hard part.  This is a meta-heavy codebase: assistant turns
 # routinely DOCUMENT, review, or self-explain this exact shape.  An early version
-# keyed on a bare ``call`` line + ``<invoke name=`` — but that is *precisely* what
+# keyed on a bare ``call`` line + ``‹invoke name=`` — but that is *precisely* what
 # you type when explaining the bug, so it would wrongfully kill (kill + --resume)
 # any turn that discusses the syntax.  Two structural facts separate a real leak
 # from documentation:
@@ -437,14 +437,14 @@ def _is_retriable_error(raw_error: str, tb_str: str = "") -> bool:
 #   1. Documentation lives in fenced code blocks (``` ... ```) or inline backtick
 #      spans; a REAL leak is RAW text (the model believes it is making a real
 #      call, so it does not fence it).  → strip fences + inline code first.
-#   2. A real leak is the FULL body — ``<invoke name="X">`` immediately followed
-#      by ``<parameter name=`` (or ``</invoke>``).  Keying on the body, NOT the
+#   2. A real leak is the FULL body — ``‹invoke name="X">`` immediately followed
+#      by ``‹parameter name=`` (or ``‹/invoke>``).  Keying on the body, NOT the
 #      optional ``call`` prefix, also catches leaks that omit ``call`` (the 8th
 #      DB case) and is robust to CRLF / casing.
 #
 # A third signal (no real ToolUseBlock in the same message) is checked by the
 # caller (the orchestrator) — if the model DID emit a real tool_use, text that
-# mentions <invoke> is discussion, not a leak.
+# mentions ‹invoke> is discussion, not a leak.
 #
 # The regex has no nested quantifiers (``[^"]+`` is bounded by ``"``; ``\s*`` is
 # bounded by literals) → no catastrophic backtracking.
@@ -468,7 +468,7 @@ def _is_retriable_error(raw_error: str, tb_str: str = "") -> bool:
 # (``.*?`` on the fence branch still crosses newlines via DOTALL; only the inline
 # branch is newline-bounded.)
 _TOOL_CALL_CODE_SPAN_RE = re.compile(r"```.*?```|`[^`\n]*`", re.DOTALL)
-# Case-SENSITIVE on purpose: the harness emits lowercase <invoke>/<parameter>
+# Case-SENSITIVE on purpose: the harness emits lowercase ‹invoke>/‹parameter>
 # literally. Prose discussing it may use other casing; matching only the exact
 # harness casing further narrows the false-positive surface. (\s spans the
 # inter-token whitespace incl. CRLF.)
@@ -478,28 +478,28 @@ _TOOL_CALL_LEAK_RE = re.compile(
 
 # CLEAN anchor (used by strip_tool_call_leak, NOT by the DETECT path). It is
 # deliberately WIDER than _TOOL_CALL_LEAK_RE: a leak that is KILLED mid-stream
-# persists to data.db TRUNCATED — the model got as far as ``<invoke name="Bash">``
-# before the subprocess was SIGKILLed, so there is NO following ``<parameter`` /
-# ``</invoke>`` that _TOOL_CALL_LEAK_RE requires. (Measured on data.db session
-# a0f04b00: 8 persisted leaks, all of the bare ``court\n<invoke name="Bash">``
+# persists to data.db TRUNCATED — the model got as far as ``‹invoke name="Bash">``
+# before the subprocess was SIGKILLed, so there is NO following ``‹parameter`` /
+# ``‹/invoke>`` that _TOOL_CALL_LEAK_RE requires. (Measured on data.db session
+# a0f04b00: 8 persisted leaks, all of the bare ``court\n‹invoke name="Bash">``
 # truncated shape — _TOOL_CALL_LEAK_RE returns False on every one.) The strip
 # step runs on ALREADY-PERSISTED history (resume-context assembly), so it must
 # catch the truncated residue, not only the complete live body. It greedily
-# consumes any complete ``<parameter>...</parameter>`` bodies + a trailing
-# ``</invoke>`` when they ARE present, so a complete leak is removed whole.
+# consumes any complete ``‹parameter>...‹/parameter>`` bodies + a trailing
+# ``‹/invoke>`` when they ARE present, so a complete leak is removed whole.
 #
 # OPENER LINE: in every observed leak the model writes a garbled one-word opener
-# line (``call`` / ``count`` / ``core`` / ``court``) right before ``<invoke``
+# line (``call`` / ``count`` / ``core`` / ``court``) right before ``‹invoke``
 # (CLI transcripts 2026-10-16: 85/85 leaks). That word is part of the leak, not
 # prose, so the optional ``^word\n`` prefix is consumed with it — otherwise the
 # user sees a dangling ``count`` (MULTILINE only affects that ``^``).
 #
 # LINEAR-TIME (ReDoS fix): the strip is NOT one regex. A single regex with a
-# lazy ``.*?</parameter>`` body rescans to the end of the text for every
-# ``<invoke`` whose parameter never closes — quadratic (measured: 120KB of
+# lazy ``.*?‹/parameter>`` body rescans to the end of the text for every
+# ``‹invoke`` whose parameter never closes — quadratic (measured: 120KB of
 # crafted text = 1.4s, 240KB = 5.1s, synchronously on the event loop, freezing
 # every session). ``_find_leak_spans`` matches the same shape with bounded
-# regexes plus ``str.find`` for the body, and remembers when no ``</parameter>``
+# regexes plus ``str.find`` for the body, and remembers when no ``‹/parameter>``
 # remains so a failed body search happens at most once per text.
 _TOOL_CALL_LEAK_HEAD_RE = re.compile(
     r'(?:^[ \t]*[A-Za-z]{2,16}[ \t]*\r?\n[ \t]*)?<invoke\s+name="[^"]*"\s*>',
@@ -514,8 +514,8 @@ def _find_leak_spans(masked: str) -> list[tuple[int, int]]:
     """Return non-overlapping (start, end) spans of raw leaks in ``masked``.
 
     Same shape the old single regex matched: optional one-word opener line,
-    ``<invoke name="X">``, any number of COMPLETE ``<parameter ...>…</parameter>``
-    bodies (lazy: up to the first ``</parameter>``), optional ``</invoke>``.
+    ``‹invoke name="X">``, any number of COMPLETE ``‹parameter ...>…‹/parameter>``
+    bodies (lazy: up to the first ``‹/parameter>``), optional ``‹/invoke>``.
     Runs in O(len(masked)).
     """
     spans: list[tuple[int, int]] = []
@@ -542,7 +542,7 @@ def _find_leak_spans(masked: str) -> list[tuple[int, int]]:
         pos = end
     return spans
 
-# STREAM onset: a raw ``<invoke name="`` at the START of a line, used on the
+# STREAM onset: a raw ``‹invoke name="`` at the START of a line, used on the
 # live text_delta buffer (before the body is complete) to stop forwarding the
 # leak to the UI while it streams. Line-anchored + applied to masked text only.
 _TOOL_CALL_LEAK_ONSET_RE = re.compile(r'^[ \t]*<invoke\s+name="', re.MULTILINE)
@@ -562,7 +562,7 @@ def _mask_doc_contexts(text: str) -> tuple[str, list[str]]:
     consume it, so the fence/inline-strip rule is defined in exactly one place.
 
     The returned spans are restored by substituting ``\\x00<index>\\x00`` back to
-    ``spans[index]`` — so a legitimate in-code reference to ``<invoke ...>`` is
+    ``spans[index]`` — so a legitimate in-code reference to ``‹invoke ...>`` is
     preserved byte-for-byte, while a RAW leak outside any code span is exposed to
     the matcher.
 
@@ -601,8 +601,8 @@ def _restore_doc_contexts(masked: str, spans: list[str]) -> str:
 def detect_tool_call_leak(text: str) -> bool:
     """Return True if ``text`` contains leaked tool-call XML in the text channel.
 
-    Detects the harness tool-call BODY — ``<invoke name="...">`` immediately
-    followed by ``<parameter name=`` or ``</invoke>`` — emitted as RAW assistant
+    Detects the harness tool-call BODY — ``‹invoke name="...">`` immediately
+    followed by ``‹parameter name=`` or ``‹/invoke>`` — emitted as RAW assistant
     text instead of a real tool_use block.
 
     False-positive-safe on documentation: fenced code blocks and inline-backtick
@@ -637,7 +637,7 @@ def strip_tool_call_leak(text: str) -> str:
     legitimate fenced/inline-code references byte-for-byte.
 
     This is the WRITE-side companion to ``detect_tool_call_leak`` (which is a
-    read-only bool). It exists because leaked ``<invoke ...>`` text that reaches
+    read-only bool). It exists because leaked ``‹invoke ...>`` text that reaches
     data.db gets spliced back into a resumed session's system prompt verbatim
     (``context_injector.build_resume_context``), re-inducing the model to leak
     again — a self-reinforcing loop. Cleaning the fragment at the point it enters
@@ -646,20 +646,20 @@ def strip_tool_call_leak(text: str) -> str:
     Two differences from the detector, both deliberate:
 
     1. **Wider anchor.** It uses ``_find_leak_spans`` (linear time), which matches a
-       bare ``<invoke name="X">`` even when the body is TRUNCATED (no following
-       ``<parameter`` / ``</invoke>``) — the shape a mid-stream kill leaves in the
+       bare ``‹invoke name="X">`` even when the body is TRUNCATED (no following
+       ``‹parameter`` / ``‹/invoke>``) — the shape a mid-stream kill leaves in the
        DB. The detector's narrower full-body regex would miss exactly the
        persisted residue this function must clean.
     2. **Per-MATCH, not per-line.** Fenced/inline spans are MASKED first, the leak
        is removed from the raw remainder, then the spans are restored verbatim —
-       so a text block that contains BOTH a legitimate `` `<invoke ...>` `` inline
+       so a text block that contains BOTH a legitimate `` `‹invoke ...>` `` inline
        reference AND a raw leak keeps the reference and drops only the leak. A
        line-granular ``grep -v``-style exclusion would drop the whole line and
        lose the legitimate reference (the per-line false-negative class recorded
        in IMPROVEMENT.md 2026-08-31).
 
     Pure function (str -> str). Idempotent: cleaning already-clean text (or text
-    whose only ``<invoke>`` references are in code spans) returns it unchanged.
+    whose only ``‹invoke>`` references are in code spans) returns it unchanged.
 
     Args:
         text: assistant text that may contain a raw leak fragment.
@@ -697,7 +697,7 @@ def find_stream_leak_onset(buf: str) -> int:
     For the live text_delta path: ``buf`` is the text streamed so far for one
     content block, so the leak body may still be incomplete (the full-body
     ``detect_tool_call_leak`` cannot fire yet). The onset is a line-start
-    ``<invoke name="`` outside code spans; text inside an unclosed ``` fence
+    ``‹invoke name="`` outside code spans; text inside an unclosed ``` fence
     (still streaming) is treated as documentation, never as a leak.
 
     A false positive only hides provisional streamed text: the authoritative

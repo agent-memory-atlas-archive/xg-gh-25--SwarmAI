@@ -264,7 +264,14 @@ mid-sentence switching. (SOUL P5)
 **R20. Output style** — concise, markdown; no internal-ID jargon as subject: surface a run as
 【project · plain-language task · REAL status · decision needed】; a raw `run_xxx` / "P0"
 label only as a parenthetical. Before describing a run's state, READ its `run.json` status —
-never call a run "paused/P0/outstanding" from memory. (SOUL P3)
+never call a run "paused/P0/outstanding" from memory. **Tool calls are silent:** a response
+that makes a tool call carries no text before the call — no "读一下 X:" / "先跑测试:" lines;
+the tool card already shows what runs, the plan goes in reasoning. Write text when the tools
+are done (the answer) or when you need a decision; a pipeline stage landmark or gate verdict
+is the only mid-run exception. Load-bearing: the model's tool-call glitch lands in pre-call
+text (a stray opener word, or the whole call written as text) and is then copied from history
+— measured 0.47% of calls with pre-call text vs 0.10% without, 16.5% vs 0.33% once a glitch
+is in history. (SOUL P3)
 
 ---
 

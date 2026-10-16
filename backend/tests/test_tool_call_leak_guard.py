@@ -3,11 +3,11 @@
 What is tested
 --------------
 1. ``detect_tool_call_leak`` (pure fn) — the double-condition matcher that
-   distinguishes a real leak (``call`` line + line-start ``<invoke name=``) from
+   distinguishes a real leak (``call`` line + line-start ``‹invoke name=``) from
    prose that merely discusses the syntax inline. Table-driven, including the
    exact shapes observed in the messages DB on 2026-06-24.
 2. The StreamingOrchestrator TextBlock guard (去容灾化 contract) — a leaked text
-   block is STRIPPED (raw ``<invoke>`` removed) and KEPT; the turn yields to its
+   block is STRIPPED (raw ``‹invoke>`` removed) and KEPT; the turn yields to its
    natural completion. kill()/respawn was removed — termination authority belongs
    to the model, not a disaster-recovery kill.
 
@@ -29,6 +29,7 @@ Key properties / invariants
 
 from __future__ import annotations
 
+from tests._tool_markup import tc
 import asyncio
 import types
 
@@ -45,43 +46,43 @@ from core.session_utils import (
 
 # ── 1. Pure detector — table-driven ────────────────────────────────────────
 
-# Real leak shapes — RAW <invoke> body in text (the durable harm). Detection
-# keys on the BODY (<invoke name="X"> + <parameter / </invoke>), NOT the optional
+# Real leak shapes — RAW ‹invoke> body in text (the durable harm). Detection
+# keys on the BODY (‹invoke name="X"> + ‹parameter / ‹/invoke>), NOT the optional
 # "call" prefix, so leaks without "call", with CRLF, or appearing late all match.
 LEAK_CASES = [
     # Classic harness shape with a "call" line (DB rowid 204014/203549 shape)
-    'some text\n\ncall\n<invoke name="Bash">\n<parameter name="command">cd /x</parameter>',
+    tc('some text\n\ncall\n‹invoke name="Bash">\n‹parameter name="command">cd /x‹/parameter>'),
     # Skill invocation variant
-    'output:\n\ncall\n<invoke name="Skill">\n<parameter name="skill">foo</parameter>',
+    tc('output:\n\ncall\n‹invoke name="Skill">\n‹parameter name="skill">foo‹/parameter>'),
     # Leak at the very start of the block
-    'call\n<invoke name="Bash">\n<parameter name="command">ls</parameter>',
+    tc('call\n‹invoke name="Bash">\n‹parameter name="command">ls‹/parameter>'),
     # NO "call" prefix at all (the 8th DB case + future variants) — MUST match
-    '<invoke name="Bash">\n<parameter name="command">ls</parameter>',
+    tc('‹invoke name="Bash">\n‹parameter name="command">ls‹/parameter>'),
     # CRLF line endings — must still match
-    'text\r\ncall\r\n<invoke name="Bash">\r\n<parameter name="command">ls</parameter>',
+    tc('text\r\ncall\r\n‹invoke name="Bash">\r\n‹parameter name="command">ls‹/parameter>'),
     # Self-closing / empty invoke body
-    'doing the thing now\n<invoke name="Read"></invoke>',
+    tc('doing the thing now\n‹invoke name="Read">‹/invoke>'),
     # Leak AFTER 4000 chars (no scan-limit truncation) — MUST match
-    "x" * 4100 + '\n<invoke name="Bash">\n<parameter name="command">ls</parameter>',
+    "x" * 4100 + tc('\n‹invoke name="Bash">\n‹parameter name="command">ls‹/parameter>'),
 ]
 
 # Non-leak: prose / documentation discussing the syntax (must NOT trigger).
 NON_LEAK_CASES = [
     # Inline backtick mention (the rowid 204050 shape that must be rejected)
-    '看两张截图,我的回复每次都在 `<invoke name="Bash">` 那一刻停了',
+    tc('看两张截图,我的回复每次都在 `‹invoke name="Bash">` 那一刻停了'),
     # Inline mention mid-sentence, backtick-wrapped
-    'The harness emits `<invoke name="Bash">` as the tool-call format.',
+    tc('The harness emits `‹invoke name="Bash">` as the tool-call format.'),
     # FENCED code block documenting the syntax — the critical false-positive
     # the first design missed. A meta-heavy turn explaining THIS bug.
-    'Example of the leak:\n```\ncall\n<invoke name="Bash">\n<parameter name="command">x</parameter>\n```\nThat is what we guard against.',
+    tc('Example of the leak:\n```\ncall\n‹invoke name="Bash">\n‹parameter name="command">x‹/parameter>\n```\nThat is what we guard against.'),
     # Fenced block WITHOUT a language tag, full body inside
-    '```\n<invoke name="Skill">\n<parameter name="skill">foo</parameter>\n</invoke>\n```',
+    tc('```\n‹invoke name="Skill">\n‹parameter name="skill">foo‹/parameter>\n‹/invoke>\n```'),
     # Self-explanation referencing the shape but backtick-wrapped
-    'My previous reply stopped at `<invoke name="Bash">` — that was a leak.',
-    # The word "call" as its own line but NO <invoke body follows
+    tc('My previous reply stopped at `‹invoke name="Bash">` — that was a leak.'),
+    # The word "call" as its own line but NO ‹invoke body follows
     'call\nthe function and see what happens',
-    # Mentions <invoke but never a real body (no <parameter, no close)
-    'the <invoke tag is interesting to discuss in the abstract',
+    # Mentions ‹invoke but never a real body (no ‹parameter, no close)
+    tc('the ‹invoke tag is interesting to discuss in the abstract'),
     # Different casing — harness emits lowercase only; this is prose, not a leak
     'Prose: <INVOKE name="Bash"><PARAMETER name="command">ls</PARAMETER>',
     # Empty / trivial
@@ -106,9 +107,9 @@ def test_detector_ignores_discussion(text):
 
 def test_detector_handles_large_text_without_truncation():
     """No scan-limit truncation: a leak anywhere in a large block is detected;
-    a huge clean block returns False (and the fast-path '<invoke' check keeps
+    a huge clean block returns False (and the fast-path '‹invoke' check keeps
     it cheap)."""
-    big_leak = "x" * 100_000 + '\n<invoke name="Bash">\n<parameter name="command">ls</parameter>'
+    big_leak = "x" * 100_000 + tc('\n‹invoke name="Bash">\n‹parameter name="command">ls‹/parameter>')
     assert detect_tool_call_leak(big_leak) is True
     big_clean = "z" * 500_000
     assert detect_tool_call_leak(big_clean) is False
@@ -117,31 +118,31 @@ def test_detector_handles_large_text_without_truncation():
 # ── 1b. strip_tool_call_leak — the WRITE-side cleaner ───────────────────────
 #
 # Difference from the detector: it must remove the TRUNCATED residue a mid-stream
-# kill persists (<invoke name="Bash"> with NO following <parameter/</invoke>),
+# kill persists (‹invoke name="Bash"> with NO following ‹parameter/‹/invoke>),
 # AND it must preserve legitimate fenced/inline references byte-for-byte
 # (per-MATCH, not per-line — the IMPROVEMENT.md 2026-08-31 false-negative class).
 
 # Raw leaks the cleaner MUST remove (incl. the truncated persisted shape).
 STRIP_LEAK_CASES = [
     # Truncated persisted shape — the dominant data.db form (kill mid-stream)
-    'court\n<invoke name="Bash">',
-    'ToDo bar 都是红色、一致。\n\ncourt\n<invoke name="Bash">',
-    'court\n<invoke name="Edit">\n\ncourt替换:',
+    tc('court\n‹invoke name="Bash">'),
+    tc('ToDo bar 都是红色、一致。\n\ncourt\n‹invoke name="Bash">'),
+    tc('court\n‹invoke name="Edit">\n\ncourt替换:'),
     # Complete body — removed whole
-    'analysis\ncall\n<invoke name="Bash">\n<parameter name="command">ls</parameter>',
+    tc('analysis\ncall\n‹invoke name="Bash">\n‹parameter name="command">ls‹/parameter>'),
     # Self-closing
-    'doing the thing\n<invoke name="Read"></invoke>',
+    tc('doing the thing\n‹invoke name="Read">‹/invoke>'),
     # Leak at the very start
-    '<invoke name="Bash">\n<parameter name="command">cd /x</parameter>',
+    tc('‹invoke name="Bash">\n‹parameter name="command">cd /x‹/parameter>'),
 ]
 
 # Legitimate references the cleaner MUST preserve byte-for-byte (all in code spans).
 STRIP_PRESERVE_CASES = [
-    '看两张截图,我的回复每次都在 `<invoke name="Bash">` 那一刻停了',
-    'The harness emits `<invoke name="Bash">` as the tool-call format.',
-    'Example:\n```\ncall\n<invoke name="Bash">\n<parameter name="command">x</parameter>\n```\nguarded.',
-    '```\n<invoke name="Skill">\n<parameter name="skill">foo</parameter>\n</invoke>\n```',
-    'My reply stopped at `<invoke name="Bash">` — that was a leak.',
+    tc('看两张截图,我的回复每次都在 `‹invoke name="Bash">` 那一刻停了'),
+    tc('The harness emits `‹invoke name="Bash">` as the tool-call format.'),
+    tc('Example:\n```\ncall\n‹invoke name="Bash">\n‹parameter name="command">x‹/parameter>\n```\nguarded.'),
+    tc('```\n‹invoke name="Skill">\n‹parameter name="skill">foo‹/parameter>\n‹/invoke>\n```'),
+    tc('My reply stopped at `‹invoke name="Bash">` — that was a leak.'),
     'just a normal assistant reply with no tool syntax at all',
     '',
 ]
@@ -150,9 +151,9 @@ STRIP_PRESERVE_CASES = [
 @pytest.mark.parametrize("text", STRIP_LEAK_CASES)
 def test_strip_removes_raw_leak(text):
     """A raw leak fragment (incl. the truncated persisted shape) is removed, and
-    the result no longer contains a <invoke name= body outside code spans."""
+    the result no longer contains a ‹invoke name= body outside code spans."""
     cleaned = strip_tool_call_leak(text)
-    assert "<invoke name=" not in cleaned
+    assert tc("‹invoke name=") not in cleaned
     assert cleaned != text  # something was actually stripped
 
 
@@ -168,26 +169,26 @@ def test_strip_per_match_not_per_line():
     reference AND a raw leak keeps the reference and strips ONLY the raw leak. A
     per-line grep -v exclusion would drop the whole line and lose the reference
     (IMPROVEMENT.md 2026-08-31 run_de417612)."""
-    text = 'As I said `<invoke name="Bash">` is the format.\n\ncourt\n<invoke name="Edit">\n\ncourt done'
+    text = tc('As I said `‹invoke name="Bash">` is the format.\n\ncourt\n‹invoke name="Edit">\n\ncourt done')
     cleaned = strip_tool_call_leak(text)
     # legit inline reference preserved
-    assert '`<invoke name="Bash">`' in cleaned
+    assert tc('`‹invoke name="Bash">`') in cleaned
     # raw leak removed
-    assert '<invoke name="Edit">' not in cleaned
+    assert tc('‹invoke name="Edit">') not in cleaned
 
 
 def test_strip_is_idempotent():
     """Cleaning already-clean text (or already-cleaned text) is a no-op."""
-    once = strip_tool_call_leak('court\n<invoke name="Bash">\n\ntext')
+    once = strip_tool_call_leak(tc('court\n‹invoke name="Bash">\n\ntext'))
     assert strip_tool_call_leak(once) == once
 
 
 def test_strip_against_real_corpus():
     """Ground-truth double-direction: against the real data.db corpus, every
-    robust-RAW sample has its <invoke body removed, every robust-FENCED sample is
+    robust-RAW sample has its ‹invoke body removed, every robust-FENCED sample is
     preserved byte-for-byte (0 false-strip, 0 miss). The corpus 'label' field is
     NOT trusted — it is re-derived here with the robust predicate (restore \\n
-    escaping, mask code spans, then a residual bare <invoke => RAW)."""
+    escaping, mask code spans, then a residual bare ‹invoke => RAW)."""
     corpus_path = Path(
         "/Users/gawan/.swarm-ai/SwarmWS/Projects/SwarmAI/.artifacts/"
         "leak-feedback-corpus/corpus.json"
@@ -201,20 +202,20 @@ def test_strip_against_real_corpus():
     _inline = _re.compile(r"`[^`]*`")
 
     def robust_is_raw(text: str) -> bool:
-        if not text or "<invoke" not in text:
+        if not text or tc("‹invoke") not in text:
             return False
         norm = text.replace("\\n", "\n").replace("\\t", "\t")
         residual = _inline.sub("", _fence.sub("", norm))
-        return "<invoke" in residual
+        return tc("‹invoke") in residual
 
     raw_total = raw_cleaned = fenced_total = fenced_preserved = 0
     for row in rows:
         text = row.get("text", "")
-        if "<invoke" not in text:
+        if tc("‹invoke") not in text:
             continue
         if robust_is_raw(text):
             raw_total += 1
-            if "<invoke name=" not in strip_tool_call_leak(text):
+            if tc("‹invoke name=") not in strip_tool_call_leak(text):
                 raw_cleaned += 1
         else:
             fenced_total += 1
@@ -245,8 +246,8 @@ def test_strip_lossless_on_backtick_fence_and_leak():
     form → this test goes RED (code block dropped + \\x00 residue)."""
     code_body = "important_code = 1"
     text = (
-        "Don`t panic here is a raw leak <invoke name=\"Bash\"> and a block\n"
-        "```python\n" + code_body + "\n```\n"
+        tc("Don`t panic here is a raw leak ‹invoke name=\"Bash\"> and a block\n"
+        "```python\n") + code_body + "\n```\n"
         "then that`s it"
     )
     out = strip_tool_call_leak(text)
@@ -256,22 +257,22 @@ def test_strip_lossless_on_backtick_fence_and_leak():
     # No NUL sentinel may leak into the output.
     assert "\x00" not in out, f"NUL residue in output: {out!r}"
     # The raw leak IS removed (chokepoint still cleans).
-    assert '<invoke name="Bash">' not in out, f"leak not stripped: {out!r}"
+    assert tc('‹invoke name="Bash">') not in out, f"leak not stripped: {out!r}"
 
 
 def test_strip_lossless_preserves_many_inline_and_fence_spans():
     """Reinforce 2a: multiple inline-code spans with odd backtick counts around
     a fence must all round-trip. Mutation proof: two-pass mask → RED."""
     text = (
-        "Use `a` and `b` and a stray ` tick, then\n"
+        tc("Use `a` and `b` and a stray ` tick, then\n"
         "```js\nconst x = `template`;\n```\n"
-        "and `c` after. Leak: <invoke name=\"X\">"
+        "and `c` after. Leak: ‹invoke name=\"X\">")
     )
     out = strip_tool_call_leak(text)
     assert "\x00" not in out
     assert "const x = `template`;" in out, f"fenced template lost: {out!r}"
     assert "`a`" in out and "`b`" in out and "`c`" in out
-    assert '<invoke name="X">' not in out
+    assert tc('‹invoke name="X">') not in out
 
 
 def test_mask_doc_contexts_round_trips_lone_backtick_with_fence():
@@ -300,12 +301,12 @@ def test_persist_strip_returns_cleaned_blocks_no_fork():
     from core.session_router import _clean_blocks_for_persist
 
     blocks = [
-        {"type": "text", "text": "hi <invoke name=\"Bash\"> leak"},
+        {"type": "text", "text": tc("hi ‹invoke name=\"Bash\"> leak")},
         {"type": "text", "text": "clean line"},
     ]
     cleaned = _clean_blocks_for_persist(blocks)
     # cleaned is a NEW list with the leak removed from the first block.
-    assert '<invoke name="Bash">' not in cleaned[0]["text"], cleaned
+    assert tc('‹invoke name="Bash">') not in cleaned[0]["text"], cleaned
     assert cleaned[1]["text"] == "clean line"
     # The SAME cleaned list is what both persist and yield must use — the caller
     # writes it back to event['content']. Verify it is a usable blocks list.
@@ -370,7 +371,7 @@ def test_persist_bytes_equal_yield_bytes_e2e():
     event = {
         "type": "assistant",
         "content": [
-            {"type": "text", "text": "answer <invoke name=\"Bash\"> leaked here"},
+            {"type": "text", "text": tc("answer ‹invoke name=\"Bash\"> leaked here")},
             {"type": "text", "text": "and a clean trailing line"},
         ],
     }
@@ -387,14 +388,14 @@ def test_persist_bytes_equal_yield_bytes_e2e():
 
     # DB actually received cleaned content (leak gone).
     assert captured.get("content") is not None, "db.put was never called"
-    assert '<invoke name="Bash">' not in captured["content"][0]["text"]
+    assert tc('‹invoke name="Bash">') not in captured["content"][0]["text"]
     # THE SEAM: what the UI gets (yielded event["content"]) == what the DB got.
     # Catches both (a) bool-return reversion and (b) a deleted write-back.
     assert event["content"] == captured["content"], (
         "yielded event['content'] != persisted DB content — the 2d fork is back"
     )
     assert isinstance(event["content"], list), "event['content'] must stay a blocks list"
-    assert '<invoke name="Bash">' not in event["content"][0]["text"]
+    assert tc('‹invoke name="Bash">') not in event["content"][0]["text"]
 
 
 # ── 2. Orchestrator guard (integration) ─────────────────────────────────────
@@ -566,7 +567,7 @@ def test_orchestrator_strips_pure_leak_and_keeps_turn():
     and_kills (which asserted the removed kill()+raise disaster-recovery)."""
     orch = _make_orchestrator()
     orch._parent._streaming_start_time = 0.0
-    leak = 'analysis text\n\ncall\n<invoke name="Bash">\n<parameter name="command">cd /x</parameter>'
+    leak = tc('analysis text\n\ncall\n‹invoke name="Bash">\n‹parameter name="command">cd /x‹/parameter>')
     msg = _make_assistant_message(leak)
 
     # A trailing ResultMessage so the turn ends via the normal result path —
@@ -593,17 +594,17 @@ def test_orchestrator_strips_pure_leak_and_keeps_turn():
     assert "analysis text" in joined
     # No residue of the failed call reaches the user: no XML, no placeholder,
     # no dangling opener word.
-    assert "<invoke name=" not in joined
+    assert tc("‹invoke name=") not in joined
     assert "[tool-call omitted]" not in joined
     assert "call" not in joined.replace("analysis text", "")
 
 
 def test_orchestrator_passes_clean_text_block():
-    """A normal text block (even one mentioning <invoke name= inline) is
+    """A normal text block (even one mentioning ‹invoke name= inline) is
     yielded as assistant content and does NOT kill the session."""
     orch = _make_orchestrator()
     orch._parent._streaming_start_time = 0.0
-    clean = "The harness emits <invoke name=\"Bash\"> as the tool-call format inline."
+    clean = tc("The harness emits ‹invoke name=\"Bash\"> as the tool-call format inline.")
     msg = _make_assistant_message(clean)
 
     # Include a trailing ResultMessage so the turn ends via the normal result
@@ -623,7 +624,7 @@ def test_orchestrator_passes_clean_text_block():
 def test_orchestrator_does_not_fire_when_real_tool_use_present():
     """Third signal: if the message ALSO contains a real ToolUseBlock, the turn
     is legitimate (the model DID invoke a tool) — the guard must NOT kill. But
-    the leak-feedback fix (run_da39669c) additionally requires the raw <invoke>
+    the leak-feedback fix (run_da39669c) additionally requires the raw ‹invoke>
     text be STRIPPED from the persisted content, so it cannot re-seed the loop on
     resume (the mixed-message gap, data.db session a0f04b00)."""
     from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock
@@ -631,7 +632,7 @@ def test_orchestrator_does_not_fire_when_real_tool_use_present():
     orch = _make_orchestrator()
     orch._parent._streaming_start_time = 0.0
     # Text that WOULD match the body matcher on its own ...
-    text_with_body = 'Here is what I ran:\n<invoke name="Bash">\n<parameter name="command">ls</parameter>'
+    text_with_body = tc('Here is what I ran:\n‹invoke name="Bash">\n‹parameter name="command">ls‹/parameter>')
     msg = AssistantMessage(
         content=[
             TextBlock(text=text_with_body),
@@ -651,18 +652,18 @@ def test_orchestrator_does_not_fire_when_real_tool_use_present():
     for ev in events:
         if ev.get("type") == "assistant":
             for block in ev.get("content", []):
-                assert "<invoke name=" not in block.get("text", "")
+                assert tc("‹invoke name=") not in block.get("text", "")
 
 
 def test_orchestrator_strips_leak_but_keeps_prose_in_mixed_message():
     """The mixed-message strip is per-MATCH: legitimate text around the leak is
-    preserved while only the raw <invoke> body is removed — the turn's real
+    preserved while only the raw ‹invoke> body is removed — the turn's real
     content survives, the leak does not."""
     from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock
 
     orch = _make_orchestrator()
     orch._parent._streaming_start_time = 0.0
-    mixed = 'Rendering now.\n<invoke name="Edit">\n<parameter name="x">y</parameter>'
+    mixed = tc('Rendering now.\n‹invoke name="Edit">\n‹parameter name="x">y‹/parameter>')
     msg = AssistantMessage(
         content=[
             TextBlock(text=mixed),
@@ -684,7 +685,7 @@ def test_orchestrator_strips_leak_but_keeps_prose_in_mixed_message():
     ]
     joined = "\n".join(asst_texts)
     assert "Rendering now." in joined
-    assert "<invoke name=" not in joined
+    assert tc("‹invoke name=") not in joined
 
 
 # ── 3b. leak dead-end → in-process continuation ────────────────────────────
@@ -694,8 +695,8 @@ def test_orchestrator_strips_leak_but_keeps_prose_in_mixed_message():
 # sees exactly one `result`, after the recovered action.
 
 _DEADEND_LEAK = (
-    "跑测试(GREEN 验证)。\n\ncount\n<invoke name=\"Bash\">\n"
-    "<parameter name=\"command\">ls</parameter>\n</invoke>"
+    tc("跑测试(GREEN 验证)。\n\ncount\n‹invoke name=\"Bash\">\n"
+    "‹parameter name=\"command\">ls‹/parameter>\n‹/invoke>")
 )
 
 
@@ -715,7 +716,7 @@ def test_leak_deadend_continues_in_process_once():
     assert raised is None
     assert orch._parent._kill_calls["n"] == 0, "continuation must not kill"
     assert client.queries == [orch._LEAK_CONTINUATION_PROMPT]
-    assert "<invoke" not in orch._LEAK_CONTINUATION_PROMPT  # no priming markup
+    assert tc("‹invoke") not in orch._LEAK_CONTINUATION_PROMPT  # no priming markup
     # The dead-end round's `result` is swallowed; only the final one reaches the UI.
     assert len(_results(events)) == 1
     assert any(ev.get("type") == "tool_use" for ev in events) or any(
@@ -813,7 +814,7 @@ def test_live_deltas_hide_leak_from_onset():
     orch = _make_orchestrator()
     orch._parent._streaming_start_time = 0.0
     chunks = ["跑测试。\n\ncount\n<inv", 'oke name="Bash">\n<param',
-              'eter name="command">ls</parameter>']
+              tc('eter name="command">ls‹/parameter>')]
     msgs = [_text_delta(c) for c in chunks]
     msgs += [_make_assistant_message("跑测试。\n\n" + "count\n" + chunks[0][-4:]
                                      + "".join(chunks[1:])),
@@ -823,14 +824,14 @@ def test_live_deltas_hide_leak_from_onset():
     ))
     assert raised is None
     streamed = "".join(ev["text"] for ev in events if ev.get("type") == "text_delta")
-    assert "<invoke" not in streamed and "<param" not in streamed
+    assert tc("‹invoke") not in streamed and "<param" not in streamed
     assert streamed.startswith("跑测试。")
 
 
 def test_live_deltas_keep_fenced_examples():
     orch = _make_orchestrator()
     orch._parent._streaming_start_time = 0.0
-    text = 'Example:\n```\n<invoke name="Bash">\n<parameter name="command">x</parameter>\n```\n'
+    text = tc('Example:\n```\n‹invoke name="Bash">\n‹parameter name="command">x‹/parameter>\n```\n')
     events, raised = asyncio.run(_drive(orch, [
         _text_delta(text[:20]), _text_delta(text[20:]),
         _make_assistant_message(text), _make_result_message(),
@@ -841,11 +842,11 @@ def test_live_deltas_keep_fenced_examples():
 
 
 @pytest.mark.parametrize("buf,expected", [
-    ("hello\n\ncount\n<invoke name=\"Ba", 13),
-    ("ab\n<invoke name=\"", 3),
-    ("```\n<invoke name=\"X\"", -1),          # inside an open fence
-    ("```\nx\n```\n<invoke name=\"X\"", 10),  # after a closed fence
-    ("x `<invoke name=\"a\"` y", -1),          # inline code
+    (tc("hello\n\ncount\n‹invoke name=\"Ba"), 13),
+    (tc("ab\n‹invoke name=\""), 3),
+    (tc("```\n‹invoke name=\"X\""), -1),          # inside an open fence
+    (tc("```\nx\n```\n‹invoke name=\"X\""), 10),  # after a closed fence
+    (tc("x `‹invoke name=\"a\"` y"), -1),          # inline code
     ("no tags at all", -1),
 ])
 def test_find_stream_leak_onset(buf, expected):
@@ -860,7 +861,7 @@ def test_strip_removes_opener_word_and_leaves_no_placeholder():
 
 
 # ── 4. user-side persist strip (run_67250d95) ──────────────────────────────
-# The ONLY path a RAW <invoke> body persists to data.db is a USER message:
+# The ONLY path a RAW ‹invoke> body persists to data.db is a USER message:
 # assistant-persist funnels through _clean_blocks_for_persist, but user-persist
 # did not. Two user-content write doors (R27 + Gate-1): session_router's
 # db.messages.put (production) and session_pending._payload_json (the raw-INSERT
@@ -871,8 +872,8 @@ def _decode_payload_text(payload: str) -> str:
     """Reconstruct the human-readable text from a _payload_json result.
 
     MUST decode (not substring-match the raw JSON): dumps_json escapes `"` →
-    `\\"`, so a raw `<invoke name="Bash">` in the text serializes to
-    `<invoke name=\\"Bash\\">` and a naive `'<invoke name="Bash">' in payload`
+    `\\"`, so a raw `‹invoke name="Bash">` in the text serializes to
+    `‹invoke name=\\"Bash\\">` and a naive `'‹invoke name="Bash">' in payload`
     is ALWAYS False — a vacuous assertion that passes with OR without the strip
     (RP47 theater, caught at BUILD). Decoding back to the real text restores the
     bytes detect_tool_call_leak actually judges."""
@@ -883,34 +884,34 @@ def _decode_payload_text(payload: str) -> str:
 
 def test_payload_json_strips_user_message_leak():
     """session_pending._payload_json (the 2nd write door, raw INSERT) must strip
-    a raw <invoke> body from a user_message. Mutation proof: without the strip,
-    the DECODED payload text contains the raw <invoke> → detect fires → RED."""
+    a raw ‹invoke> body from a user_message. Mutation proof: without the strip,
+    the DECODED payload text contains the raw ‹invoke> → detect fires → RED."""
     from core.session_pending import _payload_json
-    leak = 'why does this keep happening \'core\n<invoke name="Bash">\n<parameter name="command">ls</parameter>'
+    leak = tc('why does this keep happening \'core\n‹invoke name="Bash">\n‹parameter name="command">ls‹/parameter>')
     text = _decode_payload_text(_payload_json(leak, None))
-    assert '<invoke name="Bash">' not in text, text
+    assert tc('‹invoke name="Bash">') not in text, text
     assert detect_tool_call_leak(text) is False, text
 
 
 def test_payload_json_strips_user_content_leak():
-    """Same door, content (multimodal) path: a raw <invoke> body in a content
+    """Same door, content (multimodal) path: a raw ‹invoke> body in a content
     block must be stripped (judged on the DECODED text, not the escaped JSON)."""
     from core.session_pending import _payload_json
-    content = [{"type": "text", "text": 'look:\n<invoke name="Bash">\n<parameter name="command">rm</parameter>'}]
+    content = [{"type": "text", "text": tc('look:\n‹invoke name="Bash">\n‹parameter name="command">rm‹/parameter>')}]
     text = _decode_payload_text(_payload_json(None, content))
-    assert '<invoke name="Bash">' not in text, text
+    assert tc('‹invoke name="Bash">') not in text, text
     assert detect_tool_call_leak(text) is False, text
 
 
 def test_payload_json_preserves_clean_and_fenced():
-    """No over-reach: clean text + a fenced <invoke discussion survive intact."""
+    """No over-reach: clean text + a fenced ‹invoke discussion survive intact."""
     from core.session_pending import _payload_json
     # clean
     assert "hello world" in _decode_payload_text(_payload_json("hello world", None))
     # fenced discussion must be preserved (strip only removes RAW leaks)
-    fenced = 'the leak looks like ```\n<invoke name="Bash">\n```'
+    fenced = tc('the leak looks like ```\n‹invoke name="Bash">\n```')
     text = _decode_payload_text(_payload_json(fenced, None))
-    assert "<invoke" in text, "fenced discussion wrongly stripped: " + text
+    assert tc("‹invoke") in text, "fenced discussion wrongly stripped: " + text
 
 
 def test_session_router_user_persist_calls_clean():
@@ -934,16 +935,16 @@ def test_session_router_user_persist_calls_clean():
 
 
 # ── ReDoS: strip must be linear-time ───────────────────────────────────────
-# The old single-regex strip rescanned to end-of-text for every <invoke whose
-# <parameter> never closed: 240KB of crafted text took 5.1s synchronously on
+# The old single-regex strip rescanned to end-of-text for every ‹invoke whose
+# ‹parameter> never closed: 240KB of crafted text took 5.1s synchronously on
 # the event loop (every session frozen). Reachable from any user message
 # (session_pending strips user text) and from model output.
 
 @pytest.mark.parametrize("crafted", [
-    '<invoke name="A"><parameter name="x">a ' * 25_000,   # ~1MB, unclosed bodies
-    '<invoke name="' * 60_000,                             # unclosed quotes
+    tc('‹invoke name="A">‹parameter name="x">a ') * 25_000,   # ~1MB, unclosed bodies
+    tc('‹invoke name="') * 60_000,                             # unclosed quotes
     'count\n' * 100_000,                                   # opener-like lines
-    '<invoke name="A">' + ' ' * 500_000,                   # long whitespace run
+    tc('‹invoke name="A">') + ' ' * 500_000,                   # long whitespace run
 ])
 def test_strip_is_linear_on_crafted_input(crafted):
     import time
@@ -956,13 +957,13 @@ def test_strip_is_linear_on_crafted_input(crafted):
 @pytest.mark.parametrize("text,expected", [
     # A leak's trailing whitespace runs into the next line's opener word:
     # scanning resumes at the previous leak's end, like re.subn.
-    ('x中文<invoke name="X">\n  text \n<invoke name="Bash">', 'x中文text \n'),
-    ('count\n<invoke name="Bash">    \r\n  count\n<invoke name="Bash"></invoke></invoke>  ',
-     'count\n</invoke>  '),
+    (tc('x中文‹invoke name="X">\n  text \n‹invoke name="Bash">'), 'x中文text \n'),
+    (tc('count\n‹invoke name="Bash">    \r\n  count\n‹invoke name="Bash">‹/invoke>‹/invoke>  '),
+     tc('count\n‹/invoke>  ')),
     # complete body, then an unclosed one: first removed whole, second head-only
-    ('a\n<invoke name="B">\n<parameter name="c">ls</parameter>\n</invoke>\n'
-     'b\n<invoke name="C">\n<parameter name="d">never closed',
-     'a\n\nb\n<parameter name="d">never closed'),
+    (tc('a\n‹invoke name="B">\n‹parameter name="c">ls‹/parameter>\n‹/invoke>\n'
+     'b\n‹invoke name="C">\n‹parameter name="d">never closed'),
+     tc('a\n\nb\n‹parameter name="d">never closed')),
 ])
 def test_strip_matches_previous_regex_semantics(text, expected):
     assert strip_tool_call_leak(text) == expected

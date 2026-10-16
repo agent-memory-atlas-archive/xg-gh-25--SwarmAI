@@ -12,9 +12,9 @@
       "status": "confirmed",
       "acceptance": [
         {
-          "given": "assistant content blocks 含 court\\n<invoke name=Bash> 裸 leak",
+          "given": "assistant content blocks 含 court\\n‹invoke name=Bash> 裸 leak",
           "when": "_persist_assistant_blocks 落库",
-          "then": "写入 data.db 的 content 不含 raw <invoke,合法 fenced 引用保留"
+          "then": "写入 data.db 的 content 不含 raw ‹invoke,合法 fenced 引用保留"
         }
       ]
     },
@@ -43,11 +43,11 @@
       "options": [
         "A. 全局清 court",
         "B. 只在 leak 上下文锚定清",
-        "C. 不清,仅清 <invoke> body"
+        "C. 不清,仅清 ‹invoke> body"
       ],
-      "answer": "C. 不清,仅清 <invoke> body",
+      "answer": "C. 不清,仅清 ‹invoke> body",
       "answered_by": "self",
-      "resolution": "全库 347 条正常 assistant 消息含 court(英文词+同类残骸),全局清高误伤;persist 是 write-once 不可逆;research 实测 court 诱导性远弱于 <invoke>。本 run 只清承重的 <invoke> body(8/8 验证),court 低价值高风险不做。"
+      "resolution": "全库 347 条正常 assistant 消息含 court(英文词+同类残骸),全局清高误伤;persist 是 write-once 不可逆;research 实测 court 诱导性远弱于 ‹invoke>。本 run 只清承重的 ‹invoke> body(8/8 验证),court 低价值高风险不做。"
     },
     {
       "qid": "Q2",

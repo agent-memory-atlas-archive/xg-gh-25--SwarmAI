@@ -2024,7 +2024,7 @@ class SessionRouter:
             return blocks
         from database import db
         # Persist-side tool-call-leak clean (run_2bdec5c0; re-homed run_719886ee):
-        # strip raw <invoke> leak from each text block BEFORE it reaches data.db,
+        # strip raw ‹invoke> leak from each text block BEFORE it reaches data.db,
         # so a persisted leak can never be spliced back into a resumed prompt by
         # ANY downstream content→model-prompt reader. This is the write-side SINGLE
         # chokepoint — all 3 call sites funnel through here (TECH.md "move the
@@ -2039,7 +2039,7 @@ class SessionRouter:
         # them. It also catches a case the orchestrator structurally misses: the
         # streaming_orchestrator TextBlock guard gates its strip/kill on
         # detect_tool_call_leak(), which returns FALSE on the TRUNCATED pure-leak
-        # form (`court\n<invoke name="Bash">` with no <parameter after, the a0f04b00
+        # form (`court\n‹invoke name="Bash">` with no ‹parameter after, the a0f04b00
         # shape) → that raw text flows through to here. context_injector cleans the
         # resume READ path (incl. old pre-fix rows) as defense-in-depth.
         #
@@ -3310,7 +3310,7 @@ class SessionRouter:
                 persisted_msg_id = str(uuid4())
                 # Strip raw tool-call leaks before persisting — symmetric with the
                 # assistant path (_clean_blocks_for_persist at the assistant put).
-                # The ONLY way a raw <invoke> body reaches data.db is a USER message
+                # The ONLY way a raw ‹invoke> body reaches data.db is a USER message
                 # (a user re-feeding a prior turn's on-screen leak remnant); without
                 # this, resume splices it back into the prompt and re-induces the
                 # leak. Lossless on clean text; fenced/inline discussion preserved.

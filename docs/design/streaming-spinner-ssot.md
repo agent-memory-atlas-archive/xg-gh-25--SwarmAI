@@ -361,13 +361,13 @@ store 从未绑 sessionId → 无 DB 恢复路径。**初判与 OT01 不同根**
 
 **`tool_call_leak_detected`（独立 bug，与 OT01 同病：检测-对抗 vs 无害化）**
 
-现象：模型（Opus，原生 tool-use 模式）偶尔把 tool-call 当**纯 XML 文本**吐出（`<invoke name="...">`），
+现象：模型（Opus，原生 tool-use 模式）偶尔把 tool-call 当**纯 XML 文本**吐出（`‹invoke name="...">`），
 SDK 当 `TextBlock` 交回；`streaming_orchestrator.py:669` 正则检测 → 丢块 → `force_kill_tree` + 裸 `--resume`
 重试。低频（今日 2 次，均在 f790f427），但**与 OT01 因果相连**：每次 leak→kill→resume 都给前端顶一格 gen、
 喂进 §2.5 的 recycle 风暴。
 
 **根因诊断（已核实，非缓解）**：
-- 触发 = **上下文语法污染**。全仓库仅 4 个文件含字面 `<invoke name=`，全是 meta（检测器 `streaming_orchestrator.py`/
+- 触发 = **上下文语法污染**。全仓库仅 4 个文件含字面 `‹invoke name=`，全是 meta（检测器 `streaming_orchestrator.py`/
   `session_utils.py`、其测试、`s_autonomous-pipeline/REVIEW_PATTERNS.md` 的 RP42 举例）。泄漏发生在 pipeline 跑
   OT01 的 turn——上下文同时塞着这些文件 → 模型被字面语法 priming → 把它当文本复现。**这些都不是「教文本协议」的指令，是
   incidental 举例。**
@@ -378,7 +378,7 @@ SDK 当 `TextBlock` 交回；`streaming_orchestrator.py:669` 正则检测 → �
 （概率模型 + meta 仓库必然把该语法读进上下文）。可结构性避免的是**伤害**，伤害是自找的。两条不变量让伤害**按构造消失**：
 
 - **INV-L1（接住意图，别丢弃）**：文本通道里的 tool-call 仍是一个 tool 意图。正确响应是用与检测器**同一套正交门控**
-  （strip fenced/inline-code + 要求消息内无真实 `ToolUseBlock`）把 `<invoke>` 解析为 tool_use 并执行/续跑——而不是
+  （strip fenced/inline-code + 要求消息内无真实 `ToolUseBlock`）把 `‹invoke>` 解析为 tool_use 并执行/续跑——而不是
   丢块 + 整条 recycle。「丢一个有效意图再重生」是系统强加的伤害。若精度上不敢执行（meta turn 讨论语法的误执行风险），
   退一步也必须是**同上下文就地纠正**（注入「请用工具通道重发」并续跑），**绝不 kill+recycle**。
 - **INV-L2（重试必改输入）**：由上下文确定性致因导致的失败，重试时**必须改变输入**（去掉致因 priming / 加纠正约束），

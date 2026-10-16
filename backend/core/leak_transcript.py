@@ -1,6 +1,6 @@
 """Remove tool-call leak text from a Claude CLI session transcript.
 
-A "leak" is the model writing its tool call as text (``count\\n<invoke ...>``)
+A "leak" is the model writing its tool call as text (``count\\n‹invoke ...>``)
 instead of a real tool_use. The CLI keeps that text in its own session
 transcript, and ``--resume`` replays it to the model on every later turn, which
 primes more leaks (observed: 6-8 leaks per session within 20 minutes). Cleaning
@@ -11,7 +11,7 @@ Public symbols:
 - ``clean_transcript_leaks(path)``    — strip leak text from assistant text
   blocks in place (atomic replace); returns the number of blocks changed.
 
-Only ASSISTANT text blocks whose text starts a line with a raw ``<invoke``
+Only ASSISTANT text blocks whose text starts a line with a raw ``‹invoke``
 outside code spans are touched (the same signal the live stream uses); prose
 that discusses the syntax, tool results, and user messages are left alone.
 """

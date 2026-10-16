@@ -4,7 +4,7 @@
 **Date:** 2026-10-13 | **Status:** PUSH-READY
 
 ## TL;DR
-Raw tool-call leak (`<invoke name=...>` the model emits as prose) is now stripped from every
+Raw tool-call leak (`‹invoke name=...>` the model emits as prose) is now stripped from every
 assistant text block at the single DB write chokepoint (`_persist_assistant_blocks`), BEFORE it
 reaches data.db — closing the one leak form the streaming orchestrator misses (the detect-False
 truncated shape) and the session_recall read-path's re-induction door that the resume-side cleaner

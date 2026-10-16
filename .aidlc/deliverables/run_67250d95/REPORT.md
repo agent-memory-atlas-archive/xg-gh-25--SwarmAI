@@ -8,20 +8,20 @@
 user-side 消息入库零 leak-strip:根因已 verified——assistant 持久化走 _clean_blocks_for_persist(session_router.py:1887)过 strip_tool_call_leak,但 user message 持久化(session_router.py:3014 db.messages.put role=user)直接写入
 
 ## 1. Requirement
-user-side 消息入库零 leak-strip:根因已 verified——assistant 持久化走 _clean_blocks_for_persist(session_router.py:1887)过 strip_tool_call_leak,但 user message 持久化(session_router.py:3014 db.messages.put role=user)直接写入、不过任何清洗。后果实证:全库仅 2 条 raw-leak 残留(data.db,detect_tool_call_leak=True),两条 role 全是 user——用户把上一轮模型 leak 流式显示在屏幕上的裸 <invoke><parameter> body 连同自己的问话一起回灌(样本:ceeb87b7 user msg = '为什么老出这种错误 '+裸invoke body'),user_content 无 strip 直接入库 → resume 时经 context_injector 带回 system prompt → 可能再诱导 leak。模型自己吐的 raw-leak 零条进库(PURE-LEAK 已 kill+drop)。修复:user_content 持久化前过 _clean_blocks_for_persist(与 assistant 路径对称),切断唯一的 raw-leak 进库路径。承重前提 verified:_clean_blocks_for_persist 仅在 1887 assistant 路径调用、3014 user 路径裸 put;strip 对 clean text 无损(run_719886ee)。NON-GOAL(本 run 不做):前端 kill 时撤回已 text_delta 显示的 leak partial(热路径 OT01 家族,独立评估)。
+user-side 消息入库零 leak-strip:根因已 verified——assistant 持久化走 _clean_blocks_for_persist(session_router.py:1887)过 strip_tool_call_leak,但 user message 持久化(session_router.py:3014 db.messages.put role=user)直接写入、不过任何清洗。后果实证:全库仅 2 条 raw-leak 残留(data.db,detect_tool_call_leak=True),两条 role 全是 user——用户把上一轮模型 leak 流式显示在屏幕上的裸 ‹invoke>‹parameter> body 连同自己的问话一起回灌(样本:ceeb87b7 user msg = '为什么老出这种错误 '+裸invoke body'),user_content 无 strip 直接入库 → resume 时经 context_injector 带回 system prompt → 可能再诱导 leak。模型自己吐的 raw-leak 零条进库(PURE-LEAK 已 kill+drop)。修复:user_content 持久化前过 _clean_blocks_for_persist(与 assistant 路径对称),切断唯一的 raw-leak 进库路径。承重前提 verified:_clean_blocks_for_persist 仅在 1887 assistant 路径调用、3014 user 路径裸 put;strip 对 clean text 无损(run_719886ee)。NON-GOAL(本 run 不做):前端 kill 时撤回已 text_delta 显示的 leak partial(热路径 OT01 家族,独立评估)。
 
 ## 需求溯源审计 (Requirement Provenance Audit)
 
 ### 原始意图 (Original Intent)
-> user-side 消息入库零 leak-strip:根因已 verified——assistant 持久化走 _clean_blocks_for_persist(session_router.py:1887)过 strip_tool_call_leak,但 user message 持久化(session_router.py:3014 db.messages.put role=user)直接写入、不过任何清洗。后果实证:全库仅 2 条 raw-leak 残留(data.db,detect_tool_call_leak=True),两条 role 全是 user——用户把上一轮模型 leak 流式显示在屏幕上的裸 <invoke><parameter> body 连同自己的问话一起回灌(样本:ceeb87b7 user msg = '为什么老出这种错误 '+裸invoke body'),user_content 无 strip 直接入库 → resume 时经 context_injector 带回 system prompt → 可能再诱导 leak。模型自己吐的 raw-leak 零条进库(PURE-LEAK 已 kill+drop)。修复:user_content 持久化前过 _clean_blocks_for_persist(与 assistant 路径对称),切断唯一的 raw-leak 进库路径。承重前提 verified:_clean_blocks_for_persist 仅在 1887 assistant 路径调用、3014 user 路径裸 put;strip 对 clean text 无损(run_719886ee)。NON-GOAL(本 run 不做):前端 kill 时撤回已 text_delta 显示的 leak partial(热路径 OT01 家族,独立评估)。
+> user-side 消息入库零 leak-strip:根因已 verified——assistant 持久化走 _clean_blocks_for_persist(session_router.py:1887)过 strip_tool_call_leak,但 user message 持久化(session_router.py:3014 db.messages.put role=user)直接写入、不过任何清洗。后果实证:全库仅 2 条 raw-leak 残留(data.db,detect_tool_call_leak=True),两条 role 全是 user——用户把上一轮模型 leak 流式显示在屏幕上的裸 ‹invoke>‹parameter> body 连同自己的问话一起回灌(样本:ceeb87b7 user msg = '为什么老出这种错误 '+裸invoke body'),user_content 无 strip 直接入库 → resume 时经 context_injector 带回 system prompt → 可能再诱导 leak。模型自己吐的 raw-leak 零条进库(PURE-LEAK 已 kill+drop)。修复:user_content 持久化前过 _clean_blocks_for_persist(与 assistant 路径对称),切断唯一的 raw-leak 进库路径。承重前提 verified:_clean_blocks_for_persist 仅在 1887 assistant 路径调用、3014 user 路径裸 put;strip 对 clean text 无损(run_719886ee)。NON-GOAL(本 run 不做):前端 kill 时撤回已 text_delta 显示的 leak partial(热路径 OT01 家族,独立评估)。
 
 ### 需求推导 (Derivation)
 ## Requirements
 
 | ID | work_class | source | status | AC present | Acceptance (GWT) |
 |----|-----------|--------|--------|:---------:|------------------|
-| FR-1 | bug | user-stated: XG: 把真正的问题搞清楚+修;根因 verified = user 入库唯一无 strip 缺口 | confirmed | ● | Given 一个 user message content 含裸 <invoke name=X><parameter> body, when 持久化到 data.db, then stored content 的 detect_tool_call_leak=False(body 被 strip) |
-| FR-2 | bug | ddd-derived: strip_tool_call_leak run_719886ee 已保证 clean text 字节无损 + fenced 保留 | confirmed | ● | Given 一个无 leak 或仅含 fenced <invoke 讨论的 user message, when 持久化, then content byte-for-byte 不变 |
+| FR-1 | bug | user-stated: XG: 把真正的问题搞清楚+修;根因 verified = user 入库唯一无 strip 缺口 | confirmed | ● | Given 一个 user message content 含裸 ‹invoke name=X>‹parameter> body, when 持久化到 data.db, then stored content 的 detect_tool_call_leak=False(body 被 strip) |
+| FR-2 | bug | ddd-derived: strip_tool_call_leak run_719886ee 已保证 clean text 字节无损 + fenced 保留 | confirmed | ● | Given 一个无 leak 或仅含 fenced ‹invoke 讨论的 user message, when 持久化, then content byte-for-byte 不变 |
 
 ### 澄清问答 (Clarifications — who decided what)
 | Q | 问题 (question) | 回答 (answer) | 答者 (answered_by) |
@@ -37,9 +37,9 @@ user-side 消息入库零 leak-strip:根因已 verified——assistant 持久化
 | Feasibility | 5.00 | |
 
 **Acceptance Criteria:**
-1. user_content 持久化前经 _clean_blocks_for_persist,一个含裸 <invoke><parameter> body 的 user message 入库后 detect_tool_call_leak(stored)=False
+1. user_content 持久化前经 _clean_blocks_for_persist,一个含裸 ‹invoke>‹parameter> body 的 user message 入库后 detect_tool_call_leak(stored)=False
 2. clean 的 user message(无 leak)入库 byte-for-byte 不变(strip 无损)
-3. fenced/inline 的 <invoke 讨论在 user message 里被保留(不误伤合法讨论)
+3. fenced/inline 的 ‹invoke 讨论在 user message 里被保留(不误伤合法讨论)
 
 
 ## 3. Design & Approach
@@ -117,7 +117,7 @@ This is a quality gap. Pipeline DELIVER requires adversarial review.
 
 ## 9. Lessons
 - [pitfall] R27 全枚举消费方必须按 MECHANISM 枚举,不是按 API 字面:grep db.messages.put + role:user 漏掉了 session_pending 的 raw INSERT 第二写门(Gate-1 抓到)。一个表的写入可能有绕过 ORM chokepoint 的 raw-INSERT 旁路,枚举要问「谁写这张表」而非「谁调这个方法」。
-- [pitfall] 断言含转义的序列化输出会 vacuous:_payload_json 用 dumps_json 把 " 转义成 \",所以 assert '<invoke name="X">' not in payload 恒真(payload 里是 <invoke name=\"X\">),与 strip 是否生效无关(RP47 test-theater)。判定序列化结果要先 decode 回原文再 assert,BUILD 阶段 RED-first 才暴露了它。
+- [pitfall] 断言含转义的序列化输出会 vacuous:_payload_json 用 dumps_json 把 " 转义成 \",所以 assert '‹invoke name="X">' not in payload 恒真(payload 里是 ‹invoke name=\"X\">),与 strip 是否生效无关(RP47 test-theater)。判定序列化结果要先 decode 回原文再 assert,BUILD 阶段 RED-first 才暴露了它。
 - [decision] 污染根因的因果链是 model-leak→text_delta 先上屏→detect 在完整 block 才判→kill 只 drop DB 不撤屏→用户把屏幕残片回灌成 user message→user 入库零 strip→进库。全库 2 条 raw 全是 role=user 回灌实证。fix 选 user-side 入库 strip(切断进库),前端撤回 partial 判为独立 known gap(热路径 OT01 家族,不塞进本 run)。
 - [decision] 读门 context_injector 已 strip,所以本 fix 的准确定位是纵深防御+存储层干净,不是唯一路径。但仍有价值:脏数据不该入库,且 data.db 消费方不止 context_injector 一个。
 

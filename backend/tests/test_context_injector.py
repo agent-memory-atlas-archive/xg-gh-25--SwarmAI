@@ -9,6 +9,7 @@ Covers:
 - _assemble_context: header, preamble, truncation note
 """
 
+from tests._tool_markup import tc
 import asyncio
 import json
 import time
@@ -217,32 +218,32 @@ class TestResumeContextLeakCleaning:
 
     def test_format_message_strips_raw_leak(self):
         """A historical assistant message carrying a raw (truncated) leak has the
-        <invoke body removed before it enters the resume prompt."""
+        ‹invoke body removed before it enters the resume prompt."""
         msg = {
             "role": "assistant",
-            "content": [{"type": "text", "text": 'did the thing\n\ncourt\n<invoke name="Bash">'}],
+            "content": [{"type": "text", "text": tc('did the thing\n\ncourt\n‹invoke name="Bash">')}],
         }
         result = _format_message(msg)
         assert result is not None
-        assert "<invoke name=" not in result
+        assert tc("‹invoke name=") not in result
         assert "did the thing" in result  # legit prose preserved
 
     def test_format_message_preserves_fenced_reference(self):
         """A legitimate inline reference to the syntax survives byte-for-byte —
         the meta-discussion case must NOT be washed out."""
-        text = 'the harness emits `<invoke name="Bash">` as the format'
+        text = tc('the harness emits `‹invoke name="Bash">` as the format')
         msg = {"role": "assistant", "content": [{"type": "text", "text": text}]}
         result = _format_message(msg)
         assert result == f"Assistant: {text}"
 
     def test_extract_text_strips_raw_leak(self):
-        content = [{"type": "text", "text": 'analysis\ncall\n<invoke name="Edit">\n<parameter name="x">y</parameter>'}]
+        content = [{"type": "text", "text": tc('analysis\ncall\n‹invoke name="Edit">\n‹parameter name="x">y‹/parameter>')}]
         result = _extract_text_from_content(content)
-        assert "<invoke name=" not in result
+        assert tc("‹invoke name=") not in result
         assert "analysis" in result
 
     def test_extract_text_preserves_fenced_reference(self):
-        text = 'see `<invoke name="Read">` in the docs'
+        text = tc('see `‹invoke name="Read">` in the docs')
         result = _extract_text_from_content([{"type": "text", "text": text}])
         assert result == text
 

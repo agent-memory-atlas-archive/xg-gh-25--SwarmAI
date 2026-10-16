@@ -22,6 +22,7 @@ own first reconcile, not a later mid-turn-cut whose merged row is a UUID.)
 
 These tests exercise the backend persist contract (AC1) + the continuation stash.
 """
+from tests._tool_markup import tc
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -203,7 +204,7 @@ class TestPersistSideLeakClean:
     """Persist-side tool-call-leak clean (run_2bdec5c0).
 
     _persist_assistant_blocks must clean raw tool-call leak from each text block
-    BEFORE db.messages.put, so data.db never stores raw ``<invoke>`` text that
+    BEFORE db.messages.put, so data.db never stores raw ``‹invoke>`` text that
     the session_recall read path would splice back into a resumed prompt
     (the re-induction loop the resume-side cleaner, run_da39669c, did not cover).
 
@@ -214,7 +215,7 @@ class TestPersistSideLeakClean:
     async def test_raw_leak_stripped_before_persist(self):
         """AC1 — a0f04b00's truncated-leak shape is cleaned out of the persisted content."""
         ctx, mock_db = _patch_db()
-        leak = 'court\n<invoke name="Bash">\n\ncourt先读当前 lead:'
+        leak = tc('court\n‹invoke name="Bash">\n\ncourt先读当前 lead:')
         with ctx:
             ok = await SessionRouter._persist_assistant_blocks(
                 "sess-leak",
@@ -223,10 +224,10 @@ class TestPersistSideLeakClean:
             )
         # bool→list[dict] (run_719886ee): returns the cleaned blocks the caller
         # writes back to event['content']; here the leak is stripped out of it.
-        assert isinstance(ok, list) and "<invoke name=" not in ok[0]["text"]
+        assert isinstance(ok, list) and tc("‹invoke name=") not in ok[0]["text"]
         row = mock_db.messages.put.await_args.args[0]
         persisted = row["content"][0]["text"]
-        assert "<invoke name=" not in persisted, (
+        assert tc("‹invoke name=") not in persisted, (
             f"raw leak reached data.db: {persisted!r}"
         )
         # 2d: the RETURN (→ event['content']) and the PERSISTED bytes are identical.
@@ -234,9 +235,9 @@ class TestPersistSideLeakClean:
 
     @pytest.mark.asyncio
     async def test_fenced_reference_preserved_and_tool_use_untouched(self):
-        """AC2 — legit fenced ``<invoke>`` reference kept byte-for-byte; tool_use block untouched."""
+        """AC2 — legit fenced ``‹invoke>`` reference kept byte-for-byte; tool_use block untouched."""
         ctx, mock_db = _patch_db()
-        fenced = '讨论语法:`<invoke name="X">` 应走 tool_use 通道。'
+        fenced = tc('讨论语法:`‹invoke name="X">` 应走 tool_use 通道。')
         tool_use_block = {"type": "tool_use", "id": "tu_1", "name": "Bash",
                           "input": {"command": "ls"}}
         with ctx:
@@ -272,17 +273,17 @@ class TestPersistSideLeakClean:
         ) as mock_detect, ctx:
             await SessionRouter._persist_assistant_blocks(
                 "sess-decouple",
-                [{"type": "text", "text": 'court\n<invoke name="Bash">'}],
+                [{"type": "text", "text": tc('court\n‹invoke name="Bash">')}],
                 model="m",
             )
-        mock_strip.assert_called_once_with('court\n<invoke name="Bash">')
+        mock_strip.assert_called_once_with(tc('court\n‹invoke name="Bash">'))
         mock_detect.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_clean_exception_does_not_block_persist(self):
         """AC5 — a cleaning exception degrades to persisting the ORIGINAL blocks, never loses content."""
         ctx, mock_db = _patch_db()
-        original = [{"type": "text", "text": 'court\n<invoke name="Bash">'}]
+        original = [{"type": "text", "text": tc('court\n‹invoke name="Bash">')}]
         with patch(
             "core.session_utils.strip_tool_call_leak",
             side_effect=RuntimeError("boom"),
@@ -311,7 +312,7 @@ class TestPersistSideLeakClean:
         NON-VACUOUS: this asserts the persisted content (observable effect), not that the
         source calls strip. Mutation proof — delete the in-body clean and all 3 go RED.
         """
-        leak = 'court\n<invoke name="Bash">\n\ncourt先读:'
+        leak = tc('court\n‹invoke name="Bash">\n\ncourt先读:')
         # Each tuple = (bare, "-asst", label=answer, label=permission) — the real kwarg
         # shapes the 3 call sites pass (session_router.py :3483/:3728/:3758).
         call_site_kwargs = [
@@ -328,6 +329,6 @@ class TestPersistSideLeakClean:
             # bool→list[dict] (run_719886ee): returns cleaned blocks for the write-back.
             assert isinstance(ok, list), f"persist should return blocks list for kwargs {kwargs}"
             persisted = mock_db.messages.put.await_args.args[0]["content"][0]["text"]
-            assert "<invoke name=" not in persisted, (
+            assert tc("‹invoke name=") not in persisted, (
                 f"raw leak reached data.db via call-site kwargs {kwargs}: {persisted!r}"
             )

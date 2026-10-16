@@ -201,7 +201,7 @@ def _extract_text_from_content(content: list | None) -> str:
 
     Each text block is passed through ``strip_tool_call_leak`` — this text is
     spliced back into a resumed session's system prompt, and a raw tool-call
-    leak persisted in history (``<invoke ...>`` emitted as text) would otherwise
+    leak persisted in history (``‹invoke ...>`` emitted as text) would otherwise
     re-induce the model to leak again (the self-reinforcing loop). Legitimate
     fenced/inline references are preserved byte-for-byte.
     """

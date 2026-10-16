@@ -235,7 +235,7 @@ def _payload_json(user_message: str | None, content: list[dict] | None) -> str:
     # write door — the raw INSERT below bypasses SQLiteMessagesTable.put, so the
     # assistant path's _clean_blocks_for_persist does NOT run here). Without this a
     # user who re-feeds a prior turn's on-screen leak remnant persists a raw
-    # <invoke> body that resume then splices back into the prompt, re-inducing the
+    # ‹invoke> body that resume then splices back into the prompt, re-inducing the
     # leak. strip is lossless on clean text + preserves fenced/inline discussion.
     if content is not None:
         cleaned = [
