@@ -931,3 +931,38 @@ def test_session_router_user_persist_calls_clean():
         "user_content is persisted WITHOUT _clean_blocks_for_persist — the raw-leak "
         "user-persist gap (run_67250d95) is open"
     )
+
+
+# ── ReDoS: strip must be linear-time ───────────────────────────────────────
+# The old single-regex strip rescanned to end-of-text for every <invoke whose
+# <parameter> never closed: 240KB of crafted text took 5.1s synchronously on
+# the event loop (every session frozen). Reachable from any user message
+# (session_pending strips user text) and from model output.
+
+@pytest.mark.parametrize("crafted", [
+    '<invoke name="A"><parameter name="x">a ' * 25_000,   # ~1MB, unclosed bodies
+    '<invoke name="' * 60_000,                             # unclosed quotes
+    'count\n' * 100_000,                                   # opener-like lines
+    '<invoke name="A">' + ' ' * 500_000,                   # long whitespace run
+])
+def test_strip_is_linear_on_crafted_input(crafted):
+    import time
+
+    t0 = time.perf_counter()
+    strip_tool_call_leak(crafted)
+    assert time.perf_counter() - t0 < 1.0, "strip must stay linear (ReDoS)"
+
+
+@pytest.mark.parametrize("text,expected", [
+    # A leak's trailing whitespace runs into the next line's opener word:
+    # scanning resumes at the previous leak's end, like re.subn.
+    ('x中文<invoke name="X">\n  text \n<invoke name="Bash">', 'x中文text \n'),
+    ('count\n<invoke name="Bash">    \r\n  count\n<invoke name="Bash"></invoke></invoke>  ',
+     'count\n</invoke>  '),
+    # complete body, then an unclosed one: first removed whole, second head-only
+    ('a\n<invoke name="B">\n<parameter name="c">ls</parameter>\n</invoke>\n'
+     'b\n<invoke name="C">\n<parameter name="d">never closed',
+     'a\n\nb\n<parameter name="d">never closed'),
+])
+def test_strip_matches_previous_regex_semantics(text, expected):
+    assert strip_tool_call_leak(text) == expected

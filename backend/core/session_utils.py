@@ -493,13 +493,54 @@ _TOOL_CALL_LEAK_RE = re.compile(
 # (CLI transcripts 2026-10-16: 85/85 leaks). That word is part of the leak, not
 # prose, so the optional ``^word\n`` prefix is consumed with it — otherwise the
 # user sees a dangling ``count`` (MULTILINE only affects that ``^``).
-_TOOL_CALL_LEAK_STRIP_RE = re.compile(
-    r'(?:^[ \t]*[A-Za-z]{2,16}[ \t]*\r?\n[ \t]*)?'
-    r'<invoke\s+name="[^"]*"\s*>'
-    r'(?:\s*<parameter\s+name="[^"]*"\s*>.*?</parameter>)*'
-    r'\s*(?:</invoke>)?',
-    re.DOTALL | re.MULTILINE,
+#
+# LINEAR-TIME (ReDoS fix): the strip is NOT one regex. A single regex with a
+# lazy ``.*?</parameter>`` body rescans to the end of the text for every
+# ``<invoke`` whose parameter never closes — quadratic (measured: 120KB of
+# crafted text = 1.4s, 240KB = 5.1s, synchronously on the event loop, freezing
+# every session). ``_find_leak_spans`` matches the same shape with bounded
+# regexes plus ``str.find`` for the body, and remembers when no ``</parameter>``
+# remains so a failed body search happens at most once per text.
+_TOOL_CALL_LEAK_HEAD_RE = re.compile(
+    r'(?:^[ \t]*[A-Za-z]{2,16}[ \t]*\r?\n[ \t]*)?<invoke\s+name="[^"]*"\s*>',
+    re.MULTILINE,
 )
+_TOOL_CALL_LEAK_PARAM_OPEN_RE = re.compile(r'\s*<parameter\s+name="[^"]*"\s*>')
+_TOOL_CALL_LEAK_TAIL_RE = re.compile(r'\s*(?:</invoke>)?')
+_PARAM_CLOSE = "</parameter>"
+
+
+def _find_leak_spans(masked: str) -> list[tuple[int, int]]:
+    """Return non-overlapping (start, end) spans of raw leaks in ``masked``.
+
+    Same shape the old single regex matched: optional one-word opener line,
+    ``<invoke name="X">``, any number of COMPLETE ``<parameter ...>…</parameter>``
+    bodies (lazy: up to the first ``</parameter>``), optional ``</invoke>``.
+    Runs in O(len(masked)).
+    """
+    spans: list[tuple[int, int]] = []
+    pos = 0
+    no_close_left = False
+    while True:
+        # search(pos) resumes exactly where the previous leak ended, like
+        # re.subn does (``^`` still only matches at a real line start).
+        head = _TOOL_CALL_LEAK_HEAD_RE.search(masked, pos)
+        if head is None:
+            break
+        end = head.end()
+        while not no_close_left:
+            param = _TOOL_CALL_LEAK_PARAM_OPEN_RE.match(masked, end)
+            if param is None:
+                break
+            close = masked.find(_PARAM_CLOSE, param.end())
+            if close == -1:
+                no_close_left = True  # no later search can succeed either
+                break
+            end = close + len(_PARAM_CLOSE)
+        end = _TOOL_CALL_LEAK_TAIL_RE.match(masked, end).end()
+        spans.append((head.start(), end))
+        pos = end
+    return spans
 
 # STREAM onset: a raw ``<invoke name="`` at the START of a line, used on the
 # live text_delta buffer (before the body is complete) to stop forwarding the
@@ -604,7 +645,7 @@ def strip_tool_call_leak(text: str) -> str:
 
     Two differences from the detector, both deliberate:
 
-    1. **Wider anchor.** It uses ``_TOOL_CALL_LEAK_STRIP_RE``, which matches a
+    1. **Wider anchor.** It uses ``_find_leak_spans`` (linear time), which matches a
        bare ``<invoke name="X">`` even when the body is TRUNCATED (no following
        ``<parameter`` / ``</invoke>``) — the shape a mid-stream kill leaves in the
        DB. The detector's narrower full-body regex would miss exactly the
@@ -632,12 +673,17 @@ def strip_tool_call_leak(text: str) -> str:
     if not text or "<invoke" not in text:
         return text  # fast path — the overwhelming majority of blocks
     masked, spans = _mask_doc_contexts(text)
-    cleaned, n = _TOOL_CALL_LEAK_STRIP_RE.subn("", masked)
-    if n == 0:
+    leaks = _find_leak_spans(masked)
+    if not leaks:
         # Nothing matched outside code spans — restore and return unchanged
         # (preserves the original byte-for-byte, incl. the masked spans).
         return _restore_doc_contexts(masked, spans)
-    return _restore_doc_contexts(cleaned, spans)
+    parts, last = [], 0
+    for start, end in leaks:
+        parts.append(masked[last:start])
+        last = end
+    parts.append(masked[last:])
+    return _restore_doc_contexts("".join(parts), spans)
 
 
 # Raised by the orchestrator on a repeated leak; send() catches it and runs the

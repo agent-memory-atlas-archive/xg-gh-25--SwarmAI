@@ -2050,9 +2050,10 @@ class SessionRouter:
         # no UI≠DB fork). Best-effort: ANY exception degrades to persisting the
         # ORIGINAL blocks + a warning (crash-safe persistence outranks leak-cleaning).
         #
-        # ⚠️ Deliberately INLINE, not asyncio.to_thread: strip_tool_call_leak is a
-        # pure-Python regex (~15ms worst case, measured — the "312KB→6.9s quadratic"
-        # claim was empirically refuted as ~linear). The GIL means to_thread buys
+        # ⚠️ Deliberately INLINE, not asyncio.to_thread: strip_tool_call_leak is
+        # linear-time (~25ms for 1MB of crafted input). It WAS quadratic until the
+        # single-regex strip was replaced by _find_leak_spans (240KB crafted = 5.1s
+        # measured; an earlier "refuted" note here was wrong). The GIL means to_thread buys
         # ZERO parallelism for pure-Python CPU work, while offloading a sync-fast op
         # to the SHARED default executor is the exact 16-worker-saturation anti-pattern
         # COE run_b36c7880 fixed (see data_safety.py "run inline, NOT via to_thread" —
