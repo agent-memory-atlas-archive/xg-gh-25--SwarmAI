@@ -39,9 +39,17 @@ def _write_run(workspace, run_id, *, status="running", profile="bugfix",
 def _run_update(workspace, run_id, **kw):
     from scripts.artifact_cli import cmd_run_update
     from unittest.mock import patch
+    # This mock must carry every flag cmd_run_update BARE-READS on the non-status path
+    # (`if args.status:` guards force/reason, which this helper never reaches since it
+    # passes status=None). The bare reads on that path are taste_decision/profile/
+    # ddd_checksums/files_touched/add_required_expert. `add_required_expert` (argparse
+    # default=None) was added with R1.5a and its bare read `if args.add_required_expert:`
+    # was not reflected here — omitting it is a mock-drift AttributeError, not a code bug.
+    # Add a flag here whenever cmd_run_update gains a NEW bare-read on the non-status path.
     args = Namespace(project="TestProject", run_id=run_id, status=kw.get("status"),
                      stage_json=kw.get("stage_json"), taste_decision=None, profile=None,
                      ddd_checksums=None, files_touched=kw.get("files_touched"),
+                     add_required_expert=None,
                      force_checkpoint=False)
     with patch("scripts.artifact_cli._get_workspace", return_value=workspace):
         cmd_run_update(args, reg=None)
