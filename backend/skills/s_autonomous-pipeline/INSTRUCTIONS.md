@@ -4,6 +4,30 @@ Drive the full lifecycle pipeline from requirement to delivery. You ARE the
 orchestrator -- execute each stage's behavior inline within this session, don't
 invoke separate skills.
 
+## What the Pipeline Delivers — the North Star (read first; it defines the job)
+
+A pipeline run does NOT deliver "a code change." It delivers an **accountability
+unit of work**: a commit/PR an engineer could hand their manager and defend — code
+**plus** a short, honest report of what was built, why, and what was learned, in ONE
+reviewable object. The commit is the deliverable; the diff is only part of it.
+
+**REPORT.md is a report to a boss, not a log of every detail.** Keep the existing
+report structure (`cmd_run_report` projects it from the ledger — intent→requirement
+provenance, key decisions, reflect lessons, files changed, outcome). Two editorial
+principles govern what goes IN each section — they prune, they do not redefine the
+structure:
+
+- **Omit the fine-grained detail.** The report carries what a human will actually
+  review — the intent→requirement derivation, the decisions a reviewer would
+  challenge, the lessons, what changed and whether it works. NOT the process
+  minutiae (every gate's internal mechanics, every RP checked, how a mutation ran,
+  internal tooling debates, raw TEST metric counts). Signal, not completeness.
+- **Omit the uncertain.** If something was not actually done or you are not sure of
+  it, leave it out — do NOT state it. Omitting is honest; a precise-looking but
+  hand-fabricated value is worse than nothing — it spends the reader's trust on a
+  lie. (At commit time REPORT.md is a truthful SELF-REPORT; CI post-push is its
+  independent auditor — so never dress a self-reported number as a verified fact.)
+
 ## Core Loop
 
 For every pipeline run, follow this loop:
