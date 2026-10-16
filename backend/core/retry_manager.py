@@ -4,6 +4,8 @@ Extracted from session_unit.py as part of the strangler-fig refactoring.
 This module contains retry/recovery orchestration (~530 LOC):
 - _retry_with_resume(): exponential backoff retry with --resume
 - _handle_buffer_overflow(): 10MB JSONRPC buffer overflow recovery
+- _handle_leak_poison_restart(): repeated tool-call leak → clean CLI
+  transcript, --resume, continue the turn (once per message)
 - _inject_abandon_continuation(): context injection on retry timeout
 
 Architecture:
@@ -151,6 +153,83 @@ class RetryManager:
             logger.warning(
                 "Buffer overflow recovery failed for session %s: %s",
                 self._parent.session_id, str(recovery_exc)[:200],
+            )
+            yield {
+                "_fallthrough_error": str(recovery_exc),
+                "_fallthrough_tb": traceback.format_exc(),
+            }
+
+    async def _handle_leak_poison_restart(
+        self,
+        options: ClaudeAgentOptions,
+        config: Optional[Any],
+    ) -> AsyncIterator[dict]:
+        """Clean a leak-poisoned CLI transcript and continue the turn.
+
+        Raised for by the orchestrator on the 2nd+ leak in one SDK session.
+        The CLI process holds the leaked text in memory, so it must stop
+        before the transcript can be cleaned and re-read: kill (identity
+        kept) → strip leak text from ``<sid>.jsonl`` → spawn with --resume →
+        send the short continuation prompt (NOT the user's message again —
+        the turn's earlier work is already in history). Once per user
+        message (``_leak_restart_done``, set first); a later leak in the same
+        message falls back to the orchestrator's in-process continuation.
+
+        Sentinels match ``_handle_buffer_overflow``: ``_recovered`` on
+        success, ``_abort`` after a spawn failure, ``_fallthrough_error`` if
+        the resumed stream raised.
+        """
+        from .leak_transcript import clean_transcript_leaks, find_transcript
+        from .session_utils import _build_error_event, _sanitize_sdk_error
+        from .session_unit import SessionState
+        from .streaming_orchestrator import StreamingOrchestrator
+
+        parent = self._parent
+        parent._leak_restart_done = True
+        resume_sid = parent._sdk_session_id
+        await parent._crash_to_cold_async()  # keep identity → --resume
+
+        cleaned = 0
+        path = await asyncio.to_thread(find_transcript, resume_sid)
+        if path is not None:
+            cleaned = await asyncio.to_thread(clean_transcript_leaks, path)
+        # The history no longer carries the leaks (or there was no file to
+        # clean); count afresh against the resumed session.
+        parent._leak_sid = resume_sid
+        parent._leak_count = 0
+        logger.warning(
+            "session_unit.tool_call_leak_restart_cleaned session_id=%s "
+            "transcript_found=%s blocks_cleaned=%d — resuming",
+            parent.session_id, path is not None, cleaned,
+        )
+
+        retry_options = parent._build_retry_options(options, resume_sid)
+        try:
+            await parent._spawn(retry_options, config)
+        except Exception as spawn_exc:
+            spawn_tb = traceback.format_exc()
+            await parent._crash_to_cold_async(clear_identity=True)
+            friendly, suggested = _sanitize_sdk_error(str(spawn_exc))
+            yield _build_error_event(
+                code="SPAWN_FAILED",
+                message=friendly,
+                detail=spawn_tb,
+                suggested_action=suggested,
+            )
+            yield {"_abort": True}
+            return
+
+        parent._transition(SessionState.STREAMING)
+        try:
+            async for event in parent._streaming_orchestrator.stream_query(
+                StreamingOrchestrator._LEAK_CONTINUATION_PROMPT
+            ):
+                yield event
+            yield {"_recovered": True}
+        except Exception as recovery_exc:
+            logger.warning(
+                "Leak restart resume failed for session %s: %s",
+                parent.session_id, str(recovery_exc)[:200],
             )
             yield {
                 "_fallthrough_error": str(recovery_exc),

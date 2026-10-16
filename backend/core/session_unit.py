@@ -642,6 +642,17 @@ class SessionUnit:
         # processing (fetch items one-at-a-time).  Max 1 recovery per
         # message — if the second attempt also overflows, surface error.
         self._buffer_overflow_recovery: bool = False
+        # Tool-call leak poison tracking. _leak_count = leaks in SDK session
+        # _leak_sid since its CLI transcript was last cleaned (the orchestrator
+        # counts; a new sid resets). From the 2nd leak, send() runs ONE restart
+        # per user message: kill → strip leak text from the transcript →
+        # --resume → continue. _leak_restart_eligible is True only while
+        # send()'s primary stream runs, so continue_with_* / retry streams
+        # (which have no restart handler) never raise for it.
+        self._leak_sid: Optional[str] = None
+        self._leak_count: int = 0
+        self._leak_restart_eligible: bool = False
+        self._leak_restart_done: bool = False
 
         # ── Streaming timeout ────────────────────────────────────────
         # Updated on every yielded event during STREAMING.  The
@@ -1920,6 +1931,7 @@ class SessionUnit:
             Required when state is COLD (needs subprocess spawn).
         """
         from .session_utils import (
+            LEAK_RESTART_MARKER,
             _build_error_event,
             _is_retriable_error,
             _sanitize_sdk_error,
@@ -2170,6 +2182,7 @@ class SessionUnit:
         self._last_turn_spawn_ms = None
         # _interrupted already cleared in Layer 0 above
         self._buffer_overflow_recovery = False
+        self._leak_restart_done = False  # per-message: one leak restart budget
         self._compaction_guard.reset()  # New user turn — reset tool tracking
         self._content_emitted = False   # Track if meaningful content is emitted
         self._active_agent_tools = {}  # Clear stale sub-agent progress on new turn
@@ -2394,10 +2407,14 @@ class SessionUnit:
             self._heal_checkpoint = None  # Consumed — don't re-inject
 
         try:
-            async for event in self._streaming_orchestrator.stream_query(query_content):
-                if _capturing_wrapup_turn:
-                    self._capture_wrapup_text(event)
-                yield event
+            self._leak_restart_eligible = not self._leak_restart_done
+            try:
+                async for event in self._streaming_orchestrator.stream_query(query_content):
+                    if _capturing_wrapup_turn:
+                        self._capture_wrapup_text(event)
+                    yield event
+            finally:
+                self._leak_restart_eligible = False
             # Success — reset counters (session is healthy)
             self._consecutive_oom_kills = 0
             self._consecutive_unstick_timeouts = 0
@@ -2541,6 +2558,29 @@ class SessionUnit:
                 "Error during streaming for session %s: %s",
                 self.session_id, error_str[:200],
             )
+
+            # ── Repeated tool-call leak — clean transcript + resume (once) ──
+            # The orchestrator raises this only on the primary stream and only
+            # once per message, so it can never loop. On success the user sees
+            # the turn continue; nothing is shown about the restart.
+            if LEAK_RESTART_MARKER in error_str:
+                recovered = False
+                async for event in self._retry_manager._handle_leak_poison_restart(
+                    options, config,
+                ):
+                    if event.get("_abort"):
+                        return  # spawn failed (error already yielded)
+                    if event.get("_recovered"):
+                        recovered = True
+                        continue
+                    if "_fallthrough_error" in event:
+                        error_str = event["_fallthrough_error"]
+                        tb_str = event.get("_fallthrough_tb", tb_str)
+                        continue
+                    yield event
+                if recovered:
+                    return
+                # Resumed stream failed — fall through to the normal handling.
 
             # ── Buffer overflow — recoverable via progressive processing ──
             if "maximum buffer size" in error_str and not self._buffer_overflow_recovery:

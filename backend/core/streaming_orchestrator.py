@@ -174,6 +174,39 @@ class StreamingOrchestrator:
         async for event in self._stream_response(query_content):
             yield event
 
+    # From this many leaks in one SDK session (counted since its transcript was
+    # last cleaned) the history is treated as poisoned → clean + restart.
+    _LEAK_RESTART_THRESHOLD = 2
+
+    def _count_leak(self) -> None:
+        """Count a leak against the CURRENT SDK session; a new SDK session id
+        starts from zero (its history is a different transcript)."""
+        parent = self._parent
+        sid = parent._sdk_session_id
+        if getattr(parent, "_leak_sid", None) != sid:
+            parent._leak_sid = sid
+            parent._leak_count = 0
+        parent._leak_count = getattr(parent, "_leak_count", 0) + 1
+
+    def _should_restart_for_leak(self, message: Any) -> bool:
+        """True when this leaked message should trigger the clean restart."""
+        from claude_agent_sdk import ToolUseBlock
+
+        parent = self._parent
+        if getattr(parent, "_leak_count", 0) < self._LEAK_RESTART_THRESHOLD:
+            return False
+        if not getattr(parent, "_leak_restart_eligible", False):
+            return False  # not the primary send() stream, or already used
+        if not parent._sdk_session_id:
+            return False  # nothing to --resume
+        if any(isinstance(b, ToolUseBlock) for b in message.content):
+            return False  # a real call is in flight — never cut it off
+        if parent._open_tool_uses:
+            return False
+        if parent._interrupted or getattr(parent, "_user_stopped_current_turn", False):
+            return False
+        return True
+
     def _record_token_usage_bg(self, message: Any, usage: dict) -> None:
         """Fire-and-forget token accounting for a response whose `result` is
         not forwarded (leak continuation) — its tokens were still spent."""
@@ -1103,6 +1136,7 @@ class StreamingOrchestrator:
                 saw_assistant_message = True
                 self._parent._last_progress_time = time.time()  # real content blocks
                 content_blocks = []
+                _msg_leaked = False
                 for block in message.content:
                     if isinstance(block, TextBlock):
                         # ── Tool-call XML leak guard (strip, never terminate) ──
@@ -1160,6 +1194,9 @@ class StreamingOrchestrator:
                                 {"type": "text", "text": cleaned_text}
                             )
                             _leak_tail = True
+                            if not _msg_leaked:
+                                _msg_leaked = True
+                                self._count_leak()
                             continue
                         if block.text.strip():
                             _leak_tail = False  # model wrote real prose after it
@@ -1479,6 +1516,26 @@ class StreamingOrchestrator:
                         "content": content_blocks,
                         "model": getattr(message, "model", None),
                     }
+                # ── Repeated leak → clean the transcript and restart ──
+                # Leak text stays in the CLI's own history and primes more
+                # leaks (6-8 per session once it starts). From the 2nd leak in
+                # one SDK session, an in-process retry runs on that poisoned
+                # history, so instead hand off to send()'s one-shot restart:
+                # kill, strip the leak text from the transcript, --resume, and
+                # continue the turn. Only when no tool is running (nothing real
+                # is cut off) and only on the primary send() stream.
+                if _msg_leaked and self._should_restart_for_leak(message):
+                    from .session_utils import LEAK_RESTART_MARKER
+
+                    self._parent._leak_restart_eligible = False
+                    logger.warning(
+                        "session_unit.tool_call_leak_restart session_id=%s "
+                        "leaks_in_sdk_session=%d — cleaning transcript + resume",
+                        self._parent.session_id, self._parent._leak_count,
+                    )
+                    raise RuntimeError(
+                        f"{LEAK_RESTART_MARKER} (session_id={self._parent.session_id})"
+                    )
                 continue
 
             # ── ResultMessage — response complete or error ──────────

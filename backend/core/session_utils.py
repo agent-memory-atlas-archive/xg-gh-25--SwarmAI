@@ -640,6 +640,11 @@ def strip_tool_call_leak(text: str) -> str:
     return _restore_doc_contexts(cleaned, spans)
 
 
+# Raised by the orchestrator on a repeated leak; send() catches it and runs the
+# one-shot transcript-clean restart. Deliberately NOT a retriable pattern.
+LEAK_RESTART_MARKER = "Tool-call leak poison restart"
+
+
 def find_stream_leak_onset(buf: str) -> int:
     """Return the offset in ``buf`` where a raw tool-call leak STARTS, else -1.
 
