@@ -28,6 +28,7 @@ from .security_hooks import (
     background_command_guard,
     pytest_command_guard,
     create_adversarial_commit_gate,
+    create_active_run_commit_gate,
     bash_syntax_guard,
     inclusive_term_guard,
     create_image_read_dedup_guard,
@@ -412,6 +413,16 @@ async def build_hooks(
     registry.register(
         "PreToolUse", create_adversarial_commit_gate(hook_session_context),
         "adversarial_commit_gate", matcher="Bash",
+    )
+
+    # ── PreToolUse: active-run commit gate (Bash-scoped) ──
+    # DENY an agent `git commit` of a file owned by an ACTIVE pipeline run — route to
+    # run-commit so code + REPORT.md land in ONE commit (the review-purpose invariant).
+    # Orthogonal to adversarial_commit_gate (that binds to review coverage; this binds
+    # to run ownership). run-commit's own commit is a subprocess → bypasses PreToolUse.
+    registry.register(
+        "PreToolUse", create_active_run_commit_gate(hook_session_context),
+        "active_run_commit_gate", matcher="Bash",
     )
 
     # ── PreToolUse: AskUserQuestion gate (AskUserQuestion-scoped) ──

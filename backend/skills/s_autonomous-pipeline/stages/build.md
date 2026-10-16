@@ -310,7 +310,12 @@ in dependency order — don't skip ahead. For each sub-change's AC:
 
 7. Write the next test → it fails (RED)
 8. Write minimal code to pass → it passes (GREEN)
-9. Commit after each green cycle
+9. **Stage** after each green cycle (`git add` your files) — do **NOT** `git commit`.
+   `run-commit` (DELIVER) is the SOLE commit point, so the run's code and its REPORT.md
+   audit projection land in **ONE** commit (the review-purpose invariant). Committing
+   code here would split it from the REPORT.md generated later at REFLECT → two commits.
+   This is enforced structurally: `active_run_commit_gate` DENYs an agent `git commit`
+   of any active-run file and routes you to `run-commit`.
 10. **Don't anticipate future tests** — only enough code for the current test
 11. **Completeness bias:** when the complete implementation costs minutes more
     than the shortcut, do the complete thing. Cover edge cases, handle errors.

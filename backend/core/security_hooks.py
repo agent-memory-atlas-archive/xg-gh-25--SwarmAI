@@ -2294,6 +2294,215 @@ def create_adversarial_commit_gate(session_context: dict[str, Any]):
 
 
 # ---------------------------------------------------------------------------
+# active-run commit gate — code + REPORT.md must land in ONE commit (PreToolUse, Bash)
+# ---------------------------------------------------------------------------
+# WHY: a pipeline run's REPORT.md audit projection is generated LATE (REFLECT stage),
+# and run-commit bundles it with the run's code into ONE commit — BUT only if the code
+# is still UNCOMMITTED when run-commit runs. If the agent commits the code FIRST (a
+# manual `git commit` in COMPLETE, OR a per-cycle BUILD commit), run-commit's later
+# `git commit -- *real_files` carries only the new REPORT.md → the code and its audit
+# split across two commits, defeating the single-commit review purpose (observed:
+# git-reflog 29b3c1dd[code] + a1ec9b0e[REPORT-only]). Prose ("let run-commit commit")
+# failed twice, so per SOUL P7 this is a STRUCTURAL gate: deny an agent `git commit`
+# whose pending paths belong to an ACTIVE pipeline run, routing it to run-commit.
+#
+# run-commit itself commits via a Python subprocess (artifact_cli.py:3613
+# `subprocess.run(["git",...,"commit",...])`), NOT the agent Bash tool, so it NEVER
+# reaches PreToolUse — no self-deadlock. The agent's own Bash call that drives it is
+# `python artifact_cli.py run-commit` (no `git commit` token → not matched).
+#
+# FAIL-OPEN is cardinal (adversarial_commit_gate discipline): any uncomputable pending
+# set / parse error / timeout → APPROVE. A gate that false-blocks real work is worse
+# than the split it prevents.
+
+# Scan root for active pipeline runs. Overridable in tests. The daemon's live
+# workspace is ~/.swarm-ai/SwarmWS; runs live at Projects/*/.artifacts/runs/*/run.json.
+_ACTIVE_RUN_GLOB_ROOT = os.path.expanduser("~/.swarm-ai/SwarmWS")
+
+# A run OWNS its files_touched only while NON-TERMINAL. This is an ALLOWLIST of the two
+# live non-terminal states (NOT a terminal denylist — a denylist rots as new terminal
+# statuses appear; live data: running + paused are the only non-terminal values, all of
+# completed/abandoned/cancelled/complete/superseded/rejected/aborted are terminal).
+_ACTIVE_RUN_STATUSES = frozenset({"running", "paused"})
+
+
+# Candidate repo roots a REPO-RELATIVE files_touched entry may be rooted at — resolved
+# DETERMINISTICALLY (NOT os.getcwd()), so canonicalization is correct in the DAEMON.
+# Meta-review HIGH: in the launchd daemon os.getcwd()==BACKEND_DIR (not any pipeline
+# repo), so a cwd-based candidate is a DEAD base in production — the gate would fail
+# OPEN for relative entries while all local tests (cwd happens to BE the repo) pass
+# green. The two daemon-stable roots a SwarmAI run's relative entry can live under:
+#   (1) the SwarmAI SOURCE repo — this module is backend/core/security_hooks.py, so the
+#       repo root is two parents up from __file__ (NOT cwd — survives launchd).
+#   (2) the SwarmWS workspace (_ACTIVE_RUN_GLOB_ROOT).
+# A relative entry from a FOREIGN project (e.g. Agent-DLC's scripts/setup_agent.py)
+# whose repo is not checked out here correctly matches NEITHER — it is not a file in
+# any repo the agent commits here, so NOT denying it is correct, not a miss.
+def _canonical_rel_bases() -> list:
+    bases = [_ACTIVE_RUN_GLOB_ROOT]
+    try:
+        # backend/core/security_hooks.py → repo root = parents[2]
+        bases.append(str(Path(__file__).resolve().parents[2]))
+    except Exception:
+        pass
+    return bases
+
+
+def _canonicalize_owned_path(p: str) -> set:
+    """Canonicalize ONE files_touched entry to the SAME form _pending_commit_paths
+    emits — `os.path.realpath` of an absolute path — so set-intersection actually
+    matches. Gate-2 HIGH (multi-specialist confirmed): a files_touched entry may be
+    ABSOLUTE or REPO-RELATIVE (build.md form; live data is mixed), while the pending
+    set is ALWAYS realpath'd-absolute. A raw-string owned set silently fails to match
+    every relative entry → the gate fails OPEN exactly where it must DENY.
+
+    Returns a SET of candidate realpaths (never raises): an absolute entry → one
+    realpath; a relative entry → realpath against each DETERMINISTIC repo base
+    (`_canonical_rel_bases` — the SwarmWS workspace + the source repo via __file__,
+    NEVER os.getcwd() which is BACKEND_DIR in the daemon, meta-review HIGH). Emitting
+    multiple candidates is safe: a false candidate never intersects a real pending
+    path (distinct files never share a realpath — adversarially confirmed), and a
+    foreign-project relative entry correctly matches nothing."""
+    out: set = set()
+    try:
+        if os.path.isabs(p):
+            out.add(os.path.realpath(p))
+            return out
+        for base in _canonical_rel_bases():
+            try:
+                out.add(os.path.realpath(os.path.join(base, p)))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def _active_run_owned_paths() -> set:
+    """REALPATH'd absolute paths currently OWNED by an active (running|paused)
+    pipeline run — i.e. committing them via the agent Bash tool would split code
+    from its REPORT.md.
+
+    Globs ``<root>/Projects/*/.artifacts/runs/*/run.json``, unions the CANONICALIZED
+    ``files_touched`` (see `_canonicalize_owned_path` — matches the realpath form
+    `_pending_commit_paths` emits) of every run whose ``status`` is in
+    ``_ACTIVE_RUN_STATUSES``. Exception-safe per file: a corrupt/unreadable run.json
+    is skipped, never raised (one bad file must not blind the whole gate). Returns a
+    (possibly empty) set."""
+    # KNOWN LIMITATION (meta-review MED, accepted — fail-open, not a blocker): this
+    # globs ALL historical run.json (hundreds+ and growing), parsing each to find the
+    # 0-2 active ones, on every agent git commit. It is bounded only by the caller's
+    # _GATE_COVERAGE_TIMEOUT (which fails OPEN) — so at extreme scale the gate would
+    # silently stop enforcing rather than hang. Acceptable because: (a) it runs ONLY on
+    # a real git commit (gated upstream), not every Bash; (b) worst case is silent
+    # non-enforcement (status-quo), never breakage or false-block. Follow-up if it bites:
+    # maintain a small active-runs index (append-on-start / remove-on-terminal) and read
+    # that instead of globbing all history.
+    import glob as _glob
+    owned: set = set()
+    pattern = os.path.join(_ACTIVE_RUN_GLOB_ROOT, "Projects", "*", ".artifacts", "runs", "*", "run.json")
+    try:
+        files = _glob.glob(pattern)
+    except Exception:
+        return owned
+    for f in files:
+        try:
+            with open(f, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            continue  # corrupt/unreadable single run.json → skip, never raise
+        if data.get("status") not in _ACTIVE_RUN_STATUSES:
+            continue
+        ft = data.get("files_touched")
+        if isinstance(ft, list):
+            for p in ft:
+                if isinstance(p, str) and p:
+                    owned.update(_canonicalize_owned_path(p))
+    return owned
+
+
+def create_active_run_commit_gate(session_context: dict[str, Any]):
+    """Factory: PreToolUse (Bash) gate that DENYs an agent `git commit` whose pending
+    paths belong to an ACTIVE pipeline run's files_touched — routing it to run-commit
+    (which co-commits REPORT.md). Prevents the code/REPORT split at the root.
+    session_context is accepted for registration symmetry (unused — ownership is
+    global across runs, not session-scoped)."""
+
+    async def _gate(
+        input_data: dict[str, Any],
+        tool_use_id: str | None,
+        context: Any,
+    ) -> dict[str, Any]:
+        if input_data.get("tool_name") != "Bash":
+            return {"decision": "approve"}
+        command = (input_data.get("tool_input", {}) or {}).get("command", "") or ""
+        if not command or not _command_has_git_commit(command):
+            return {"decision": "approve"}
+
+        if os.environ.get("SWARM_ADVERSARIAL_GATE_FORCE") == "1":
+            # Reuse the sanctioned explicit-bypass env (set by the daemon, not shell-
+            # settable by the agent — C051) so a deliberate exception has ONE switch.
+            return {"decision": "approve"}
+
+        cwd = input_data.get("cwd", "") or ""
+
+        # Compute the pending commit path-set off-loop + timeout-bounded (same discipline
+        # as adversarial_commit_gate — the gate can never hang the commit). ANY failure
+        # fails OPEN.
+        try:
+            pending = await asyncio.wait_for(
+                executors.run_in("subprocess", _pending_commit_paths, cwd, command),
+                timeout=_GATE_COVERAGE_TIMEOUT,
+            )
+        except Exception:  # incl. asyncio.TimeoutError
+            return {"decision": "approve"}
+
+        # None (uncomputable: not a repo / git error) / cross-repo sentinel / empty
+        # (no-op/amend-no-diff) → nothing to bind → fail-open approve.
+        if pending is None or pending is _PENDING_CROSS_REPO or not pending:
+            return {"decision": "approve"}
+        if not isinstance(pending, set):
+            return {"decision": "approve"}
+
+        try:
+            owned = await asyncio.wait_for(
+                executors.run_in("subprocess", _active_run_owned_paths),
+                timeout=_GATE_COVERAGE_TIMEOUT,
+            )
+        except Exception:
+            return {"decision": "approve"}
+
+        offending = sorted(p for p in pending if p in owned)
+        if not offending:
+            return {"decision": "approve"}
+
+        logger.warning(
+            "[BLOCKED] git commit of active-run path(s) %s — must go through run-commit "
+            "so code + REPORT.md land in ONE commit (command=%s)",
+            offending[:5], command[:80],
+        )
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    "git commit → DENY: this commit touches file(s) owned by an ACTIVE "
+                    "pipeline run (" + ", ".join(offending[:5]) + "). Committing the run's "
+                    "code manually here SPLITS it from its REPORT.md audit projection (which "
+                    "run-commit generates and co-commits LATER) → two separate commits, "
+                    "defeating the single-commit review purpose. FIX: do NOT `git commit` the "
+                    "run's code yourself — let the pipeline's `run-commit` make the one commit "
+                    "(it bundles code + REPORT.md together). If this is genuinely NOT a "
+                    "pipeline-run file (false match), set SWARM_ADVERSARIAL_GATE_FORCE=1 for "
+                    "that one command."
+                ),
+            }
+        }
+
+    return _gate
+
+
+# ---------------------------------------------------------------------------
 # bash-syntax guard — hang prevention via parse-check (PreToolUse, Bash)
 # ---------------------------------------------------------------------------
 # A syntactically INCOMPLETE bash command (unterminated quote/backtick, unclosed
