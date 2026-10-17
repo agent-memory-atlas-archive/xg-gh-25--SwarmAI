@@ -43,7 +43,11 @@ from core.context_directory_loader import (
     TOKEN_CAP_PER_DAILY_FILE,
 )
 from core.ddd_paths import ddd_path
-from model_registry import context_window_for, is_large_context_model
+from model_registry import (
+    context_window_for,
+    is_large_context_model,
+    supports_disabled_thinking,
+)
 
 if TYPE_CHECKING:
     from .app_config_manager import AppConfigManager
@@ -1760,6 +1764,55 @@ class PromptBuilder:
 
         return effort
 
+    def _guard_thinking_for_model(
+        self, thinking_config: dict | None, model: str | None
+    ) -> dict | None:
+        """Down-grade a disabled/enabled thinking config a model would 400 on.
+
+        Opus 5+ rejects ``thinking.type`` "disabled" and "enabled" (manual
+        budget) with a 400 ``invalid_request_error`` — adaptive is the only
+        accepted on-mode. A user can persist ``thinking_mode: disabled`` in
+        config.json and then switch the model to opus-5-5; the stale config
+        would then send a mode the model rejects. This guard runs at the
+        build_options call site (where the resolved ``model`` is already in
+        scope) and rewrites such a config to adaptive BEFORE it reaches the wire.
+
+        Scoped by ``model_registry.supports_disabled_thinking`` — a family
+        predicate, not an allowlist — so it fires ONLY for a model that actually
+        rejects the mode (opus>=5) and never false-trips opus-4-8 / sonnet / an
+        unrecognized model, nor an already-adaptive config.
+
+        Lives here (the call site), NOT inside ``_build_thinking_config``:
+        that helper intentionally knows only the config, never the model
+        (Gate-0 WRONG-FRAME correction, run_8a5d6b54) — the model↔thinking
+        coupling belongs at the one place both are already resolved.
+
+        Args:
+            thinking_config: The config from :meth:`_build_thinking_config`
+                (``{"type": ...}`` or ``None`` when thinking is disabled-via-None).
+            model: The resolved model (short name or Bedrock id), or ``None`` if
+                not yet resolved — in which case the config is left untouched
+                (do not guess).
+
+        Returns:
+            The thinking config, down-graded to ``{"type": "adaptive"}`` only
+            when a rejecting model was sent a disabled/enabled mode; otherwise
+            the input unchanged.
+        """
+        if thinking_config is None or not model:
+            return thinking_config
+        if supports_disabled_thinking(model):
+            return thinking_config
+        if thinking_config.get("type") in ("disabled", "enabled"):
+            logger.info(
+                "thinking_mode %r rejected by model %s (opus>=5 is adaptive-only) "
+                "— downgrading to adaptive",
+                thinking_config.get("type"),
+                model,
+            )
+            return {"type": "adaptive"}
+        return thinking_config
+
     def _build_thinking_display(self, channel_context: dict | None = None) -> str | None:
         """Resolve the thinking ``display`` mode → CLI ``--thinking-display`` flag.
 
@@ -2157,6 +2210,9 @@ class PromptBuilder:
         # Build thinking configuration from app config.
         # Supports: "adaptive" (default), "enabled" (with budget), "disabled"
         thinking_config = self._build_thinking_config(channel_context=channel_context)
+        # Opus 5+ 400s on a disabled/enabled thinking mode — down-grade a stale
+        # config to adaptive here, where the resolved `model` (above) is in scope.
+        thinking_config = self._guard_thinking_for_model(thinking_config, model)
         effort = self._build_effort(channel_context=channel_context)
 
         # Thinking display: Opus 4.8 defaults display to "omitted" (empty thinking

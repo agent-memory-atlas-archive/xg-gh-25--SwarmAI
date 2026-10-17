@@ -57,10 +57,17 @@ from __future__ import annotations
 # f"us.anthropic.{short_name}"; look it up here.
 MODEL_REGISTRY: dict[str, str] = {
     "claude-opus-4-8": "us.anthropic.claude-opus-4-8",
+    "claude-opus-5-5": "us.anthropic.claude-opus-5-5",
     "claude-opus-5": "us.anthropic.claude-opus-5",
     "claude-opus-4-6": "us.anthropic.claude-opus-4-6-v1",
     "claude-sonnet-4-6": "us.anthropic.claude-sonnet-4-6",
 }
+# ⚠️ claude-opus-5-5 is a selectable CANDIDATE, deliberately NOT first. It is
+# newer and benchmarks higher, but flagship stays opus-4-8 until an OS-Eval A/B
+# clears it on the behavior axes that matter here (cognition-adherence,
+# adversarial convergence, writing — community reports 5.5 writing regressed vs
+# 4.7). Promoting it = move it to index 0 (settings.py auto-resets default_model
+# to available_models[0]); do that only after the eval, never as a side effect.
 
 # Derived — never hand-maintain a parallel list.
 MODEL_NAMES: list[str] = list(MODEL_REGISTRY)
@@ -297,6 +304,43 @@ def supports_custom_temperature(model: str | None) -> bool:
     if version is None:
         return True
     return version < _MIN_OPUS_REJECTING_TEMPERATURE
+
+
+# Opus 5 and later reject thinking.type "disabled" and "enabled" (manual budget):
+# both return a 400 invalid_request_error. Adaptive is the only accepted on-mode.
+# (Threshold is (5, 0) not (5, 5): opus-5 is also adaptive-first, and silently
+# upgrading a disabled/enabled request to adaptive is harmless for it — the guard
+# that consumes this just avoids sending a mode the model will 400 on.)
+_MIN_OPUS_REJECTING_DISABLED_THINKING: tuple[int, int] = (5, 0)
+
+
+def supports_disabled_thinking(model: str | None) -> bool:
+    """Return True when ``model`` accepts ``thinking.type`` "disabled"/"enabled".
+
+    A FAMILY comparison, not a hardcoded allowlist — the exact shape of
+    :func:`supports_custom_temperature`, and for the same reason: an allowlist
+    (``{"claude-opus-5-5"}``) would silently mis-answer the NEXT opus, reading it
+    as "supports disabled" and sending a mode it 400s on. Comparing versions
+    keeps a future opus correct with no code edit.
+
+    Non-opus models (sonnet, haiku, anything unrecognized) and falsy input are
+    treated as supporting a disabled thinking mode — the historical default — so
+    this never down-grades a model that genuinely accepts ``disabled``.
+
+    Consumed by ``prompt_builder.build_options`` to down-grade a configured
+    ``disabled``/``enabled`` thinking mode to ``adaptive`` for a model that
+    rejects it, rather than letting the request fail on the wire.
+
+    Args:
+        model: Short name, full Bedrock ID, or ``None``.
+
+    Returns:
+        True if a disabled/enabled thinking mode may be sent.
+    """
+    version = _opus_version(normalize_short_name(model))
+    if version is None:
+        return True
+    return version < _MIN_OPUS_REJECTING_DISABLED_THINKING
 
 
 def context_window_for(model: str | None) -> int:

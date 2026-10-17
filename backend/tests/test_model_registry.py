@@ -155,6 +155,35 @@ class TestFlagshipOrdering:
             "claude-opus-5 must NOT be first (it is intentionally not the default)"
         )
 
+    def test_opus_5_5_is_available_but_not_flagship(self):
+        """opus-5-5 is a selectable candidate — added, NOT made flagship.
+
+        It must be in the registry (so Settings can pick it + resolve its
+        Bedrock id) AND it must NOT be index 0 (settings.py auto-resets
+        default_model to available_models[0]; placing 5-5 first would silently
+        swap the default). Teeth: moving 5-5 to index 0, or dropping it, turns
+        this RED.
+        """
+        assert "claude-opus-5-5" in reg.MODEL_REGISTRY, (
+            "claude-opus-5-5 must be a selectable registry member"
+        )
+        assert reg.MODEL_REGISTRY["claude-opus-5-5"] == "us.anthropic.claude-opus-5-5"
+        assert reg.MODEL_NAMES[0] != "claude-opus-5-5", (
+            "claude-opus-5-5 must NOT be first — default stays opus-4-8"
+        )
+        assert reg.FLAGSHIP_MODEL == "claude-opus-4-8", (
+            "flagship must remain opus-4-8 — this change adds a candidate, "
+            "not a new default"
+        )
+        # Placed AFTER opus-4-8 (not before) — the explicit insertion contract.
+        names = reg.MODEL_NAMES
+        assert names.index("claude-opus-5-5") > names.index("claude-opus-4-8")
+
+    def test_opus_5_5_resolves_bedrock_id(self):
+        """The 5-5 Bedrock id must resolve (it is the live inference-profile)."""
+        assert reg.resolve_bedrock_id("claude-opus-5-5") == "us.anthropic.claude-opus-5-5"
+        assert reg.resolve_bedrock_id("us.anthropic.claude-opus-5-5") == "us.anthropic.claude-opus-5-5"
+
     def test_default_config_default_model_is_flagship(self):
         assert DEFAULT_CONFIG["default_model"] == reg.FLAGSHIP_MODEL
 
@@ -353,6 +382,47 @@ class TestTemperatureDerivation:
 
     def test_bedrock_prefixed_form_agrees(self):
         assert reg.supports_custom_temperature("us.anthropic.claude-opus-5") is False
+
+
+class TestDisabledThinkingDerivation:
+    """Opus >= 5 rejects thinking:disabled / enabled+budget — a 400 on the wire.
+
+    A FAMILY comparison mirroring supports_custom_temperature: a hardcoded
+    allowlist would silently mis-answer a future opus. Non-opus and unrecognized
+    models keep the historical default (disabled IS supported) so this never
+    down-grades a model that genuinely accepts a disabled thinking mode.
+
+    Teeth: an allowlist form (e.g. {"claude-opus-5-5"}) turns
+    test_newer_opus_also_rejects_disabled RED, because a newer opus is absent
+    from the set and would read as "supports disabled".
+    """
+
+    @pytest.mark.parametrize("model,expected", [
+        ("claude-opus-4-6", True),
+        ("claude-opus-4-7", True),
+        ("claude-opus-4-8", True),
+        ("claude-opus-5", False),
+        ("claude-opus-5-5", False),
+        ("claude-opus-6", False),
+        ("claude-sonnet-4-6", True),
+        ("claude-haiku-3", True),
+        ("gpt-4", True),
+        (None, True),
+    ])
+    def test_supports_disabled_thinking(self, model, expected):
+        assert reg.supports_disabled_thinking(model) is expected
+
+    def test_newer_opus_also_rejects_disabled(self):
+        """Any opus at or past 5 must reject a disabled thinking mode."""
+        assert reg.supports_disabled_thinking("claude-opus-5-5") is False
+
+    def test_bedrock_prefixed_form_agrees(self):
+        assert reg.supports_disabled_thinking("us.anthropic.claude-opus-5-5") is False
+        assert reg.supports_disabled_thinking("claude-opus-5-5[1m]") is False
+
+    def test_opus_4_8_flagship_still_supports_disabled(self):
+        """The current flagship must NOT be caught by the guard (no false-trip)."""
+        assert reg.supports_disabled_thinking(reg.FLAGSHIP_MODEL) is True
 
     def test_llm_optimizer_CONSUMES_the_derivation(self, monkeypatch):
         """The teeth: llm_optimizer must actually USE the registry predicate.
