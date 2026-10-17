@@ -189,7 +189,7 @@ async def _rehydrate_pipeline_run_id(ctx: dict, session_id: str) -> None:
         logger.debug("pipeline_run_id re-hydration skipped: %s", e)
 
 
-def _clean_blocks_for_persist(blocks: list) -> list:
+def _clean_blocks_for_persist(blocks: list, *, assistant: bool = True) -> list:
     """Return a NEW blocks list with raw tool-call leaks stripped from every text
     block — the single write-side clean (run_2bdec5c0, re-homed run_719886ee).
 
@@ -211,8 +211,12 @@ def _clean_blocks_for_persist(blocks: list) -> list:
     leak-cleaning (losing content is the worse harm). The strip itself is lossless
     on clean text (run_719886ee fixed the 2a mask corruption), so a clean block is
     returned byte-for-byte.
+
+    ``assistant=True`` also strips the glitch-prefix shape (``strip_glitch_prefix``:
+    a corrupted opener word at a line start). It is model output only — a USER may
+    legitimately type "count 一下", so the user persist passes ``assistant=False``.
     """
-    from .session_utils import strip_tool_call_leak
+    from .session_utils import strip_glitch_prefix, strip_tool_call_leak
 
     cleaned: list = []
     for blk in blocks:
@@ -221,7 +225,10 @@ def _clean_blocks_for_persist(blocks: list) -> list:
             and blk.get("type") == "text"
             and isinstance(blk.get("text"), str)
         ):
-            cleaned.append({**blk, "text": strip_tool_call_leak(blk["text"])})
+            text = strip_tool_call_leak(blk["text"])
+            if assistant:
+                text = strip_glitch_prefix(text)
+            cleaned.append({**blk, "text": text})
         else:
             cleaned.append(blk)
     return cleaned
@@ -3314,7 +3321,7 @@ class SessionRouter:
                 # (a user re-feeding a prior turn's on-screen leak remnant); without
                 # this, resume splices it back into the prompt and re-induces the
                 # leak. Lossless on clean text; fenced/inline discussion preserved.
-                user_content = _clean_blocks_for_persist(user_content)
+                user_content = _clean_blocks_for_persist(user_content, assistant=False)
                 await db.messages.put({
                     "id": persisted_msg_id,
                     "session_id": session_id,

@@ -11,8 +11,10 @@ Public symbols:
 - ``clean_transcript_leaks(path)``    — strip leak text from assistant text
   blocks in place (atomic replace); returns the number of blocks changed.
 
-Only ASSISTANT text blocks whose text starts a line with a raw ``‹invoke``
-outside code spans are touched (the same signal the live stream uses); prose
+Only ASSISTANT text blocks are touched: a raw line-start ``‹invoke`` outside
+code spans (the signal the live stream uses) is stripped, and so is the second
+glitch shape — a corrupted opener word at the start of a narration line
+(``detect_glitch_prefix``), which the model also copies from history. Prose
 that discusses the syntax, tool results, and user messages are left alone.
 """
 from __future__ import annotations
@@ -24,7 +26,13 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from .session_utils import find_stream_leak_onset, strip_tool_call_leak
+from .session_utils import (
+    _has_glitch_word,
+    detect_glitch_prefix,
+    find_stream_leak_onset,
+    strip_glitch_prefix,
+    strip_tool_call_leak,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +65,9 @@ def find_transcript(sdk_session_id: Optional[str]) -> Optional[Path]:
 
 def _clean_line(line: str) -> tuple[str, int]:
     """Return (line, n_blocks_changed) for one transcript record."""
-    if "<invoke" not in line or '"assistant"' not in line:
+    if '"assistant"' not in line or not (
+        "<invoke" in line or _has_glitch_word(line)
+    ):
         return line, 0
     try:
         rec = json.loads(line)
@@ -73,9 +83,13 @@ def _clean_line(line: str) -> tuple[str, int]:
         if not (isinstance(block, dict) and block.get("type") == "text"):
             continue
         text = block.get("text")
-        if not isinstance(text, str) or find_stream_leak_onset(text) == -1:
+        if not isinstance(text, str):
             continue
-        cleaned = strip_tool_call_leak(text)
+        cleaned = text
+        if find_stream_leak_onset(cleaned) != -1:
+            cleaned = strip_tool_call_leak(cleaned)
+        if detect_glitch_prefix(cleaned):
+            cleaned = strip_glitch_prefix(cleaned)
         if cleaned != text:
             block["text"] = cleaned if cleaned.strip() else EMPTY_FILLER
             n += 1

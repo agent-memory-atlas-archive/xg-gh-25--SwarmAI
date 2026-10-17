@@ -163,10 +163,14 @@ class RetryManager:
         self,
         options: ClaudeAgentOptions,
         config: Optional[Any],
+        kind: str = "leak",
     ) -> AsyncIterator[dict]:
         """Clean a leak-poisoned CLI transcript and continue the turn.
 
-        Raised for by the orchestrator on the 2nd+ leak in one SDK session.
+        Raised for by the orchestrator on the 2nd+ leak in one SDK session
+        (``kind="leak"``), or at a tool-result boundary after a glitch prefix
+        (``kind="prefix"``: the tool call ran, so the continuation prompt just
+        says to continue).
         The CLI process holds the leaked text in memory, so it must stop
         before the transcript can be cleaned and re-read: kill (identity
         kept) → strip leak text from ``<sid>.jsonl`` → spawn with --resume →
@@ -197,10 +201,17 @@ class RetryManager:
         # clean); count afresh against the resumed session.
         parent._leak_sid = resume_sid
         parent._leak_count = 0
+        # The glitch flag is moot once the transcript has just been cleaned.
+        parent._transcript_poisoned = False
         logger.warning(
-            "session_unit.tool_call_leak_restart_cleaned session_id=%s "
+            "session_unit.tool_call_leak_restart_cleaned session_id=%s kind=%s "
             "transcript_found=%s blocks_cleaned=%d — resuming",
-            parent.session_id, path is not None, cleaned,
+            parent.session_id, kind, path is not None, cleaned,
+        )
+        prompt = (
+            StreamingOrchestrator._GLITCH_CONTINUATION_PROMPT
+            if kind == "prefix"
+            else StreamingOrchestrator._LEAK_CONTINUATION_PROMPT
         )
 
         retry_options = parent._build_retry_options(options, resume_sid)
@@ -221,9 +232,7 @@ class RetryManager:
 
         parent._transition(SessionState.STREAMING)
         try:
-            async for event in parent._streaming_orchestrator.stream_query(
-                StreamingOrchestrator._LEAK_CONTINUATION_PROMPT
-            ):
+            async for event in parent._streaming_orchestrator.stream_query(prompt):
                 yield event
             yield {"_recovered": True}
         except Exception as recovery_exc:

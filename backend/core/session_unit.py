@@ -653,6 +653,10 @@ class SessionUnit:
         self._leak_count: int = 0
         self._leak_restart_eligible: bool = False
         self._leak_restart_done: bool = False
+        # Set by the orchestrator when a turn ended with the glitch prefix still
+        # in the CLI history (no safe mid-turn restart). The next send() kills
+        # the warm process and cleans the transcript before --resume reads it.
+        self._transcript_poisoned: bool = False
 
         # ── Streaming timeout ────────────────────────────────────────
         # Updated on every yielded event during STREAMING.  The
@@ -2234,6 +2238,12 @@ class SessionUnit:
         # defeat the prewarm. The prefix is the ONLY signal that distinguishes the
         # two, so the exemption keys on it (lazy import avoids the session_router↔
         # session_unit circular dependency — same pattern as lifecycle_manager).
+        # Glitch-poisoned history from the previous turn (see _transcript_poisoned):
+        # clean it before the CLI reads it again, so the model can't copy it.
+        # (getattr: some fixtures build a unit with __new__, skipping __init__.)
+        if getattr(self, "_transcript_poisoned", False):
+            await self._clean_poisoned_transcript()
+
         if self._should_poison_guard_recycle():
             logger.info(
                 "session_unit.poison_guard_recycle session_id=%s — warm IDLE "
@@ -2564,9 +2574,12 @@ class SessionUnit:
             # once per message, so it can never loop. On success the user sees
             # the turn continue; nothing is shown about the restart.
             if LEAK_RESTART_MARKER in error_str:
+                from .session_utils import LEAK_RESTART_KIND_PREFIX
+
                 recovered = False
                 async for event in self._retry_manager._handle_leak_poison_restart(
                     options, config,
+                    kind="prefix" if LEAK_RESTART_KIND_PREFIX in error_str else "leak",
                 ):
                     if event.get("_abort"):
                         return  # spawn failed (error already yielded)
@@ -4690,6 +4703,38 @@ class SessionUnit:
                 self.session_id, exc_info=True,
             )
             return {}
+
+    async def _clean_poisoned_transcript(self) -> None:
+        """Clean a glitch-poisoned CLI transcript before the next turn reads it.
+
+        The live CLI holds its history in memory, so a warm process is recycled
+        first (identity kept → the following spawn uses --resume on the cleaned
+        file). One-shot: the flag is cleared up front. Never raises.
+        """
+        from .leak_transcript import clean_transcript_leaks, find_transcript
+
+        self._transcript_poisoned = False
+        sid = self._sdk_session_id
+        if not sid:
+            return  # no --resume identity → the next spawn won't read it
+        try:
+            if self.is_alive:
+                await self._arm_recovery_checkpoint("glitch_clean_recycle")
+                await self._crash_to_cold_async(clear_identity=False)
+            path = await asyncio.to_thread(find_transcript, sid)
+            cleaned = (
+                await asyncio.to_thread(clean_transcript_leaks, path) if path else 0
+            )
+            logger.warning(
+                "session_unit.tool_call_glitch_cleaned session_id=%s "
+                "transcript_found=%s blocks_cleaned=%d",
+                self.session_id, path is not None, cleaned,
+            )
+        except Exception as exc:  # noqa: BLE001 — cleaning must not block send()
+            logger.warning(
+                "session_unit.tool_call_glitch_clean_failed session_id=%s: %s",
+                self.session_id, exc,
+            )
 
     async def _arm_recovery_checkpoint(
         self, trigger: str, *, allow_wrapup: bool = False

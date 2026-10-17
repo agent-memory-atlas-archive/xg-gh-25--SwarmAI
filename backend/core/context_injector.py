@@ -25,7 +25,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from core import executors
-from core.session_utils import strip_tool_call_leak
+from core.session_utils import strip_glitch_prefix, strip_tool_call_leak
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +143,12 @@ def _format_message(message: dict) -> str | None:
                     # Clean raw tool-call leaks before this historical text is
                     # spliced into the resume prompt (cuts the leak feedback
                     # loop); fenced/inline references preserved byte-for-byte.
-                    parts.append(strip_tool_call_leak(text))
+                    # Assistant rows also lose the glitch-prefix word (older rows
+                    # were persisted before the write-side strip existed).
+                    text = strip_tool_call_leak(text)
+                    if role == "assistant":
+                        text = strip_glitch_prefix(text)
+                    parts.append(text)
             elif block_type == "image":
                 parts.append("[image attachment]")
             elif block_type == "document":

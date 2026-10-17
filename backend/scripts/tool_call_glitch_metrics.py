@@ -13,7 +13,10 @@ Per day it reports:
               stage-landmark exception keeps this above 0)
 - leaks:      daemon log lines `tool_call_leak_stripped` (transcripts get
               cleaned by the restart path, so logs are the source of truth)
-- prefix:     narration lines starting with a glitch word right before a call
+- prefix:     responses whose pre-call text has a glitch-prefix line
+              (``core.session_utils.detect_glitch_prefix``); max of that and the
+              daemon log count `tool_call_glitch_prefix_stripped`, since the
+              runtime now strips it and cleans transcripts
 - glitch%:    (leaks + prefix) / calls
 
 Sources: CLI transcripts (~/.claude/projects/**/*.jsonl, or CLAUDE_CONFIG_DIR)
@@ -34,19 +37,22 @@ import glob
 import json
 import os
 import re
+import sys
 from pathlib import Path
 
-# Glitch words seen so far; a word must be followed by a CJK character or a
-# line ending in ':' to count, so ordinary English ("count the files") is not.
-_PREFIX_RE = re.compile(
-    r"(?m)^(?:count|court|core|card|care|call|coute)[ \t]*[:：,，]?[ \t]*(?=[\u4e00-\u9fff])"
-)
-# A bare glitch word as the LAST line of the text right before the call.
-_BARE_LAST_RE = re.compile(r"(?:^|\n)[ \t]*(?:count|court|core|card|care|coute)[ \t]*\s*\Z")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # backend/
+# One definition of the prefix shape, shared with the runtime strip/restart.
+from core.session_utils import detect_glitch_prefix  # noqa: E402
+
 _LEAK_LINE_RE = re.compile(r"(?m)^[ \t]*<invoke\s+name=")
 # Older daemons logged `_detected` (kill path), newer ones `_stripped`.
 _LOG_LEAK_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2}) .*session_unit\.tool_call_leak_(?:stripped|detected)"
+)
+# The runtime strips the prefix shape (and cleans transcripts), so logs are the
+# source of truth for it from then on, as for leaks.
+_LOG_PREFIX_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}) .*session_unit\.tool_call_glitch_prefix_stripped"
 )
 
 
@@ -58,9 +64,7 @@ def classify_response(blocks: list) -> tuple[bool, bool, bool, bool]:
     if not made_call:
         return False, False, False, False
     pre_text = any(t.strip() for t in texts)
-    prefix = not leaked and any(
-        _PREFIX_RE.search(t) or _BARE_LAST_RE.search(t) for t in texts
-    )
+    prefix = not leaked and any(detect_glitch_prefix(t) for t in texts)
     return True, pre_text, prefix, leaked
 
 
@@ -127,6 +131,10 @@ def daily_metrics(days: int) -> dict[str, collections.Counter]:
                     m = _LOG_LEAK_RE.match(line)
                     if m and m.group(1) >= since:
                         out[m.group(1)]["leaks_log"] += 1
+                        continue
+                    m = _LOG_PREFIX_RE.match(line)
+                    if m and m.group(1) >= since:
+                        out[m.group(1)]["prefix_log"] += 1
         except OSError:
             continue
     return dict(out)
@@ -144,11 +152,13 @@ def main() -> None:
         # Logs survive transcript cleaning but rotate; transcripts keep old
         # days but lose cleaned leaks — take the larger count per day.
         leaks = max(c["leaks_log"], c["leaks_tx"])
+        # Same for the prefix shape once the runtime strips + cleans it.
+        prefix = max(c["prefix_log"], c["prefix"])
         if not calls and not leaks:
             continue
         pre = 100 * c["pre_text"] / calls if calls else 0.0
-        glitch = 100 * (leaks + c["prefix"]) / calls if calls else 0.0
-        print(f"{day:10s} {calls:6d} {pre:8.1f}% {leaks:5d} {c['prefix']:6d} {glitch:6.2f}%")
+        glitch = 100 * (leaks + prefix) / calls if calls else 0.0
+        print(f"{day:10s} {calls:6d} {pre:8.1f}% {leaks:5d} {prefix:6d} {glitch:6.2f}%")
 
 
 if __name__ == "__main__":

@@ -207,6 +207,25 @@ class StreamingOrchestrator:
             return False
         return True
 
+    # Continuation after a glitch-prefix restart. The tool call DID run, so this
+    # must not say it failed. No tool-call markup and no glitch word in it.
+    _GLITCH_CONTINUATION_PROMPT = "Continue the task where you left off."
+
+    def _should_restart_for_glitch(self) -> bool:
+        """True at a tool-result boundary where the glitch restart is safe."""
+        parent = self._parent
+        if not getattr(parent, "_leak_restart_eligible", False):
+            return False  # not the primary send() stream, or budget used
+        if not parent._sdk_session_id:
+            return False  # nothing to --resume
+        if parent._open_tool_uses:
+            return False  # a tool is still running — never cut it off
+        if getattr(parent, "_pending_tool_use_id", None) is not None:
+            return False  # an AskUserQuestion / approval is outstanding
+        if parent._interrupted or getattr(parent, "_user_stopped_current_turn", False):
+            return False
+        return True
+
     def _record_token_usage_bg(self, message: Any, usage: dict) -> None:
         """Fire-and-forget token accounting for a response whose `result` is
         not forwarded (leak continuation) — its tokens were still spent."""
@@ -662,6 +681,13 @@ class StreamingOrchestrator:
         # Consecutive continuations that produced no real tool_use. Bounds the
         # retry so a model that keeps leaking cannot loop.
         _leak_continuations = 0
+        # True once a main-thread text block carried the glitch-prefix shape
+        # ("core 跑测试…"). The word is stripped from what is shown/persisted,
+        # but the CLI's in-memory history keeps it and the model copies it, so
+        # the next safe boundary (tool results back, nothing open) hands off to
+        # the clean+resume restart; if the turn ends first, the transcript is
+        # flagged for cleaning before the next send() reuses it.
+        _glitch_pending = False
 
         # ── Permission queue watcher ──────────────────────────────
         # The dangerous_command_gate hook blocks inside PreToolUse
@@ -1129,6 +1155,29 @@ class StreamingOrchestrator:
                             _pending_file_changes.pop(_tuid, None)
                             _pending_file_deletes.pop(_tuid, None)
                             _pending_completion.pop(_tuid, None)
+                # ── Glitch prefix in history → clean + resume at this boundary ──
+                # Tool results just came back, so the model is about to write
+                # its next response from a history that still holds the glitch
+                # word (copied by ~31% of later calls). With nothing open, hand
+                # off to send()'s one-shot restart: kill, clean the transcript,
+                # --resume, and continue the turn. Same guards and budget as the
+                # leak restart (primary stream only, once per user message).
+                if _glitch_pending and self._should_restart_for_glitch():
+                    from .session_utils import (
+                        LEAK_RESTART_KIND_PREFIX,
+                        LEAK_RESTART_MARKER,
+                    )
+
+                    self._parent._leak_restart_eligible = False
+                    logger.warning(
+                        "session_unit.tool_call_glitch_restart session_id=%s — "
+                        "glitch prefix in history; cleaning transcript + resume",
+                        self._parent.session_id,
+                    )
+                    raise RuntimeError(
+                        f"{LEAK_RESTART_MARKER} {LEAK_RESTART_KIND_PREFIX} "
+                        f"(session_id={self._parent.session_id})"
+                    )
                 continue
 
             # ── AssistantMessage: full content blocks ─────────────
@@ -1173,12 +1222,16 @@ class StreamingOrchestrator:
                         # removed with the kill()+raise it gated: strip + keep is
                         # correct for both.
                         from .session_utils import (
+                            detect_glitch_prefix,
                             detect_tool_call_leak,
+                            strip_glitch_prefix,
                             strip_tool_call_leak,
                         )
 
                         if detect_tool_call_leak(block.text):
-                            cleaned_text = strip_tool_call_leak(block.text)
+                            cleaned_text = strip_glitch_prefix(
+                                strip_tool_call_leak(block.text)
+                            )
                             logger.warning(
                                 "session_unit.tool_call_leak_stripped "
                                 "session_id=%s — tool-call XML in text channel; "
@@ -1200,7 +1253,24 @@ class StreamingOrchestrator:
                             continue
                         if block.text.strip():
                             _leak_tail = False  # model wrote real prose after it
-                        content_blocks.append({"type": "text", "text": block.text})
+                        _text = block.text
+                        # ── Glitch-prefix shape (same glitch, second shape) ──
+                        # A corrupted opener word left at the start of a
+                        # narration line. Strip it from what is shown/persisted
+                        # (always yield the block so the frontend replaces its
+                        # provisional streamed text). Only main-thread text arms
+                        # the restart: a sub-agent's text lives in its own
+                        # sidechain transcript, which a parent restart can't clean.
+                        if detect_glitch_prefix(_text):
+                            _text = strip_glitch_prefix(_text)
+                            if not getattr(message, "parent_tool_use_id", None):
+                                _glitch_pending = True
+                            logger.warning(
+                                "session_unit.tool_call_glitch_prefix_stripped "
+                                "session_id=%s block_len=%d→%d",
+                                self._parent.session_id, len(block.text), len(_text),
+                            )
+                        content_blocks.append({"type": "text", "text": _text})
                     elif isinstance(block, ThinkingBlock):
                         # Skip content-free thinking blocks. Bedrock CAN emit
                         # thinking blocks with empty/whitespace content under
@@ -1986,6 +2056,17 @@ class StreamingOrchestrator:
                         "session_unit.tool_call_leak_unrecovered session_id=%s "
                         "continuations=%d — ending turn",
                         self._parent.session_id, _leak_continuations,
+                    )
+
+                # Glitch prefix seen but no safe mid-turn boundary came (or the
+                # restart budget was used): the transcript still holds it. Flag
+                # it so the next send() cleans it before the CLI reads it again.
+                if _glitch_pending:
+                    self._parent._transcript_poisoned = True
+                    logger.warning(
+                        "session_unit.tool_call_glitch_deferred_clean session_id=%s "
+                        "— transcript flagged for cleaning before the next send",
+                        self._parent.session_id,
                     )
 
                 # run_cce6f4b9: the TURN-END git sweep (sweep_turn_delta) was DELETED —

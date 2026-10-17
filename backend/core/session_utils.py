@@ -689,6 +689,64 @@ def strip_tool_call_leak(text: str) -> str:
 # Raised by the orchestrator on a repeated leak; send() catches it and runs the
 # one-shot transcript-clean restart. Deliberately NOT a retriable pattern.
 LEAK_RESTART_MARKER = "Tool-call leak poison restart"
+# Suffix on the same marker when the restart is for a glitch prefix (the tool
+# call itself ran fine, so the continuation prompt must not say it failed).
+LEAK_RESTART_KIND_PREFIX = "kind=prefix"
+
+
+# ── Glitch-prefix shape (second shape of the same model glitch) ──────────────
+# At a text→tool_use transition the model sometimes corrupts the call opener into
+# a word and leaves it at the start of a narration line ("core 跑测试…",
+# "count 显示 2 paused", "core GREEN change 3") or alone on a line ("core"). The
+# real tool call still runs. Once such a line is in the CLI history the model
+# copies it (measured: ~31% of later calls vs ~0.5% onset), so it is stripped
+# from display/persist and cleaned from the transcript.
+#
+# Matching is deliberately narrow, all on code-span-masked text:
+# - only these lowercase words, at a line start;
+# - prefix form: word, optional colon/comma, then a CJK char or an UPPERCASE
+#   ASCII letter (English prose starts a sentence with "Count", not "count X");
+# - bare form: the word alone on its line.
+# The word list is the single source shared with
+# scripts/tool_call_glitch_metrics.py; add a new word here when the metric shows one.
+GLITCH_WORDS = ("count", "court", "core", "card", "care", "call", "coute")
+_GLITCH_ALT = "|".join(GLITCH_WORDS)
+_GLITCH_PREFIX_RE = re.compile(
+    rf"(?m)^([ \t]*)(?:{_GLITCH_ALT})[ \t]*[:：,，]?[ \t]*(?=[\u4e00-\u9fffA-Z])"
+)
+_GLITCH_BARE_LINE_RE = re.compile(rf"(?m)^[ \t]*(?:{_GLITCH_ALT})[ \t]*(?:\r?\n|\Z)")
+
+
+def _has_glitch_word(text: str) -> bool:
+    """Cheap pre-check before masking (hot path: every assistant text block)."""
+    return any(w in text for w in GLITCH_WORDS)
+
+
+def detect_glitch_prefix(text: str) -> bool:
+    """True if ``text`` has a glitch-prefix or bare glitch-word line outside code."""
+    if not text or not _has_glitch_word(text):
+        return False
+    masked, _spans = _mask_doc_contexts(text)
+    return bool(_GLITCH_PREFIX_RE.search(masked) or _GLITCH_BARE_LINE_RE.search(masked))
+
+
+def strip_glitch_prefix(text: str) -> str:
+    """Remove glitch prefix words and bare glitch-word lines; keep everything else.
+
+    Code spans are masked and restored verbatim. Idempotent. A text that was only
+    a bare word becomes "" (callers that cannot store an empty block substitute a
+    filler).
+    """
+    if not text or not _has_glitch_word(text):
+        return text
+    masked, spans = _mask_doc_contexts(text)
+    cleaned = _GLITCH_BARE_LINE_RE.sub("", masked)
+    cleaned = _GLITCH_PREFIX_RE.sub(r"\1", cleaned)
+    if cleaned == masked:
+        return _restore_doc_contexts(masked, spans)
+    # Removing a bare line can leave 3+ newlines; keep paragraphs tidy.
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip("\n") if cleaned.strip() else ""
+    return _restore_doc_contexts(cleaned, spans)
 
 
 def find_stream_leak_onset(buf: str) -> int:

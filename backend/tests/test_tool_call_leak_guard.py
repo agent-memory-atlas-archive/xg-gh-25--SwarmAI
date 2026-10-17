@@ -928,10 +928,12 @@ def test_session_router_user_persist_calls_clean():
     idx = src.find('"role": "user"')
     assert idx != -1, "user-persist put not found"
     window = src[max(0, idx - 800):idx]
-    assert "_clean_blocks_for_persist(user_content)" in window, (
+    assert "_clean_blocks_for_persist(user_content" in window, (
         "user_content is persisted WITHOUT _clean_blocks_for_persist — the raw-leak "
         "user-persist gap (run_67250d95) is open"
     )
+    # A user may type "count 一下": the glitch-prefix strip is assistant-only.
+    assert "_clean_blocks_for_persist(user_content, assistant=False)" in window
 
 
 # ── ReDoS: strip must be linear-time ───────────────────────────────────────

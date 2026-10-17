@@ -24,6 +24,7 @@ Key public symbols:
 - ``build_context_warning()``    — Context window warning event
 - ``get_model_context_window()`` — Context window size for a model
 - ``sum_usage_input_tokens()``   — Sum all input token fields (static)
+- ``CLI_SKILL_OVERRIDES``        — CLI-bundled skills turned off (``--settings``)
 
 No subprocess lifecycle, routing, or hook logic lives here.
 """
@@ -53,6 +54,14 @@ if TYPE_CHECKING:
     from .app_config_manager import AppConfigManager
 
 logger = logging.getLogger(__name__)
+
+# CLI-bundled skills turned off for every SwarmAI session (Claude Code
+# `skillOverrides`; "off" hides a skill from the model's listing and rejects a
+# Skill call by name — verified on CLI 2.1.190: init skills 66 → 65).
+# - claude-api: one invocation injects ~734K chars (~290K tokens) of SDK docs as a
+#   meta message (session f2eb58c2 jumped 158K → 448K context on its first call).
+#   Model facts come from WebFetch of the official docs instead.
+CLI_SKILL_OVERRIDES: dict[str, str] = {"claude-api": "off"}
 
 
 def assert_core_sections(prompt_text: str) -> list[str]:
@@ -2340,6 +2349,10 @@ class PromptBuilder:
             stderr=lambda msg: logger.error(msg),
             cwd=_channel_sender_dir or working_directory,
             setting_sources=setting_sources,
+            # Flag-level CLI settings (`--settings`; the SDK merges `sandbox` in).
+            # Hides CLI-bundled skills that SwarmAI must not load — see
+            # CLI_SKILL_OVERRIDES.
+            settings=json.dumps({"skillOverrides": CLI_SKILL_OVERRIDES}),
             hooks=hooks if hooks else None,
             resume=resume_session_id,
             sandbox=sandbox_settings,
