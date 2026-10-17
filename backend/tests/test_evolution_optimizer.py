@@ -303,10 +303,9 @@ class TestRunEvolutionCycle:
         transcripts_dir = tmp_path / "transcripts"
         transcripts_dir.mkdir()
         records = []
-        # 6 user/assistant pairs mine to 3 examples (the keyword pass advances past
-        # the user turn after each response): below the normal 5-example bar, at the
-        # priority bar of 3.
-        for i in range(6):
+        # 3 user/assistant pairs mine to 3 examples: below the normal 5-example bar,
+        # at the priority bar of 3.
+        for i in range(3):
             records.append(json.dumps({"type": "user", "message": {"content": f"weather forecast {i}"}}))
             records.append(json.dumps({"type": "assistant", "message": {"content": f"The weather is {i}C"}}))
         (transcripts_dir / "session1.jsonl").write_text("\n".join(records))

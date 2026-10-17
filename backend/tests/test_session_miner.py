@@ -536,6 +536,52 @@ class TestCorrectionConsumed:
         assert len(clean) == 1
 
 
+class TestKeywordPassAdvance:
+    """Path 1 (keyword pass) must resume at the record after the reply, not past it.
+
+    It used to do ``i = j + 1``, which skipped the user turn right after every
+    reply, so N back-to-back prompts mined to ~N/2 examples. Corrections are
+    guarded by ``correction_consumed`` instead.
+    """
+
+    @staticmethod
+    def _miner(tmp_path, records):
+        skills_dir = tmp_path / "skills"
+        (skills_dir / "s_weather").mkdir(parents=True)
+        (skills_dir / "s_weather" / "SKILL.md").write_text(
+            "---\nname: weather\ndescription: >\n  Get weather\n"
+            "  TRIGGER: weather, forecast\n---\nCheck the weather.\n"
+        )
+        evals_dir = tmp_path / "evals"
+        evals_dir.mkdir()
+        transcripts_dir = tmp_path / "transcripts"
+        transcripts_dir.mkdir()
+        _write_jsonl(transcripts_dir / "session.jsonl", records)
+        return SessionMiner(transcripts_dir, skills_dir, evals_dir)
+
+    def test_back_to_back_prompts_all_mined(self, tmp_path):
+        records = []
+        for i in range(4):
+            records.append({"type": "user", "message": {"content": f"weather forecast {i}"}})
+            records.append({"type": "assistant", "message": {"content": f"The weather is {i}C"}})
+        examples = self._miner(tmp_path, records).mine_all().get("weather", [])
+        assert sorted(e.user_prompt for e in examples) == [
+            f"weather forecast {i}" for i in range(4)
+        ]
+
+    def test_keyword_bearing_correction_not_mined_as_new_prompt(self, tmp_path):
+        records = [
+            {"type": "user", "message": {"content": "weather forecast for Beijing"}},
+            {"type": "assistant", "message": {"content": "Sunny, 25C"}},
+            {"type": "user", "message": {"content": "不对 weather 应该查上海"}},
+            {"type": "assistant", "message": {"content": "Shanghai: rain, 20C"}},
+        ]
+        examples = self._miner(tmp_path, records).mine_all().get("weather", [])
+        assert len(examples) == 1, [(e.user_prompt, e.user_correction) for e in examples]
+        assert examples[0].user_prompt == "weather forecast for Beijing"
+        assert examples[0].user_correction == "不对 weather 应该查上海"
+
+
 class TestLoadHistoricalCorrections:
     """Verify historical correction loading from persisted evals."""
 

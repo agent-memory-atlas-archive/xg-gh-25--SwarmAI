@@ -409,7 +409,14 @@ class SessionMiner:
                         score=score,
                     ))
                     seen_indices.add(i)
-                    i = j + 1 if j < len(records) else i + 1
+                    # Resume AT j (the first non-assistant record after the reply),
+                    # never past it. The old `i = j + 1` predated correction_consumed:
+                    # it skipped records[j] so a correction wasn't re-mined as a new
+                    # invocation, but it also dropped every back-to-back prompt
+                    # (N prompts → ~N/2 examples). correction_consumed now guards
+                    # corrections, wherever _detect_correction found them. j > i
+                    # always (j starts at i + 1), so this still makes progress.
+                    i = j
                     continue
             i += 1
 
