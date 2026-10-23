@@ -94,6 +94,19 @@ async def list_channel_types():
     return list_supported_types()
 
 
+@router.get("/inbox")
+async def list_inbox(since: str | None = None, limit: int = 50):
+    """List inbound messages across all channels (unified inbox).
+
+    Declared BEFORE ``/{channel_id}`` so FastAPI doesn't treat "inbox"
+    as a channel_id path parameter.
+    """
+    # Cap limit to prevent OOM on large tables
+    limit = min(max(limit, 1), 200)
+    rows = await db.channel_messages.list_inbox(since=since, limit=limit)
+    return rows
+
+
 @router.get("/{channel_id}", response_model=ChannelResponse)
 async def get_channel(channel_id: str):
     """Get a single channel by ID."""
@@ -325,6 +338,7 @@ async def start_channel(channel_id: str):
         messages_processed=status.get("messages_processed", 0),
         active_sessions=status.get("active_sessions", 0),
         error_message=status.get("error_message"),
+        connection_mode=status.get("connection_mode"),
     )
 
 
@@ -375,6 +389,7 @@ async def restart_channel(channel_id: str):
         messages_processed=status.get("messages_processed", 0),
         active_sessions=status.get("active_sessions", 0),
         error_message=status.get("error_message"),
+        connection_mode=status.get("connection_mode"),
     )
 
 
@@ -395,6 +410,7 @@ async def get_channel_status(channel_id: str):
         messages_processed=status.get("messages_processed", 0),
         active_sessions=status.get("active_sessions", 0),
         error_message=status.get("error_message"),
+        connection_mode=status.get("connection_mode"),
     )
 
 
