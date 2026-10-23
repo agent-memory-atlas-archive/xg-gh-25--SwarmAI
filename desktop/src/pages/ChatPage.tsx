@@ -1539,10 +1539,12 @@ export default function ChatPage() {
     }
   }, [messagesReady]);
 
-  // Scroll to bottom after tab restore completes.
+  // Scroll to bottom + force repaint after tab restore completes.
   // The normal scroll effect ([messages]) may fire before the messages container
   // is rendered (it's gated behind messagesReady). This effect ensures a
   // reliable scroll-to-bottom once the DOM is fully laid out after restore.
+  // COE-001: Tauri WebView GPU compositing may not repaint after programmatic
+  // DOM updates — force repaint via translateZ trick as a backstop.
   useEffect(() => {
     if (messagesReady && messages.length > 0) {
       // Double-rAF: first rAF runs after React commit, second runs after
@@ -1550,11 +1552,19 @@ export default function ChatPage() {
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
           messagesEndRef.current?.scrollIntoView({ behavior: 'auto' });
+          // COE-001: GPU translateZ compositing force-repaint
+          const el = document.querySelector('.messages-container') || document.getElementById('messages');
+          if (el) {
+            (el as HTMLElement).style.transform = 'translateZ(0)';
+            requestAnimationFrame(() => {
+              (el as HTMLElement).style.transform = '';
+            });
+          }
         });
       });
     }
     // Only fire once when messagesReady transitions to true — not on every message change
-     
+
   }, [messagesReady]);
 
   // Register the initial/default tab in the per-tab state map on mount.
