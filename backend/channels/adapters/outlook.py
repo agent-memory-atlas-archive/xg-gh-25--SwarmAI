@@ -372,12 +372,17 @@ class OutlookChannelAdapter(ChannelAdapter):
             subject = email.get("subject", "(no subject)")
             preview = email.get("body_preview", "")
             text = f"📧 {subject}\n{preview}" if preview else f"📧 {subject}"
+            # Thread grouping: real Outlook senders have no address, so prefer
+            # the conversation id (stable per-thread) over the sender address or
+            # the per-message id — otherwise every email keys its own chat.
+            conv_id = email.get("conversation_id", "")
+            chat_id = sender_addr or conv_id or email_id
 
             msg = InboundMessage(
                 channel_id=self.channel_id,
-                external_chat_id=sender_addr or email_id,
-                external_sender_id=sender_addr,
-                external_thread_id=email_id,  # thread = email conversation
+                external_chat_id=chat_id,
+                external_sender_id=sender_addr or sender_name,
+                external_thread_id=conv_id or email_id,  # thread = email conversation
                 external_message_id=email_id,
                 text=text,
                 sender_display_name=sender_name,
@@ -400,46 +405,66 @@ class OutlookChannelAdapter(ChannelAdapter):
     def _normalize_email(raw: dict) -> Optional[dict]:
         """Map one raw email object to the shape ``_poll_once`` consumes.
 
-        The aws-outlook-mcp email tools return Microsoft Graph objects in
-        camelCase (``bodyPreview`` / ``receivedDateTime`` /
-        ``from.emailAddress.{name,address}``).  ``_poll_once`` consumes a
-        snake_case shape (``body_preview`` / ``received_at`` /
-        ``from.{name,address}``).  This bridges the two.
+        The REAL aws-outlook-mcp email_inbox object (observed live 2026-10-26)
+        uses: ``itemIds[0].id`` (id), ``topic`` (subject), ``preview``
+        (body), ``lastDeliveryTime`` (received), ``senders`` (a list of plain
+        display-name STRINGS, no email address). ``_poll_once`` consumes a
+        snake_case shape (``id`` / ``subject`` / ``body_preview`` /
+        ``received_at`` / ``from.{name,address}``). This bridges the two.
 
-        Defensive on key naming: the live MCP response shape could not be
-        observed at build time (auth was down), so each field falls back to
-        its snake_case spelling.  This never trusts a single naming guess —
-        a post-deploy smoke with a real email is the authoritative check.
+        Each field tries the REAL key first, then falls back to the older
+        Graph camelCase / snake_case spellings so a future shape change (or
+        the existing fallback-shaped tests) still parses. ``senders`` carry
+        no address, so ``from.address`` is "" for the real shape.
 
-        Returns ``None`` when the email has no ``id`` — without a stable id
-        the dedup cache (``_seen_ids``) cannot work, so such a record would
-        be re-delivered every poll.  Dropping it is safer than looping it.
+        Returns ``None`` when the email has no id — without a stable id the
+        dedup cache (``_seen_ids``) cannot work, so such a record would be
+        re-delivered every poll. Dropping it is safer than looping it.
         """
         if not isinstance(raw, dict):
             return None
-        email_id = raw.get("id") or raw.get("message_id") or ""
+
+        # id: real = itemIds[0].id; fallbacks = top-level id / message_id
+        email_id = ""
+        item_ids = raw.get("itemIds")
+        if isinstance(item_ids, list) and item_ids and isinstance(item_ids[0], dict):
+            email_id = item_ids[0].get("id") or ""
+        if not email_id:
+            email_id = raw.get("id") or raw.get("message_id") or ""
         if not email_id:
             return None
 
-        # Sender: Graph nests it as from.emailAddress.{name,address};
-        # a snake_case variant may expose from.{name,address} directly.
-        sender_obj = raw.get("from") or {}
-        if not isinstance(sender_obj, dict):
-            sender_obj = {}
-        email_addr_obj = sender_obj.get("emailAddress")
-        if isinstance(email_addr_obj, dict):
-            sender_name = email_addr_obj.get("name", "")
-            sender_addr = email_addr_obj.get("address", "")
-        else:
-            sender_name = sender_obj.get("name", "")
-            sender_addr = sender_obj.get("address", "")
+        # sender: real = senders[] (plain-string display names, no address);
+        # fallbacks = Graph from.emailAddress.{name,address} / from.{name,address}
+        sender_name = ""
+        sender_addr = ""
+        senders = raw.get("senders")
+        if isinstance(senders, list) and senders:
+            first = senders[0]
+            sender_name = first if isinstance(first, str) else ""
+        if not sender_name:
+            sender_obj = raw.get("from") or {}
+            if not isinstance(sender_obj, dict):
+                sender_obj = {}
+            email_addr_obj = sender_obj.get("emailAddress")
+            if isinstance(email_addr_obj, dict):
+                sender_name = email_addr_obj.get("name", "")
+                sender_addr = email_addr_obj.get("address", "")
+            else:
+                sender_name = sender_obj.get("name", "")
+                sender_addr = sender_obj.get("address", "")
 
         return {
             "id": email_id,
-            "subject": raw.get("subject", ""),
-            "body_preview": raw.get("bodyPreview") or raw.get("body_preview") or "",
-            "received_at": raw.get("receivedDateTime") or raw.get("received_at") or "",
+            "subject": raw.get("topic") or raw.get("subject") or "",
+            "body_preview": raw.get("preview") or raw.get("bodyPreview") or raw.get("body_preview") or "",
+            "received_at": raw.get("lastDeliveryTime") or raw.get("receivedDateTime") or raw.get("received_at") or "",
             "from": {"name": sender_name, "address": sender_addr},
+            # Stable per-thread grouping key. Real Outlook senders carry no email
+            # address, so without this every message would key its own
+            # conversation at the gateway (external_chat_id falls back to the
+            # unique message id). conversationId groups a thread like a chat.
+            "conversation_id": raw.get("conversationId") or raw.get("conversation_id") or "",
         }
 
     @staticmethod
@@ -483,10 +508,23 @@ class OutlookChannelAdapter(ChannelAdapter):
     def _extract_email_list(payload: dict) -> list:
         """Pull the email array out of the inner payload.
 
-        Graph/MCP responses vary on the array key (``items`` / ``value`` /
-        ``emails`` / ``messages``); accept any of them, else ``[]``.
+        The REAL aws-outlook-mcp email_inbox response (observed live
+        2026-10-26) nests the array under ``content.emails`` — the business
+        payload is ``{"success": true, "content": {"message": ..,
+        "emails": [...]}}``. Check that nested path FIRST, then fall back to
+        the top-level keys various Graph/MCP shapes might use. Returns ``[]``
+        if no known location holds a list.
         """
-        for key in ("items", "value", "emails", "messages", "data"):
+        _keys = ("emails", "items", "value", "messages", "data")
+        # Real shape nests the array under ``content`` (a dict). Check the known
+        # keys there FIRST, then fall back to the same keys at top level.
+        content = payload.get("content")
+        if isinstance(content, dict):
+            for key in _keys:
+                arr = content.get(key)
+                if isinstance(arr, list):
+                    return arr
+        for key in _keys:
             arr = payload.get(key)
             if isinstance(arr, list):
                 return arr
@@ -529,10 +567,22 @@ class OutlookChannelAdapter(ChannelAdapter):
             # loudly ONCE instead of failing invisibly. Logs only the KEY NAME,
             # never email content.
             if not raw_list and not self._warned_key_drift:
+                _known = ("items", "value", "emails", "messages", "data")
                 other_list_keys = [
                     k for k, v in payload.items()
-                    if isinstance(v, list) and v and k not in ("items", "value", "emails", "messages", "data")
+                    if isinstance(v, list) and v and k not in _known
                 ]
+                # Mirror _extract_email_list's search DEPTH: the real shape nests
+                # the array one level under ``content`` (a dict). A drift of the
+                # nested key (content.messages instead of content.emails) would
+                # be invisible to a top-level-only scan — which is exactly the
+                # shape this detector must catch. So scan one level into content.
+                content = payload.get("content")
+                if isinstance(content, dict):
+                    other_list_keys += [
+                        "content." + k for k, v in content.items()
+                        if isinstance(v, list) and v and k not in _known
+                    ]
                 if other_list_keys:
                     logger.warning(
                         "Outlook fetch: success payload had no email list under a known key, "

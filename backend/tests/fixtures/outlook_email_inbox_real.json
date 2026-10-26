@@ -1,0 +1,48 @@
+{
+  "_comment": "REAL aws-outlook-mcp email_inbox response, captured 2026-10-26 from a live Midway session (Titus's inbox). Content redacted to non-sensitive training/report emails. This is the authoritative wire shape the daemon must parse — replaces the build-time guessed shape (run_b39f7756 shipped a wrong guess: it looked for top-level items/value/emails and id/subject/bodyPreview; the real shape is content.emails[] with topic/preview/lastDeliveryTime/senders[]/itemIds[].id).",
+  "success": true,
+  "content": {
+    "message": "Found 3 most recent emails in your inbox, there may be more.",
+    "emails": [
+      {
+        "conversationId": "AAQkAGE0ZTViMzQ1LWRkN2ItNDlmYi1hYTFjLTg1ZGM2NTkwNWVjNwAQAJxpIB1o4LlAp+2mTsnfWTI=",
+        "topic": "Learn Invite for Amazon Quick training | Mandatory class (out of 1)",
+        "senders": ["Learn Hub"],
+        "recipients": ["Tian, Titus"],
+        "lastDeliveryTime": "2026-10-26T10:31:12+08:00",
+        "preview": "Hi Titus, You're registered for the instructor-led training.",
+        "unreadCount": 0,
+        "hasAttachments": true,
+        "messageCount": 1,
+        "itemClasses": ["IPM.Schedule.Meeting.Request"],
+        "itemIds": [{"id": "AAkALgAAAAAAHYQDEapmEc2byACqAC-EWg0AJv-gukr9ukGf1W6PiWOsHAABRKoBkQAA", "changeKey": "CQAAAA=="}]
+      },
+      {
+        "conversationId": "AAQkAGE0ZTViMzQ1LWRkN2ItNDlmYi1hYTFjLTg1ZGM2NTkwNWVjNwAQAFit63kh1Z1DmcmBMethhQs=",
+        "topic": "Success! Registration confirmed",
+        "senders": ["Amazon A to Z"],
+        "recipients": ["Tian, Titus"],
+        "lastDeliveryTime": "2026-10-26T10:30:52+08:00",
+        "preview": "Hi Titus, You've successfully registered.",
+        "unreadCount": 0,
+        "hasAttachments": false,
+        "messageCount": 1,
+        "itemClasses": ["IPM.Note"],
+        "itemIds": [{"id": "AAkALgAAAAAAHYQDEapmEc2byACqAC-EWg0AJv-gukr9ukGf1W6PiWOsHAABRKn9owAA", "changeKey": "CQAAAA=="}]
+      },
+      {
+        "conversationId": "AAQkAGE0ZTViMzQ1LWRkN2ItNDlmYi1hYTFjLTg1ZGM2NTkwNWVjNwAQAEk68X2G6htCt76gm0hSF24=",
+        "topic": "Online Eval Daily Report PASSED",
+        "senders": ["Rocky"],
+        "recipients": ["cmhk-agentplatform-builders@amazon.com"],
+        "lastDeliveryTime": "2026-10-26T10:09:46+08:00",
+        "preview": "CMHK Agent Platform Online Evaluation 19 of 22 sessions passed.",
+        "unreadCount": 0,
+        "hasAttachments": false,
+        "messageCount": 1,
+        "itemClasses": ["IPM.Note"],
+        "itemIds": [{"id": "AAkALgAAAAAAHYQDEapmEc2byACqAC-EWg0AJv-gukr9ukGf1W6PiWOsHAABRKn32gAA", "changeKey": "CQAAAA=="}]
+      }
+    ]
+  }
+}

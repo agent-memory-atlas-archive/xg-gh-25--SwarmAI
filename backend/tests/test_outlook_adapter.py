@@ -5,11 +5,20 @@ AC1-AC5 of run_b39f7756 (real aws-outlook-mcp fetch).
 """
 import asyncio
 import json
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from channels.base import ChannelAdapter, InboundMessage
+
+_FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "fixtures")
+
+
+def _load_real_inbox():
+    """The REAL aws-outlook-mcp email_inbox response captured 2026-10-26."""
+    with open(os.path.join(_FIXTURE_DIR, "outlook_email_inbox_real.json"), encoding="utf-8") as f:
+        return json.load(f)
 
 
 # ===================================================================
@@ -300,6 +309,135 @@ class TestNormalizeEmail:
         assert "body" in msg.text  # the bodyPreview content "body" surfaced into text
         assert msg.metadata.get("received_at") == "2026-10-26T10:00:00Z"
         assert msg.metadata.get("sender_address") == "carol@b.com"
+
+
+# ===================================================================
+# REAL SHAPE — aws-outlook-mcp email_inbox actual wire format
+# (run_eb09eb94: run_b39f7756 guessed the shape wrong; these drive the
+#  real content.emails[] / topic / preview / lastDeliveryTime / senders[] /
+#  itemIds[0].id against a captured-live fixture — the non-vacuous guard)
+# ===================================================================
+class TestRealShape:
+    def test_extract_from_nested_content_emails(self):
+        """_extract_email_list pulls the array from the REAL nested location
+        content.emails — not just top-level keys."""
+        from channels.adapters.outlook import OutlookChannelAdapter
+        real = _load_real_inbox()
+        # _unwrap_mcp_result returns the whole inner payload {success, content:{emails}}
+        payload = {"success": True, "content": real["content"]}
+        emails = OutlookChannelAdapter._extract_email_list(payload)
+        assert len(emails) == 3
+        assert emails[0]["topic"].startswith("Learn Invite")
+
+    def test_normalize_real_email_all_fields(self):
+        """_normalize_email maps the REAL field names (topic/preview/
+        lastDeliveryTime/senders[0]/itemIds[0].id) to the consumer shape."""
+        from channels.adapters.outlook import OutlookChannelAdapter
+        real = _load_real_inbox()
+        raw = real["content"]["emails"][0]  # the Learn Hub meeting invite
+        out = OutlookChannelAdapter._normalize_email(raw)
+        assert out is not None
+        assert out["id"] == "AAkALgAAAAAAHYQDEapmEc2byACqAC-EWg0AJv-gukr9ukGf1W6PiWOsHAABRKoBkQAA"
+        assert out["subject"].startswith("Learn Invite")
+        assert out["body_preview"].startswith("Hi Titus")
+        assert out["received_at"] == "2026-10-26T10:31:12+08:00"
+        assert out["from"]["name"] == "Learn Hub"   # senders[0], a plain string
+        assert out["from"]["address"] == ""          # real senders carry NO address
+
+    def test_normalize_empty_senders_and_itemids_no_index_error(self):
+        """senders=[] and itemIds=[] must not raise; missing id → None."""
+        from channels.adapters.outlook import OutlookChannelAdapter
+        # empty senders but has id → normalizes with blank sender
+        ok = OutlookChannelAdapter._normalize_email(
+            {"topic": "T", "preview": "p", "lastDeliveryTime": "t",
+             "senders": [], "itemIds": [{"id": "has-id"}]})
+        assert ok is not None and ok["id"] == "has-id" and ok["from"]["name"] == ""
+        # field-mapping must still work on the empty-sender path (not just no-raise)
+        assert ok["received_at"] == "t" and ok["subject"] == "T" and ok["body_preview"] == "p"
+        # empty itemIds → no id → None
+        assert OutlookChannelAdapter._normalize_email(
+            {"topic": "T", "preview": "p", "senders": ["S"], "itemIds": []}) is None
+
+    def test_normalize_carries_conversation_id(self):
+        """conversation_id is carried through for thread grouping (real senders
+        have no address, so grouping must key on conversationId)."""
+        from channels.adapters.outlook import OutlookChannelAdapter
+        real = _load_real_inbox()
+        out = OutlookChannelAdapter._normalize_email(real["content"]["emails"][0])
+        assert out["conversation_id"] == real["content"]["emails"][0]["conversationId"]
+
+    @pytest.mark.asyncio
+    async def test_poll_once_groups_by_conversation_id(self):
+        """A real email (no sender address) keys its chat on conversation_id,
+        not the unique per-message id — so a thread groups like a chat."""
+        from channels.adapters.outlook import OutlookChannelAdapter
+        on_msg = AsyncMock()
+        adapter = OutlookChannelAdapter("ch1", {}, on_msg)
+        adapter._primed = True
+        normalized = {
+            "id": "msg-1", "subject": "S", "body_preview": "p",
+            "received_at": "t", "from": {"name": "Rocky", "address": ""},
+            "conversation_id": "conv-ABC",
+        }
+        adapter._fetch_emails = AsyncMock(return_value=[normalized])
+        await adapter._poll_once()
+        msg = on_msg.await_args.args[0]
+        assert msg.external_chat_id == "conv-ABC"      # grouped by conversation, not msg id
+        assert msg.external_thread_id == "conv-ABC"
+        assert msg.external_sender_id == "Rocky"        # falls back to name when no address
+        assert msg.external_message_id == "msg-1"       # the unique message id stays here
+
+    @pytest.mark.asyncio
+    async def test_extract_handles_known_nested_key_variant(self):
+        """content.messages (a known key, nested) is EXTRACTED, not just warned
+        — extract tries all known keys under content, mirroring the real shape."""
+        from channels.adapters.outlook import OutlookChannelAdapter
+        payload = {"success": True, "content": {"messages": [{"itemIds": [{"id": "m"}], "topic": "T", "preview": "p"}]}}
+        emails = OutlookChannelAdapter._extract_email_list(payload)
+        assert len(emails) == 1 and emails[0]["topic"] == "T"
+
+    @pytest.mark.asyncio
+    async def test_drift_detector_catches_unknown_nested_key(self, caplog):
+        """If the array drifts to an UNKNOWN nested key (content.records), the
+        detector must STILL warn — a top-level-only scan would miss it
+        (red-team catch: the detector was blind to nested drift)."""
+        import logging
+        from channels.adapters.outlook import OutlookChannelAdapter
+        adapter = OutlookChannelAdapter("ch1", {}, AsyncMock())
+        inner = {"success": True, "content": {"records": [{"id": "x", "topic": "T"}]}}  # unknown nested key
+        fake = MagicMock()
+        fake.available = True
+        fake.call_tool = AsyncMock(return_value={"content": [{"type": "text", "text": json.dumps(inner)}]})
+        with patch.object(adapter, "_get_bridge", return_value=fake):
+            with caplog.at_level(logging.WARNING):
+                out = await adapter._fetch_emails()
+        assert out == []
+        drift = [r for r in caplog.records if "array-key drift" in r.message]
+        assert len(drift) == 1
+        assert "content.records" in drift[0].message  # named the NESTED drifted key
+        assert adapter._warned_key_drift is True
+
+    @pytest.mark.asyncio
+    async def test_fetch_emails_end_to_end_real_envelope(self):
+        """THE non-vacuous guard: feed the FULL real MCP envelope through the
+        real _fetch_emails → _unwrap → _extract(content.emails) → _normalize.
+        All 3 emails must come back with non-empty id/subject/preview."""
+        from channels.adapters.outlook import OutlookChannelAdapter
+        real = _load_real_inbox()
+        adapter = OutlookChannelAdapter("ch1", {}, AsyncMock())
+        fake = MagicMock()
+        fake.available = True
+        # The MCP transport envelope: content[0].text is the JSON string of `real`
+        fake.call_tool = AsyncMock(return_value={
+            "content": [{"type": "text", "text": json.dumps(real)}]
+        })
+        with patch.object(adapter, "_get_bridge", return_value=fake):
+            out = await adapter._fetch_emails()
+        assert len(out) == 3
+        for e in out:
+            assert e["id"] and e["subject"] and e["body_preview"]
+        assert out[0]["subject"].startswith("Learn Invite")
+        assert out[2]["from"]["name"] == "Rocky"
 
 
 # ===================================================================
