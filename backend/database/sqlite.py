@@ -1199,6 +1199,47 @@ class SQLiteChannelMessagesTable(SQLiteTable[T], Generic[T]):
                 rows = await cursor.fetchall()
                 return [self._row_to_dict(row) for row in rows]
 
+    async def list_inbox(
+        self,
+        since: str | None = None,
+        limit: int = 50,
+    ) -> list[T]:
+        """List inbound messages across all channels (unified inbox).
+
+        Joins ``channel_sessions`` to enrich each message with
+        ``channel_id`` and the session's source channel type.
+        Ordered by ``created_at DESC`` (newest first).
+
+        Args:
+            since: ISO-8601 timestamp — only messages created after this.
+            limit: Max rows returned (default 50).
+        """
+        sql = (
+            f"SELECT m.*, cs.channel_id, cs.external_chat_id "
+            f"FROM {self.table_name} m "
+            f"JOIN channel_sessions cs ON m.channel_session_id = cs.id "
+            f"WHERE m.direction = 'inbound'"
+        )
+        params: list = []
+        if since:
+            sql += " AND m.created_at > ?"
+            params.append(since)
+        sql += " ORDER BY m.created_at DESC LIMIT ?"
+        params.append(limit)
+
+        async with self._get_connection() as conn:
+            conn.row_factory = aiosqlite.Row
+            async with conn.execute(sql, params) as cursor:
+                rows = await cursor.fetchall()
+                results = []
+                for row in rows:
+                    d = self._row_to_dict(row)
+                    # Enrich with join columns
+                    d["channel_id"] = row["channel_id"]
+                    d["external_chat_id"] = row["external_chat_id"]
+                    results.append(d)
+                return results
+
 
 class SQLiteWorkspaceConfigTable(SQLiteTable[T], Generic[T]):
     """Single-row workspace configuration table for the SwarmWS singleton.

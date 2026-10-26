@@ -155,6 +155,42 @@ def _is_authorized_tier(sender_identity: Optional[SenderIdentity]) -> bool:
     )
 
 
+def _compute_pushworthy(msg: "InboundMessage", channel: dict) -> bool:
+    """Decide whether an inbound message should surface in the unified inbox dock.
+
+    Pushworthy = the message warrants a notification/badge in the desktop dock.
+    Whitelist (any match → True):
+      1. DM (chat_type == "im") — always pushworthy.
+      2. @mention (is_mention flag in metadata) — always pushworthy.
+      3. Channel opt-in — channel config has ``inbox_pushworthy: true``
+         (set by the user for GCR-Tech-Projects section channels, etc.).
+
+    Everything else → False (the message is still stored, just not surfaced).
+    """
+    meta = msg.metadata or {}
+    chat_type = meta.get("chat_type", "")
+
+    # DM — always push
+    if chat_type == "im":
+        return True
+
+    # @mention — always push
+    if meta.get("is_mention"):
+        return True
+
+    # Channel-level opt-in (GCR-Tech-Projects section channels, etc.)
+    config = channel.get("config") or {}
+    if isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+    if config.get("inbox_pushworthy"):
+        return True
+
+    return False
+
+
 def _resolve_reply_thread_ts(
     external_thread_id: Optional[str],
     external_message_id: Optional[str],
@@ -1148,6 +1184,10 @@ class ChannelGateway:
         start_ts = self._channel_start_times.get(channel_id)
         uptime = round(time.time() - start_ts, 1) if start_ts else None
 
+        # connection_mode from the adapter thread (socket/polling/None)
+        adapter = self._adapters.get(channel_id)
+        connection_mode = getattr(adapter, "_connection_mode", None) if adapter else None
+
         return {
             "channel_id": channel_id,
             "status": status,
@@ -1155,6 +1195,7 @@ class ChannelGateway:
             "messages_processed": self._channel_msg_counts.get(channel_id, 0),
             "active_sessions": active_sessions,
             "error_message": error_message,
+            "connection_mode": connection_mode,
         }
 
     # ------------------------------------------------------------------
@@ -1533,6 +1574,7 @@ class ChannelGateway:
                     "observed": True,  # recorded without a reply
                     **_sender_metadata(sender_identity, resolved_name),
                     "attachment_count": len(msg.attachments),
+                    "pushworthy": _compute_pushworthy(msg, channel),
                 },
                 "status": "observed",
             })
@@ -1683,6 +1725,7 @@ class ChannelGateway:
                     **_sender_metadata(sender_identity, resolved_name),
                     "attachment_count": len(msg.attachments),
                     "attachment_names": [a.get("file_name") for a in msg.attachments],
+                    "pushworthy": _compute_pushworthy(msg, channel),
                 },
                 "status": "received",
             })

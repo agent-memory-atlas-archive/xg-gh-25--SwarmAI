@@ -37,7 +37,36 @@ from core import surface_injection
 
 # ── Multi-session architecture ────────────────────────────────────
 import logging as _logging
+import re as _re
 from typing import Optional
+
+
+# ── Auto model routing ────────────────────────────────────────────
+# When the user does not explicitly specify a model, classify the
+# message and upgrade to Opus for complex tasks.  Sonnet is the
+# default (config.json), so only the *upgrade* direction is needed.
+_OPUS_PATTERNS = _re.compile(
+    r"(?i)(?:"
+    r"研究|分析|deep\s*dive|pipeline|对比|评估|写报告|报告"
+    r"|coding|改代码|debug|review|code\s*review|refactor"
+    r"|六页纸|six.pager|PR/FAQ|HLD|LLD|ADR|narrative"
+    r"|竞对|competitive|consulting|strategy|战略"
+    r"|/opus"
+    r")"
+)
+
+
+def _auto_route_model(user_message: str, explicit_model: str | None) -> str | None:
+    """Return a model override, or None to use the session default.
+
+    If the user already specified a model (via the request field), honour it.
+    Otherwise, scan the message for patterns that need Opus-level reasoning.
+    """
+    if explicit_model:
+        return explicit_model
+    if user_message and _OPUS_PATTERNS.search(user_message):
+        return "claude-opus-4-6"
+    return None  # use session default (Sonnet)
 
 _chat_logger = _logging.getLogger(__name__)
 
@@ -501,6 +530,7 @@ async def chat_stream(request: Request):
                 editor_context=chat_request.editor_context.model_dump() if chat_request.editor_context else None,
                 terminal_context=chat_request.terminal_context.model_dump() if chat_request.terminal_context else None,
                 client_id=chat_request.client_id,
+                model_override=_auto_route_model(chat_request.message, chat_request.model),
             ):
                 if captured_session_id is None:
                     captured_session_id = msg.get("sessionId") or msg.get("session_id")

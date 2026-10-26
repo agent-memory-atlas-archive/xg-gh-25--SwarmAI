@@ -93,6 +93,7 @@ class ChatRequest(BaseModel):
     editor_context: EditorContext | None = None  # Currently open file in editor panel
     terminal_context: TerminalContext | None = None  # Attached terminal output (P2)
     client_id: str | None = None  # Correlation ID for optimistic message dedup
+    model: str | None = None  # Per-request model override (e.g. "claude-sonnet-4-6")
 
 
 class AnswerQuestionRequest(BaseModel):

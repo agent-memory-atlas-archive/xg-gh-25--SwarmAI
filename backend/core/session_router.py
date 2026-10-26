@@ -3196,6 +3196,7 @@ class SessionRouter:
         agent_config: Optional[dict] = None,
         client_id: Optional[str] = None,
         _drained_pending: bool = False,
+        model_override: Optional[str] = None,
     ) -> AsyncIterator[dict]:
         """Entry point for chat requests.
 
@@ -3431,6 +3432,12 @@ class SessionRouter:
         # chat tabs use Opus (or vice versa).
         if channel_context and channel_context.get("model"):
             agent_config["model"] = channel_context["model"]
+
+        # Per-request model override from desktop: chat_request.model takes
+        # precedence over the global default but NOT over channel_context
+        # (channel config is authoritative for channel sessions).
+        if model_override and not (channel_context and channel_context.get("model")):
+            agent_config["model"] = model_override
 
         # Detect cold-start resume (Mechanism B): subprocess is gone but
         # session has prior messages in DB (app restarted or session evicted).

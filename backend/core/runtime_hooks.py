@@ -1618,7 +1618,7 @@ def create_enforcement_injector(session_context: Optional[dict] = None):
     is never broken. Mirrors the additionalContext shape of
     ``create_post_compact_injection`` so it rides the same in-turn merge path.
     """
-    _ = session_context  # reserved for parity with sibling factories; unused today
+    ctx = session_context or {}
 
     async def _hook(input_data: Any, tool_use_id: Any, context: Any) -> dict:
         try:
@@ -1631,6 +1631,44 @@ def create_enforcement_injector(session_context: Optional[dict] = None):
             user_text = _strip_injected_prefix(prompt)
 
             parts: list[str] = []
+
+            # Signal C — Daily Briefing gate (X015). MUST be first — highest priority.
+            # Checks: (1) workday, (2) briefing not yet output today.
+            # Uses a session-scoped flag so we only inject once per session after
+            # the first briefing-containing response.
+            try:
+                import datetime
+                now = datetime.datetime.now()
+                weekday = now.weekday()  # 0=Mon, 6=Sun
+                is_workday = weekday < 5  # Mon-Fri
+                briefing_done = ctx.get("_briefing_done_today")
+
+                if is_workday and not briefing_done:
+                    # Check DailyActivity for briefing marker
+                    from jobs.paths import SWARMWS as _SWARMWS_bf
+                    da_file = Path(str(_SWARMWS_bf)) / "Knowledge" / "DailyActivity" / f"{now.strftime('%Y-%m-%d')}.md"
+                    has_briefing_marker = False
+                    if da_file.exists():
+                        try:
+                            content = da_file.read_text(encoding="utf-8", errors="replace")
+                            has_briefing_marker = "Daily Briefing" in content or "daily briefing" in content
+                        except Exception:
+                            pass
+
+                    if has_briefing_marker:
+                        ctx["_briefing_done_today"] = True
+                    else:
+                        parts.append(
+                            "[MANDATORY — DAILY BRIEFING GATE] Today is a new calendar "
+                            "day and Daily Briefing has NOT been output yet. You MUST "
+                            "output Daily Briefing + Today's Todo as the FIRST part of "
+                            "your response BEFORE addressing the user's question. This "
+                            "is a structural gate (X015) — no exception. If the user "
+                            "has a specific question, output a brief briefing (3-line "
+                            "summary) followed by the answer. Do NOT skip."
+                        )
+            except Exception:
+                logger.debug("enforcement_injector: briefing gate check failed", exc_info=True)
 
             # Signal A — symmetric language reminder (classifier re-strips defensively,
             # but pass the already-stripped text so the two signals agree on the input).

@@ -581,11 +581,19 @@ export function ChatInput({
     [onAddFiles]
   );
 
-  // Drag handlers
+  // Drag handlers — with safety timeout to clear stuck overlay.
+  // Tauri's disable_drag_drop_handler may cause the browser drop event to
+  // never fire, leaving isDragging=true forever. A 2s timeout after the
+  // last dragOver ensures the overlay always clears.
+  const dragTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const handleDragOver = useCallback((e: React.DragEvent) => {
     if (e.dataTransfer.types.includes('Files') || e.dataTransfer.types.includes('application/json')) {
       e.preventDefault();
       setIsDragging(true);
+      // Reset safety timeout on every dragOver event
+      if (dragTimeoutRef.current) clearTimeout(dragTimeoutRef.current);
+      dragTimeoutRef.current = setTimeout(() => setIsDragging(false), 2000);
     }
   }, []);
 
@@ -593,13 +601,16 @@ export function ChatInput({
     if (e.dataTransfer.types.includes('Files') || e.dataTransfer.types.includes('application/json')) {
       e.preventDefault();
       setIsDragging(false);
+      if (dragTimeoutRef.current) { clearTimeout(dragTimeoutRef.current); dragTimeoutRef.current = null; }
     }
   }, []);
 
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
       e.preventDefault();
+      e.stopPropagation(); // Prevent parent from double-processing the drop
       setIsDragging(false);
+      if (dragTimeoutRef.current) { clearTimeout(dragTimeoutRef.current); dragTimeoutRef.current = null; }
 
       // 1. Existing file-drop behavior — unchanged
       const files = Array.from(e.dataTransfer.files);
@@ -684,7 +695,19 @@ export function ChatInput({
     [onAddFiles, activeTabIdRef, inputValueMapRef, onInputValueChange, inputValue, onInputChange]
   );
 
+  // IME composition guard — prevent Enter from sending during CJK input.
+  // WebKit fires compositionEnd BEFORE keyDown, so the ref alone is not
+  // enough. We also check nativeEvent.isComposing AND add a 50ms cooldown
+  // after compositionEnd to catch the trailing Enter keyDown.
+  const isComposingRef = useRef(false);
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    // Block Enter during IME composition (Chinese/Japanese/Korean input)
+    if ((isComposingRef.current || e.nativeEvent.isComposing) && e.key === 'Enter') {
+      e.preventDefault();
+      return; // Let IME handle it — don't send
+    }
+
     // Expand/collapse shortcut
     if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'E') {
       e.preventDefault();
@@ -908,6 +931,12 @@ export function ChatInput({
               value={inputValue}
               onChange={handleInputChange}
               onKeyDown={handleKeyDown}
+              onCompositionStart={() => { isComposingRef.current = true; }}
+              onCompositionEnd={() => {
+                // Delay reset: WebKit fires compositionEnd BEFORE the final
+                // Enter keyDown, so we keep the guard up for 50ms to catch it.
+                setTimeout(() => { isComposingRef.current = false; }, 50);
+              }}
               onPaste={handlePaste}
               placeholder={
                 disabled

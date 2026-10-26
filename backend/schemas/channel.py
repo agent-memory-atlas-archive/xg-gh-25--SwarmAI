@@ -62,6 +62,7 @@ class ChannelStatusResponse(BaseModel):
     messages_processed: int = 0
     active_sessions: int = 0
     error_message: Optional[str] = None
+    connection_mode: Optional[str] = None
 
 
 class ChannelSessionResponse(BaseModel):
