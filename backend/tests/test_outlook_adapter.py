@@ -337,7 +337,7 @@ class TestRealShape:
         raw = real["content"]["emails"][0]  # the Learn Hub meeting invite
         out = OutlookChannelAdapter._normalize_email(raw)
         assert out is not None
-        assert out["id"] == "AAkALgAAAAAAHYQDEapmEc2byACqAC-EWg0AJv-gukr9ukGf1W6PiWOsHAABRKoBkQAA"
+        assert out["id"] == "FAKE-ITEM-1"
         assert out["subject"].startswith("Learn Invite")
         assert out["body_preview"].startswith("Hi Titus")
         assert out["received_at"] == "2026-10-26T10:31:12+08:00"

@@ -1,11 +1,11 @@
 {
-  "_comment": "REAL aws-outlook-mcp email_inbox response, captured 2026-10-26 from a live Midway session (Titus's inbox). Content redacted to non-sensitive training/report emails. This is the authoritative wire shape the daemon must parse — replaces the build-time guessed shape (run_b39f7756 shipped a wrong guess: it looked for top-level items/value/emails and id/subject/bodyPreview; the real shape is content.emails[] with topic/preview/lastDeliveryTime/senders[]/itemIds[].id).",
+  "_comment": "aws-outlook-mcp email_inbox WIRE SHAPE fixture, captured 2026-10-26 from a live session then SANITIZED. The field STRUCTURE is authoritative (content.emails[] with topic/preview/lastDeliveryTime/senders[]/itemIds[].id — the real shape, vs the build-time wrong guess of top-level items/id/bodyPreview). The id/conversationId VALUES are synthetic short placeholders (FAKE-*): tests assert the shape + field mapping, never the id content, so real high-entropy Graph ids are neither needed nor stored here (they tripped the secret scanner as false-positive high-entropy strings).",
   "success": true,
   "content": {
     "message": "Found 3 most recent emails in your inbox, there may be more.",
     "emails": [
       {
-        "conversationId": "AAQkAGE0ZTViMzQ1LWRkN2ItNDlmYi1hYTFjLTg1ZGM2NTkwNWVjNwAQAJxpIB1o4LlAp+2mTsnfWTI=",
+        "conversationId": "FAKE-CONV-1",
         "topic": "Learn Invite for Amazon Quick training | Mandatory class (out of 1)",
         "senders": ["Learn Hub"],
         "recipients": ["Tian, Titus"],
@@ -15,10 +15,10 @@
         "hasAttachments": true,
         "messageCount": 1,
         "itemClasses": ["IPM.Schedule.Meeting.Request"],
-        "itemIds": [{"id": "AAkALgAAAAAAHYQDEapmEc2byACqAC-EWg0AJv-gukr9ukGf1W6PiWOsHAABRKoBkQAA", "changeKey": "CQAAAA=="}]
+        "itemIds": [{"id": "FAKE-ITEM-1", "changeKey": "FAKE-CK"}]
       },
       {
-        "conversationId": "AAQkAGE0ZTViMzQ1LWRkN2ItNDlmYi1hYTFjLTg1ZGM2NTkwNWVjNwAQAFit63kh1Z1DmcmBMethhQs=",
+        "conversationId": "FAKE-CONV-2",
         "topic": "Success! Registration confirmed",
         "senders": ["Amazon A to Z"],
         "recipients": ["Tian, Titus"],
@@ -28,10 +28,10 @@
         "hasAttachments": false,
         "messageCount": 1,
         "itemClasses": ["IPM.Note"],
-        "itemIds": [{"id": "AAkALgAAAAAAHYQDEapmEc2byACqAC-EWg0AJv-gukr9ukGf1W6PiWOsHAABRKn9owAA", "changeKey": "CQAAAA=="}]
+        "itemIds": [{"id": "FAKE-ITEM-2", "changeKey": "FAKE-CK"}]
       },
       {
-        "conversationId": "AAQkAGE0ZTViMzQ1LWRkN2ItNDlmYi1hYTFjLTg1ZGM2NTkwNWVjNwAQAEk68X2G6htCt76gm0hSF24=",
+        "conversationId": "FAKE-CONV-3",
         "topic": "Online Eval Daily Report PASSED",
         "senders": ["Rocky"],
         "recipients": ["cmhk-agentplatform-builders@amazon.com"],
@@ -41,7 +41,7 @@
         "hasAttachments": false,
         "messageCount": 1,
         "itemClasses": ["IPM.Note"],
-        "itemIds": [{"id": "AAkALgAAAAAAHYQDEapmEc2byACqAC-EWg0AJv-gukr9ukGf1W6PiWOsHAABRKn32gAA", "changeKey": "CQAAAA=="}]
+        "itemIds": [{"id": "FAKE-ITEM-3", "changeKey": "FAKE-CK"}]
       }
     ]
   }
