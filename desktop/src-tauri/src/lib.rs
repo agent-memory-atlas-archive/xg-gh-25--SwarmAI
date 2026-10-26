@@ -2812,7 +2812,11 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             match event {
-                // macOS: clicking Dock icon re-shows the hidden window
+                // macOS: clicking Dock icon re-shows the hidden window.
+                // Gated: RunEvent::Reopen is a macOS-only variant — on Windows/Linux
+                // the enum has no such variant (E0599), so the arm must be cfg'd out.
+                // Those targets fall into the `_ => {}` catch-all below (no Dock concept).
+                #[cfg(target_os = "macos")]
                 tauri::RunEvent::Reopen { .. } => {
                     if let Some(window) = app_handle.get_webview_window("main") {
                         let _ = window.show();
