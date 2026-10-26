@@ -14,14 +14,210 @@ a separate design (threading, CC, rich-text) deferred to Phase 3.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
 from channels.base import ChannelAdapter, InboundMessage, OutboundMessage
 from channels.registry import register_adapter
 
+try:
+    from config import get_app_data_dir
+except Exception:  # pragma: no cover - config always present in daemon
+    get_app_data_dir = None  # type: ignore
+
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# MCP config discovery + stdio bridge (mirrors SlackMcpBridge in slack.py).
+# A dedicated function/class keeps the live Slack path untouched (zero
+# regression) while reusing the proven daemon→MCP stdio JSON-RPC pattern.
+# ---------------------------------------------------------------------------
+
+def _find_outlook_mcp_config() -> Optional[dict]:
+    """Find the aws-outlook-mcp server config from mcp-dev.json.
+
+    Returns ``{"command": str, "args": list, "env": dict}`` or None.
+    Mirrors ``slack.py:_find_slack_mcp_config`` but matches the outlook
+    server id. The config path is the owner's own machine (never network
+    input), so the spawned command is always operator-controlled.
+    """
+    if get_app_data_dir is None:
+        return None
+    mcp_dev = get_app_data_dir() / "SwarmWS" / ".claude" / "mcps" / "mcp-dev.json"
+    if not mcp_dev.is_file():
+        return None
+    try:
+        entries = json.loads(mcp_dev.read_text(encoding="utf-8"))
+        if not isinstance(entries, list):
+            return None
+        for entry in entries:
+            eid = (entry.get("id", "") or entry.get("name", "")).lower()
+            if "outlook" in eid and entry.get("enabled", True):
+                config = entry.get("config", {})
+                cmd = config.get("command", "")
+                if cmd:
+                    return {
+                        "command": cmd,
+                        "args": config.get("args", []),
+                        "env": config.get("env", {}),
+                    }
+    except Exception:
+        logger.debug("Failed to read aws-outlook-mcp config", exc_info=True)
+    return None
+
+
+class OutlookMcpBridge:
+    """Async stdio JSON-RPC 2.0 bridge to the aws-outlook-mcp binary.
+
+    Mirrors ``SlackMcpBridge`` (slack.py): spawn on first use, perform the
+    MCP initialize handshake, reuse the connection for subsequent calls,
+    concurrency-safe via ``asyncio.Lock``. Line-delimited JSON framing to
+    match the working Slack bridge against the same MCP server family.
+
+    Every failure mode (no binary, spawn error, handshake failure, timeout)
+    degrades to ``None`` — the caller (``_fetch_emails``) maps that to ``[]``
+    so a dead/slow MCP can never crash or freeze the polling loop.
+    """
+
+    def __init__(self) -> None:
+        config = _find_outlook_mcp_config()
+        if config:
+            self._command: str = config["command"]
+            self._args: list = config["args"]
+            self._env: dict = config["env"]
+        else:
+            self._command = ""
+            self._args = []
+            self._env = {}
+        self._process: Optional[asyncio.subprocess.Process] = None
+        self._initialized = False
+        self._request_id = 0
+        self._lock = asyncio.Lock()
+
+    @property
+    def available(self) -> bool:
+        """True if an aws-outlook-mcp binary was found in config."""
+        return bool(self._command)
+
+    def _build_request(self, tool_name: str, arguments: dict) -> dict:
+        self._request_id += 1
+        return {
+            "jsonrpc": "2.0",
+            "id": self._request_id,
+            "method": "tools/call",
+            "params": {"name": tool_name, "arguments": arguments},
+        }
+
+    async def _spawn(self) -> bool:
+        if self._process and self._process.returncode is None:
+            return True
+        if not self._command:
+            return False
+        if not Path(self._command).is_file():
+            logger.warning("aws-outlook-mcp binary not found")
+            return False
+        env = {**os.environ, **self._env}
+        try:
+            self._process = await asyncio.create_subprocess_exec(
+                self._command, *self._args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            self._initialized = False
+            return True
+        except Exception:
+            logger.debug("Failed to spawn aws-outlook-mcp process", exc_info=True)
+            self._process = None
+            return False
+
+    async def _send_receive(self, request: dict, timeout: float = 15.0) -> Optional[dict]:
+        proc = self._process
+        if not proc or proc.returncode is not None:
+            return None
+        line = json.dumps(request) + "\n"
+        try:
+            proc.stdin.write(line.encode())
+            await proc.stdin.drain()
+            raw = await asyncio.wait_for(proc.stdout.readline(), timeout=timeout)
+            if not raw:
+                return None
+            return json.loads(raw)
+        except asyncio.TimeoutError:
+            logger.warning("aws-outlook-mcp response timed out after %.1fs", timeout)
+            return None
+        except Exception:
+            logger.debug("aws-outlook-mcp send/receive failed", exc_info=True)
+            return None
+
+    async def _ensure_initialized(self, timeout: float = 15.0) -> bool:
+        if self._initialized:
+            return True
+        if not await self._spawn():
+            return False
+        init_req = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "swarm-outlook-adapter", "version": "1.0"},
+            },
+        }
+        self._request_id = 1
+        resp = await self._send_receive(init_req, timeout=timeout)
+        if not resp or "result" not in resp:
+            logger.warning("aws-outlook-mcp initialize handshake failed")
+            await self.close()
+            return False
+        notif = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
+        proc = self._process
+        if proc and proc.returncode is None:
+            try:
+                proc.stdin.write((json.dumps(notif) + "\n").encode())
+                await proc.stdin.drain()
+            except Exception:
+                pass
+        self._initialized = True
+        return True
+
+    async def call_tool(self, tool_name: str, arguments: dict,
+                        timeout: float = 15.0) -> Optional[dict]:
+        """Call an MCP tool; return the ``result`` dict or None on any error."""
+        if not self._command:
+            return None
+        async with self._lock:
+            if not await self._ensure_initialized(timeout=timeout):
+                return None
+            request = self._build_request(tool_name, arguments)
+            resp = await self._send_receive(request, timeout=timeout)
+            if resp and "result" in resp:
+                return resp["result"]
+            if resp and "error" in resp:
+                logger.warning("aws-outlook-mcp tool error (type=%s)",
+                               type(resp.get("error")).__name__)
+            return None
+
+    async def close(self) -> None:
+        proc = self._process
+        if proc:
+            try:
+                proc.terminate()
+                await asyncio.wait_for(proc.wait(), timeout=3)
+            except (asyncio.TimeoutError, Exception):
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            self._process = None
+            self._initialized = False
 
 
 class OutlookChannelAdapter(ChannelAdapter):
@@ -38,6 +234,8 @@ class OutlookChannelAdapter(ChannelAdapter):
     def __init__(self, channel_id: str, config: dict, on_message) -> None:
         super().__init__(channel_id, config, on_message)
         self._poll_interval: int = config.get("poll_interval_seconds", 60)
+        # How many recent emails to request per poll (Graph default ~10).
+        self._fetch_limit: int = config.get("fetch_limit", 25)
         self._connection_mode: str = "polling"
         self._stopped: bool = False
         self._poll_task: Optional[asyncio.Task] = None
@@ -45,6 +243,25 @@ class OutlookChannelAdapter(ChannelAdapter):
         self._seen_ids: dict[str, None] = {}  # OrderedDict-like (dict is insertion-ordered since 3.7)
         # Cap seen IDs to prevent unbounded growth
         self._seen_ids_max: int = 500
+        # One-time guard so the array-key-drift WARNING (in _fetch_emails)
+        # fires once, not every 60s poll.
+        self._warned_key_drift: bool = False
+        # First-poll priming: the inbox already holds history when the adapter
+        # starts. Without this guard, the first poll (and EVERY daemon restart,
+        # since _seen_ids is in-memory) would emit all existing emails as "new"
+        # and flood the dock. The first poll records their ids WITHOUT emitting;
+        # only mail arriving after startup surfaces. (Polling has no live-event
+        # stream like Slack's socket mode, so it must self-prime.)
+        self._primed: bool = False
+        # Lazy MCP bridge — created on first fetch so construction (and the
+        # whole test suite) never spawns a subprocess.
+        self._bridge: Optional[OutlookMcpBridge] = None
+
+    def _get_bridge(self) -> OutlookMcpBridge:
+        """Return the lazily-created MCP bridge (one per adapter)."""
+        if self._bridge is None:
+            self._bridge = OutlookMcpBridge()
+        return self._bridge
 
     @property
     def channel_type(self) -> str:
@@ -76,6 +293,12 @@ class OutlookChannelAdapter(ChannelAdapter):
                 await self._poll_task
             except asyncio.CancelledError:
                 pass
+        # Release the MCP subprocess so stop() leaves no orphan.
+        if self._bridge is not None:
+            try:
+                await self._bridge.close()
+            except Exception:
+                logger.debug("Outlook bridge close failed", exc_info=True)
         logger.info("Outlook adapter stopped for channel %s", self.channel_id)
 
     async def send_message(self, message: OutboundMessage) -> Optional[str]:
@@ -109,6 +332,23 @@ class OutlookChannelAdapter(ChannelAdapter):
             emails = await self._fetch_emails()
         except Exception:
             logger.exception("Outlook fetch_emails failed")
+            return
+
+        # First successful poll: prime the seen-id set from existing inbox
+        # history WITHOUT emitting, so startup/restart never floods the dock
+        # with pre-existing mail. Only emails arriving after this surface.
+        # Guard on a non-empty fetch so a transient empty/failed first poll
+        # (e.g. MCP auth still warming up) doesn't "prime" an empty set and
+        # then flood on the first REAL fetch.
+        if not self._primed:
+            if emails:
+                for email in emails:
+                    eid = email.get("id", "")
+                    if eid:
+                        self._seen_ids[eid] = None
+                self._primed = True
+                logger.info("Outlook adapter primed %d existing email(s) for channel %s (not emitted)",
+                            len(self._seen_ids), self.channel_id)
             return
 
         for email in emails:
@@ -156,19 +396,159 @@ class OutlookChannelAdapter(ChannelAdapter):
             except Exception:
                 logger.exception("Failed to deliver Outlook email %s", email_id)
 
-    async def _fetch_emails(self) -> list[dict]:
-        """Fetch recent emails via aws-outlook-mcp.
+    @staticmethod
+    def _normalize_email(raw: dict) -> Optional[dict]:
+        """Map one raw email object to the shape ``_poll_once`` consumes.
 
-        Override this in tests to mock the MCP boundary.
-        In production, this will call the MCP tool via ToolSearch.
-        For Phase 2, this is a placeholder that returns [] — the real
-        MCP integration requires the MCP server to be connected at runtime.
+        The aws-outlook-mcp email tools return Microsoft Graph objects in
+        camelCase (``bodyPreview`` / ``receivedDateTime`` /
+        ``from.emailAddress.{name,address}``).  ``_poll_once`` consumes a
+        snake_case shape (``body_preview`` / ``received_at`` /
+        ``from.{name,address}``).  This bridges the two.
+
+        Defensive on key naming: the live MCP response shape could not be
+        observed at build time (auth was down), so each field falls back to
+        its snake_case spelling.  This never trusts a single naming guess —
+        a post-deploy smoke with a real email is the authoritative check.
+
+        Returns ``None`` when the email has no ``id`` — without a stable id
+        the dedup cache (``_seen_ids``) cannot work, so such a record would
+        be re-delivered every poll.  Dropping it is safer than looping it.
         """
-        # Phase 2: placeholder — real MCP integration in a follow-up
-        # when the adapter is actually connected to a running MCP server.
-        # The test suite mocks this method at the boundary.
-        logger.debug("Outlook _fetch_emails: no MCP integration yet (placeholder)")
+        if not isinstance(raw, dict):
+            return None
+        email_id = raw.get("id") or raw.get("message_id") or ""
+        if not email_id:
+            return None
+
+        # Sender: Graph nests it as from.emailAddress.{name,address};
+        # a snake_case variant may expose from.{name,address} directly.
+        sender_obj = raw.get("from") or {}
+        if not isinstance(sender_obj, dict):
+            sender_obj = {}
+        email_addr_obj = sender_obj.get("emailAddress")
+        if isinstance(email_addr_obj, dict):
+            sender_name = email_addr_obj.get("name", "")
+            sender_addr = email_addr_obj.get("address", "")
+        else:
+            sender_name = sender_obj.get("name", "")
+            sender_addr = sender_obj.get("address", "")
+
+        return {
+            "id": email_id,
+            "subject": raw.get("subject", ""),
+            "body_preview": raw.get("bodyPreview") or raw.get("body_preview") or "",
+            "received_at": raw.get("receivedDateTime") or raw.get("received_at") or "",
+            "from": {"name": sender_name, "address": sender_addr},
+        }
+
+    @staticmethod
+    def _unwrap_mcp_result(result: dict) -> Optional[dict]:
+        """Unwrap the two-layer aws-outlook-mcp response.
+
+        Layer 1 — MCP envelope: ``{"content": [{"type": "text",
+        "text": "<json-string>"}]}``. The real payload is a JSON STRING
+        inside ``content[0].text`` (same shape slack.py parses).
+        Layer 2 — business envelope: the decoded payload is
+        ``{"success": bool, ...}``; a ``success: false`` (or an ``error``
+        key) means the MCP call itself failed server-side.
+
+        Returns the decoded inner payload dict on success, else ``None``.
+        All content is treated as untrusted DATA — only structural keys are
+        read, never executed or interpreted as instructions.
+        """
+        if not isinstance(result, dict):
+            return None
+        content = result.get("content")
+        if not isinstance(content, list) or not content:
+            return None
+        text = None
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                break
+        if not isinstance(text, str) or not text:
+            return None
+        try:
+            payload = json.loads(text)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("success") is False or "error" in payload:
+            return None
+        return payload
+
+    @staticmethod
+    def _extract_email_list(payload: dict) -> list:
+        """Pull the email array out of the inner payload.
+
+        Graph/MCP responses vary on the array key (``items`` / ``value`` /
+        ``emails`` / ``messages``); accept any of them, else ``[]``.
+        """
+        for key in ("items", "value", "emails", "messages", "data"):
+            arr = payload.get(key)
+            if isinstance(arr, list):
+                return arr
         return []
+
+    async def _fetch_emails(self) -> list[dict]:
+        """Fetch recent emails via aws-outlook-mcp, normalized for _poll_once.
+
+        Returns a list of snake_case email dicts. Returns ``[]`` on EVERY
+        failure (no binary, spawn/handshake fail, timeout, server-side error
+        envelope, non-JSON content, unexpected shape) — never raises — so a
+        dead or slow MCP cannot crash or freeze the polling loop.
+
+        Email content is untrusted external DATA: nothing here logs a body,
+        subject, or address, and nothing interprets email text as an
+        instruction. Downstream delivery goes through the gateway's existing
+        owner-only authorization path (unchanged by this adapter).
+        """
+        try:
+            bridge = self._get_bridge()
+            if not bridge.available:
+                logger.debug("Outlook MCP bridge unavailable (no binary configured)")
+                return []
+            result = await bridge.call_tool(
+                "email_inbox",
+                {"limit": self._fetch_limit, "unreadOnly": False},
+            )
+            if result is None:
+                return []
+            payload = self._unwrap_mcp_result(result)
+            if payload is None:
+                logger.debug("Outlook MCP returned error/empty envelope")
+                return []
+            raw_list = self._extract_email_list(payload)
+            # Key-drift detector: a success payload that carries a non-empty list
+            # under some OTHER key (one _extract_email_list doesn't know) would
+            # make every poll silently return [] and the adapter would look
+            # healthy while emitting nothing. The live email_inbox shape could
+            # not be observed at build time (auth down), so surface the drift
+            # loudly ONCE instead of failing invisibly. Logs only the KEY NAME,
+            # never email content.
+            if not raw_list and not self._warned_key_drift:
+                other_list_keys = [
+                    k for k, v in payload.items()
+                    if isinstance(v, list) and v and k not in ("items", "value", "emails", "messages", "data")
+                ]
+                if other_list_keys:
+                    logger.warning(
+                        "Outlook fetch: success payload had no email list under a known key, "
+                        "but found list(s) under unrecognized key(s) %s — array-key drift? "
+                        "_extract_email_list may need updating.", other_list_keys)
+                    self._warned_key_drift = True
+            normalized = []
+            for raw in raw_list:
+                item = self._normalize_email(raw)
+                if item is not None:
+                    normalized.append(item)
+            logger.debug("Outlook fetch: %d email(s) normalized", len(normalized))
+            return normalized
+        except Exception:
+            logger.exception("Outlook _fetch_emails failed (non-fatal)")
+            return []
 
 
 # Self-register on import (same pattern as slack.py)
