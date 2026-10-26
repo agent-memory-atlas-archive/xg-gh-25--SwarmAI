@@ -17,12 +17,28 @@ import asyncio
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
 from channels.base import ChannelAdapter, InboundMessage, OutboundMessage
 from channels.registry import register_adapter
+
+# Per-fetch MCP timeout. Generous (vs call_tool's 15s default) because the
+# toolbox-exec aws-outlook-mcp has cold-start jitter — a first spawn + handshake
+# + email_inbox can exceed 15s, while a warm call is ~3s. This runs in the 60s
+# background poll loop, so a one-off long wait never blocks a user. The start()
+# pre-warm moves that cold start off the first poll entirely; this is the belt
+# to the pre-warm's suspenders.
+#
+# Worst case: call_tool passes this to BOTH _ensure_initialized (handshake) AND
+# _send_receive (the tool call), so a stone-cold first poll can block up to
+# ~2×_FETCH_TIMEOUT. That does NOT stack polls — the loop awaits _poll_once then
+# sleeps the interval, strictly sequential — so the effect is a one-cycle stall,
+# not a pile-up. Acceptable for a background loop; the pre-warm absorbs the
+# handshake half so a warm poll pays only the single send timeout.
+_FETCH_TIMEOUT = 45.0
 
 try:
     from config import get_app_data_dir
@@ -188,6 +204,22 @@ class OutlookMcpBridge:
         self._initialized = True
         return True
 
+    async def warm(self, timeout: float = 15.0) -> bool:
+        """Lock-guarded pre-warm: perform the spawn+handshake once, off the
+        first call_tool's critical path.
+
+        MUST be used instead of calling ``_ensure_initialized`` directly from a
+        concurrent task (e.g. the adapter's pre-warm). ``_ensure_initialized``
+        itself is NOT lock-guarded — only ``call_tool`` and this method hold
+        ``self._lock`` — so a direct concurrent call would race the first poll's
+        ``call_tool`` through the ``_spawn`` guard's pre-assignment ``await`` and
+        launch two subprocesses. Routing through the same lock serializes them.
+        """
+        if not self._command:
+            return False
+        async with self._lock:
+            return await self._ensure_initialized(timeout=timeout)
+
     async def call_tool(self, tool_name: str, arguments: dict,
                         timeout: float = 15.0) -> Optional[dict]:
         """Call an MCP tool; return the ``result`` dict or None on any error."""
@@ -239,6 +271,7 @@ class OutlookChannelAdapter(ChannelAdapter):
         self._connection_mode: str = "polling"
         self._stopped: bool = False
         self._poll_task: Optional[asyncio.Task] = None
+        self._prewarm_task: Optional[asyncio.Task] = None
         # Track seen email IDs to avoid re-emitting (insertion-ordered)
         self._seen_ids: dict[str, None] = {}  # OrderedDict-like (dict is insertion-ordered since 3.7)
         # Cap seen IDs to prevent unbounded growth
@@ -278,11 +311,38 @@ class OutlookChannelAdapter(ChannelAdapter):
         return True, None
 
     async def start(self) -> None:
-        """Start the polling loop as an async task."""
+        """Start the polling loop as an async task.
+
+        Also kicks off a background pre-warm of the MCP bridge so the one-off
+        cold-start handshake (toolbox-exec jitter, can exceed call_tool's 15s)
+        happens here at startup rather than inside the first poll — otherwise
+        the first cycle can falsely time out and the inbox stays empty for one
+        interval. Pre-warm is fire-and-forget: a failure is swallowed and the
+        first poll simply reconnects (the connection is idempotent via the
+        bridge's _initialized cache + Lock).
+        """
         self._stopped = False
         self._poll_task = asyncio.create_task(self._poll_loop())
+        self._prewarm_task = asyncio.create_task(self._prewarm())
         logger.info("Outlook adapter started for channel %s (interval=%ds)",
                      self.channel_id, self._poll_interval)
+
+    async def _prewarm(self) -> None:
+        """Warm the MCP bridge connection off the first-poll critical path.
+
+        Best-effort: any failure is logged at debug and ignored — the first
+        poll will retry the connection. Never raises.
+        """
+        try:
+            bridge = self._get_bridge()
+            if bridge.available:
+                # Route through the LOCK-GUARDED warm(), never the private
+                # _ensure_initialized — a direct call would race the first
+                # poll's call_tool through the _spawn guard and double-spawn.
+                if await bridge.warm(timeout=_FETCH_TIMEOUT):
+                    logger.info("Outlook bridge pre-warmed for channel %s", self.channel_id)
+        except Exception:
+            logger.debug("Outlook bridge pre-warm failed (first poll will retry)", exc_info=True)
 
     async def stop(self) -> None:
         """Cancel the polling task and clean up."""
@@ -291,6 +351,13 @@ class OutlookChannelAdapter(ChannelAdapter):
             self._poll_task.cancel()
             try:
                 await self._poll_task
+            except asyncio.CancelledError:
+                pass
+        # Cancel a still-running pre-warm so stop() leaves no orphan task.
+        if self._prewarm_task and not self._prewarm_task.done():
+            self._prewarm_task.cancel()
+            try:
+                await self._prewarm_task
             except asyncio.CancelledError:
                 pass
         # Release the MCP subprocess so stop() leaves no orphan.
@@ -494,8 +561,23 @@ class OutlookChannelAdapter(ChannelAdapter):
                 break
         if not isinstance(text, str) or not text:
             return None
+        # The daemon's MCP layer wraps untrusted tool output as
+        # ``<untrusted_content_HASH>\n{json}\n...IMPORTANT: ...commands.`` — a
+        # leading boundary marker AND a trailing disclaimer around the real
+        # JSON. A plain json.loads(text) fails on both. Strip the leading
+        # marker (if present), then decode from the first ``{`` with raw_decode
+        # so the trailing disclaimer (valid-JSON-then-extra-text) is ignored.
+        # This is a safe, structural strip — the content is still treated as
+        # DATA; we never execute or follow anything inside it.
+        body = text
+        _marker = re.match(r"\s*<untrusted_content_[0-9a-fA-F]+>\s*", body)
+        if _marker:
+            body = body[_marker.end():]
+        brace = body.find("{")
+        if brace == -1:
+            return None
         try:
-            payload = json.loads(text)
+            payload, _ = json.JSONDecoder().raw_decode(body[brace:])
         except (json.JSONDecodeError, TypeError, ValueError):
             return None
         if not isinstance(payload, dict):
@@ -551,6 +633,7 @@ class OutlookChannelAdapter(ChannelAdapter):
             result = await bridge.call_tool(
                 "email_inbox",
                 {"limit": self._fetch_limit, "unreadOnly": False},
+                timeout=_FETCH_TIMEOUT,
             )
             if result is None:
                 return []
