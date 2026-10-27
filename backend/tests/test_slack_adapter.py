@@ -112,30 +112,40 @@ class TestSlackConfigValidation:
             assert error is None
 
     @pytest.mark.asyncio
-    async def test_missing_bot_token(self, on_message):
-        """Missing bot_token fails validation."""
-        from channels.adapters.slack import SlackChannelAdapter
-        adapter = SlackChannelAdapter(
+    async def test_missing_bot_token(self, on_message, monkeypatch):
+        """Missing bot_token fails validation with a CREDENTIALS_NEEDED reconfig hint.
+
+        AC5: credentials now live in the OS secret store, not config. When the
+        bot_token is absent from BOTH config and keystore, validation fails with a
+        clear reconfigure instruction (not a generic 'missing bot_token' that reads
+        like a code bug). Keystore is patched empty to simulate a fresh/restored box.
+        """
+        from channels.adapters import slack
+        monkeypatch.setattr(slack, "_load_channel_secret", lambda key: "")
+        adapter = slack.SlackChannelAdapter(
             channel_id="test",
             config={"app_token": "xapp-test"},
             on_message=on_message,
         )
         valid, error = await adapter.validate_config()
         assert valid is False
-        assert "bot_token" in error.lower()
+        assert "CREDENTIALS_NEEDED" in error
+        assert "xoxb-" in error  # tells the user which token to supply
 
     @pytest.mark.asyncio
-    async def test_missing_app_token(self, on_message):
-        """Missing app_token fails validation."""
-        from channels.adapters.slack import SlackChannelAdapter
-        adapter = SlackChannelAdapter(
+    async def test_missing_app_token(self, on_message, monkeypatch):
+        """Missing app_token fails validation with a CREDENTIALS_NEEDED reconfig hint (AC5)."""
+        from channels.adapters import slack
+        monkeypatch.setattr(slack, "_load_channel_secret", lambda key: "")
+        adapter = slack.SlackChannelAdapter(
             channel_id="test",
             config={"bot_token": "xoxb-test"},
             on_message=on_message,
         )
         valid, error = await adapter.validate_config()
         assert valid is False
-        assert "app_token" in error.lower()
+        assert "CREDENTIALS_NEEDED" in error
+        assert "xapp-" in error
 
     @pytest.mark.asyncio
     async def test_invalid_bot_token_prefix(self, on_message):
