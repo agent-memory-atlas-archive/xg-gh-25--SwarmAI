@@ -336,6 +336,24 @@ class ChannelGateway:
         channels = await db.channels.list()
         logger.info(f"Found {len(channels)} channel(s), auto-starting all")
 
+        # Remediate any PRE-EXISTING row that still holds a plaintext secret in
+        # its config (written before the keystore migration). Without this the
+        # write-path strip only protects NEW rows, and a legacy row would leak
+        # into the git-exported db-export/channels.sql.gz on the next backup —
+        # readers prefer config-first so it never self-heals. Idempotent no-op
+        # once migrated (review HIGH finding).
+        try:
+            from core.channel_secrets import migrate_legacy_channel_secrets
+            migrated = await migrate_legacy_channel_secrets(channels)
+            if migrated:
+                logger.warning(
+                    "migrated %d legacy channel(s): secrets moved config→keystore; "
+                    "re-reading sanitized rows", migrated,
+                )
+                channels = await db.channels.list()  # re-read so start uses sanitized config
+        except Exception:
+            logger.exception("legacy channel-secret migration sweep failed (non-fatal)")
+
         for ch in channels:
             try:
                 await self.start_channel(ch["id"])
@@ -1766,8 +1784,18 @@ class ChannelGateway:
 
         channel_type_str = channel.get("channel_type", "")
         if channel_type_str == "slack":
-            channel_context["bot_token"] = channel_config.get("bot_token", "")
-            channel_context["app_token"] = channel_config.get("app_token", "")
+            # Credentials live in the OS secret store, not config (config is
+            # git-exported verbatim). Keystore is AUTHORITATIVE (read first);
+            # config is a legacy-only fallback — keystore-first so a stray config
+            # token can't override the real stored one. See core/keychain.py.
+            from core import keychain
+            _svc = "com.swarmai.channel-creds"
+            channel_context["bot_token"] = (
+                keychain.get_secret(_svc, "slack:bot_token") or channel_config.get("bot_token", "") or ""
+            )
+            channel_context["app_token"] = (
+                keychain.get_secret(_svc, "slack:app_token") or channel_config.get("app_token", "") or ""
+            )
 
         final_text = await self._prepare_message_text(
             msg, agent_id, sender_identity,
