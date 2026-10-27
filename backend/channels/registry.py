@@ -39,14 +39,6 @@ def list_supported_types() -> list[dict]:
                 {"key": "app_token", "label": "App Token (xapp-)", "type": "password", "required": True},
             ],
         },
-        "outlook": {
-            "id": "outlook",
-            "label": "Outlook",
-            "description": "Poll Outlook emails via MCP bridge",
-            "config_fields": [
-                {"key": "poll_interval_seconds", "label": "Poll Interval (seconds)", "type": "number", "required": False},
-            ],
-        },
     }
 
     result = []
@@ -67,9 +59,3 @@ def load_adapters() -> None:
         from channels.adapters import slack  # noqa: F401
     except ImportError:
         logger.info("Slack adapter not available (slack-bolt not installed)")
-
-    # Outlook adapter (MCP-bridged email polling)
-    try:
-        from channels.adapters import outlook  # noqa: F401
-    except ImportError:
-        logger.info("Outlook adapter not available")

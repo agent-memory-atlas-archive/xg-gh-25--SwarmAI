@@ -540,8 +540,6 @@ export const chatService = {
       }),
       // Correlation ID for optimistic message dedup (AC2/AC3)
       ...(request.clientId && { client_id: request.clientId }),
-      // Per-request model override (e.g. "claude-sonnet-4-6")
-      ...(request.model && { model: request.model }),
     };
 
     // If content array is provided, use it; otherwise use message

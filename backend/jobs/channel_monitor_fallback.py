@@ -44,18 +44,7 @@ _CHANNELS_TO_MONITOR = _load_channels_to_monitor()
 
 
 def _get_bot_token() -> str:
-    """Read the Slack bot_token from the OS secret store (config fallback for legacy rows).
-
-    Credentials moved out of channels.config into the OS secret store (that column
-    is git-exported verbatim — see core/keychain.py). Config is still checked as a
-    fallback for rows written before the migration, but the keystore is primary.
-    """
-    from core import keychain
-    token = keychain.get_secret("com.swarmai.channel-creds", "slack:bot_token")
-    if token:
-        return token
-
-    # Legacy fallback: a Slack channel row written before the keystore migration.
+    """Read bot_token from the channels DB table."""
     db_path = DB_PATH
     if not db_path.exists():
         raise FileNotFoundError(f"Database not found: {db_path}")
@@ -69,10 +58,7 @@ def _get_bot_token() -> str:
         config = json.loads(row[0])
         token = config.get("bot_token", "")
         if not token:
-            raise ValueError(
-                "No Slack bot_token in the secret store or channel config — "
-                "re-save the Slack channel to store its credentials"
-            )
+            raise ValueError("No bot_token in channel config")
         return token
     finally:
         conn.close()

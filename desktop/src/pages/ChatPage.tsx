@@ -73,8 +73,6 @@ import { todosService } from '../services/todos';
 import type { ToDo } from '../types/todo';
 import { useAttentionQueue } from '../hooks/useAttentionQueue';
 import RefreshContextModal from '../components/modals/RefreshContextModal';
-import { useInbox } from '../hooks/useInbox';
-import { InboxDock, InboxToggle } from '../components/inbox/InboxDock';
 
 import { mergeOlderMessages, toDisplayMessage } from './chat/utils';
 import { EXPLORER_ATTACH_FILE, EXPLORER_ASK_ABOUT_FILE } from '../constants/explorerEvents';
@@ -440,23 +438,6 @@ export default function ChatPage() {
   // down) so Canvas visibly belongs to the current tab. Replaces the former
   // global Canvas state that lived in ThreeColumnLayout.
   const canvas = useCanvasHost({ activeTabId, sessionId, isStreaming });
-
-  // Unified Inbox — polls /api/channels/inbox for inbound messages (Slack + Outlook).
-  // Dock open/close state is local (not persisted across sessions).
-  const [inboxOpen, setInboxOpen] = useState(false);
-  const inbox = useInbox(true);
-  // Stable ref so the toggle callback doesn't recreate on every poll
-  const inboxMarkAllReadRef = useRef(inbox.markAllRead);
-  inboxMarkAllReadRef.current = inbox.markAllRead;
-  const handleInboxToggle = useCallback(() => {
-    setInboxOpen((prev) => {
-      if (!prev) inboxMarkAllReadRef.current(); // auto-mark-read on open
-      return !prev;
-    });
-  }, []);
-  const handleInboxClose = useCallback(() => {
-    setInboxOpen(false);
-  }, []);
 
   // Agent UI proprioception (SENSE): assemble a request-time snapshot of the
   // agent's own UI state — open file + Canvas state + which nav overlay is open —
@@ -1567,12 +1548,10 @@ export default function ChatPage() {
     }
   }, [messagesReady]);
 
-  // Scroll to bottom + force repaint after tab restore completes.
+  // Scroll to bottom after tab restore completes.
   // The normal scroll effect ([messages]) may fire before the messages container
   // is rendered (it's gated behind messagesReady). This effect ensures a
   // reliable scroll-to-bottom once the DOM is fully laid out after restore.
-  // COE-001: Tauri WebView GPU compositing may not repaint after programmatic
-  // DOM updates — force repaint via translateZ trick as a backstop.
   useEffect(() => {
     if (messagesReady && messages.length > 0) {
       // Double-rAF: first rAF runs after React commit, second runs after
@@ -1580,19 +1559,11 @@ export default function ChatPage() {
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
           messagesEndRef.current?.scrollIntoView({ behavior: 'auto' });
-          // COE-001: GPU translateZ compositing force-repaint
-          const el = document.querySelector('.messages-container') || document.getElementById('messages');
-          if (el) {
-            (el as HTMLElement).style.transform = 'translateZ(0)';
-            requestAnimationFrame(() => {
-              (el as HTMLElement).style.transform = '';
-            });
-          }
         });
       });
     }
     // Only fire once when messagesReady transitions to true — not on every message change
-
+     
   }, [messagesReady]);
 
   // Register the initial/default tab in the per-tab state map on mount.
@@ -3351,14 +3322,6 @@ export default function ChatPage() {
         lastSeenOutputCount={canvas.lastSeenOutputCount}
         canvasOpen={canvas.isOpen}
         onOpenCanvas={() => window.dispatchEvent(new CustomEvent('swarm:open-canvas'))}
-        // Inbox toggle — placed in the ChatHeader's right cluster
-        inboxToggle={
-          <InboxToggle
-            unreadCount={inbox.unreadCount}
-            isOpen={inboxOpen}
-            onClick={handleInboxToggle}
-          />
-        }
       />
 
       {/* 🔔 Alerts pill — portaled into the left-sidebar slot (run_2bdc68ad).
@@ -3575,20 +3538,6 @@ export default function ChatPage() {
             onRevealCanvas={canvas.reveal}
           />
         )}
-
-        {/* Inbox Dock — unified inbox panel (Slack + Outlook inbound messages).
-            Flex sibling to the right of Canvas, toggled via the ChatHeader inbox
-            button. Follows the same pattern as FileViewerPanel: a fixed-width
-            flex-shrink-0 column with border-l separation. */}
-        <InboxDock
-          isOpen={inboxOpen}
-          items={inbox.items}
-          unreadCount={inbox.unreadCount}
-          isLoading={inbox.isLoading}
-          error={inbox.error}
-          onClose={handleInboxClose}
-          onMarkAllRead={inbox.markAllRead}
-        />
 
         {/* SwarmRadar removed (2026-08-02): all 3 sections have live replacements —
             Changes → Canvas (CanvasOutputRail), Attention → ChatHeader AlertsPill

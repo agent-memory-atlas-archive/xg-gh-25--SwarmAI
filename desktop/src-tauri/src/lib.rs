@@ -2726,8 +2726,7 @@ pub fn run() {
                     .resizable(true)
                     .fullscreen(false)
                     .center()
-                    .zoom_hotkeys_enabled(false)
-                    .disable_drag_drop_handler();
+                    .zoom_hotkeys_enabled(false);
 
                 // title_bar_style and hidden_title are macOS-only APIs
                 #[cfg(target_os = "macos")]
@@ -2775,33 +2774,23 @@ pub fn run() {
                 }
             }
 
-            // Set up window close handler: hide on close (macOS), cleanup on destroy
+            // Set up window close handler for cleanup (especially important on Windows)
             if let Some(window) = app.get_webview_window("main") {
                 let app_handle = app.handle().clone();
                 window.on_window_event(move |event| {
-                    match event {
-                        tauri::WindowEvent::CloseRequested { api, .. } => {
-                            // Hide instead of closing — keeps backend alive
-                            api.prevent_close();
-                            if let Some(win) = app_handle.get_webview_window("main") {
-                                let _ = win.hide();
-                            }
-                        }
-                        tauri::WindowEvent::Destroyed => {
-                            // Best-effort: emit before block_on freezes event loop
-                            let _ = app_handle.emit("shutdown-started", ());
-                            // Reap any live integrated-terminal PTY children (AC6 backstop
-                            // for a hard window close where the frontend beforeunload
-                            // closeAll didn't run). Runs before the backend shutdown.
-                            let term_state = app_handle.state::<TerminalState>();
-                            tauri::async_runtime::block_on(terminal::reap_all_ptys(
-                                term_state.inner(),
-                            ));
-                            // Graceful shutdown: send POST /shutdown, wait, then force-kill
-                            let state = app_handle.state::<SharedBackendState>();
-                            graceful_shutdown_and_kill(state.inner().clone(), "window_destroy");
-                        }
-                        _ => {}
+                    if let tauri::WindowEvent::Destroyed = event {
+                        // Best-effort: emit before block_on freezes event loop
+                        let _ = app_handle.emit("shutdown-started", ());
+                        // Reap any live integrated-terminal PTY children (AC6 backstop
+                        // for a hard window close where the frontend beforeunload
+                        // closeAll didn't run). Runs before the backend shutdown.
+                        let term_state = app_handle.state::<TerminalState>();
+                        tauri::async_runtime::block_on(terminal::reap_all_ptys(
+                            term_state.inner(),
+                        ));
+                        // Graceful shutdown: send POST /shutdown, wait, then force-kill
+                        let state = app_handle.state::<SharedBackendState>();
+                        graceful_shutdown_and_kill(state.inner().clone(), "window_destroy");
                     }
                 });
             }
@@ -2812,17 +2801,6 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             match event {
-                // macOS: clicking Dock icon re-shows the hidden window.
-                // Gated: RunEvent::Reopen is a macOS-only variant — on Windows/Linux
-                // the enum has no such variant (E0599), so the arm must be cfg'd out.
-                // Those targets fall into the `_ => {}` catch-all below (no Dock concept).
-                #[cfg(target_os = "macos")]
-                tauri::RunEvent::Reopen { .. } => {
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                    }
-                }
                 tauri::RunEvent::Exit => {
                     // Best-effort: emit before block_on freezes event loop
                     let _ = app_handle.emit("shutdown-started", ());

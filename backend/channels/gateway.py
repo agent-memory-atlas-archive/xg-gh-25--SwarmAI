@@ -155,42 +155,6 @@ def _is_authorized_tier(sender_identity: Optional[SenderIdentity]) -> bool:
     )
 
 
-def _compute_pushworthy(msg: "InboundMessage", channel: dict) -> bool:
-    """Decide whether an inbound message should surface in the unified inbox dock.
-
-    Pushworthy = the message warrants a notification/badge in the desktop dock.
-    Whitelist (any match → True):
-      1. DM (chat_type == "im") — always pushworthy.
-      2. @mention (is_mention flag in metadata) — always pushworthy.
-      3. Channel opt-in — channel config has ``inbox_pushworthy: true``
-         (set by the user for GCR-Tech-Projects section channels, etc.).
-
-    Everything else → False (the message is still stored, just not surfaced).
-    """
-    meta = msg.metadata or {}
-    chat_type = meta.get("chat_type", "")
-
-    # DM — always push
-    if chat_type == "im":
-        return True
-
-    # @mention — always push
-    if meta.get("is_mention"):
-        return True
-
-    # Channel-level opt-in (GCR-Tech-Projects section channels, etc.)
-    config = channel.get("config") or {}
-    if isinstance(config, str):
-        try:
-            config = json.loads(config)
-        except (json.JSONDecodeError, TypeError):
-            config = {}
-    if config.get("inbox_pushworthy"):
-        return True
-
-    return False
-
-
 def _resolve_reply_thread_ts(
     external_thread_id: Optional[str],
     external_message_id: Optional[str],
@@ -335,24 +299,6 @@ class ChannelGateway:
 
         channels = await db.channels.list()
         logger.info(f"Found {len(channels)} channel(s), auto-starting all")
-
-        # Remediate any PRE-EXISTING row that still holds a plaintext secret in
-        # its config (written before the keystore migration). Without this the
-        # write-path strip only protects NEW rows, and a legacy row would leak
-        # into the git-exported db-export/channels.sql.gz on the next backup —
-        # readers prefer config-first so it never self-heals. Idempotent no-op
-        # once migrated (review HIGH finding).
-        try:
-            from core.channel_secrets import migrate_legacy_channel_secrets
-            migrated = await migrate_legacy_channel_secrets(channels)
-            if migrated:
-                logger.warning(
-                    "migrated %d legacy channel(s): secrets moved config→keystore; "
-                    "re-reading sanitized rows", migrated,
-                )
-                channels = await db.channels.list()  # re-read so start uses sanitized config
-        except Exception:
-            logger.exception("legacy channel-secret migration sweep failed (non-fatal)")
 
         for ch in channels:
             try:
@@ -1202,10 +1148,6 @@ class ChannelGateway:
         start_ts = self._channel_start_times.get(channel_id)
         uptime = round(time.time() - start_ts, 1) if start_ts else None
 
-        # connection_mode from the adapter thread (socket/polling/None)
-        adapter = self._adapters.get(channel_id)
-        connection_mode = getattr(adapter, "_connection_mode", None) if adapter else None
-
         return {
             "channel_id": channel_id,
             "status": status,
@@ -1213,7 +1155,6 @@ class ChannelGateway:
             "messages_processed": self._channel_msg_counts.get(channel_id, 0),
             "active_sessions": active_sessions,
             "error_message": error_message,
-            "connection_mode": connection_mode,
         }
 
     # ------------------------------------------------------------------
@@ -1592,7 +1533,6 @@ class ChannelGateway:
                     "observed": True,  # recorded without a reply
                     **_sender_metadata(sender_identity, resolved_name),
                     "attachment_count": len(msg.attachments),
-                    "pushworthy": _compute_pushworthy(msg, channel),
                 },
                 "status": "observed",
             })
@@ -1743,7 +1683,6 @@ class ChannelGateway:
                     **_sender_metadata(sender_identity, resolved_name),
                     "attachment_count": len(msg.attachments),
                     "attachment_names": [a.get("file_name") for a in msg.attachments],
-                    "pushworthy": _compute_pushworthy(msg, channel),
                 },
                 "status": "received",
             })
@@ -1784,18 +1723,8 @@ class ChannelGateway:
 
         channel_type_str = channel.get("channel_type", "")
         if channel_type_str == "slack":
-            # Credentials live in the OS secret store, not config (config is
-            # git-exported verbatim). Keystore is AUTHORITATIVE (read first);
-            # config is a legacy-only fallback — keystore-first so a stray config
-            # token can't override the real stored one. See core/keychain.py.
-            from core import keychain
-            _svc = "com.swarmai.channel-creds"
-            channel_context["bot_token"] = (
-                keychain.get_secret(_svc, "slack:bot_token") or channel_config.get("bot_token", "") or ""
-            )
-            channel_context["app_token"] = (
-                keychain.get_secret(_svc, "slack:app_token") or channel_config.get("app_token", "") or ""
-            )
+            channel_context["bot_token"] = channel_config.get("bot_token", "")
+            channel_context["app_token"] = channel_config.get("app_token", "")
 
         final_text = await self._prepare_message_text(
             msg, agent_id, sender_identity,

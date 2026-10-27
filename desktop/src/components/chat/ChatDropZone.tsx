@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, ReactNode } from 'react';
+import { useState, useCallback, ReactNode } from 'react';
 import clsx from 'clsx';
 import type { FileTreeItem } from '../workspace-explorer/FileTreeNode';
 
@@ -28,66 +28,49 @@ interface ChatDropZoneProps {
  */
 export function ChatDropZone({ children, addFiles, addWorkspaceFiles }: ChatDropZoneProps) {
   const [isDragOver, setIsDragOver] = useState(false);
-  // Safety timeout: Tauri's disable_drag_drop_handler can cause the browser
-  // drop event to never fire, leaving the overlay stuck. A 2s timeout after
-  // the last dragOver ensures the overlay always clears.
-  const dragTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const clearDragTimeout = useCallback(() => {
-    if (dragTimeoutRef.current) { clearTimeout(dragTimeoutRef.current); dragTimeoutRef.current = null; }
-  }, []);
-
-  const resetDragTimeout = useCallback(() => {
-    clearDragTimeout();
-    dragTimeoutRef.current = setTimeout(() => setIsDragOver(false), 2000);
-  }, [clearDragTimeout]);
 
   // Handle drag enter - show visual feedback for workspace JSON or native files
   const handleDragEnter = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
-
+    
     // Show overlay for workspace explorer JSON drags OR native OS file drags
     if (e.dataTransfer.types.includes('application/json') || e.dataTransfer.types.includes('Files')) {
       setIsDragOver(true);
-      resetDragTimeout();
     }
-  }, [resetDragTimeout]);
+  }, []);
 
   // Handle drag over - required to allow drop for both drag types
   const handleDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
-
+    
     // Set the drop effect to copy for workspace JSON or native file drags
     if (e.dataTransfer.types.includes('application/json') || e.dataTransfer.types.includes('Files')) {
       e.dataTransfer.dropEffect = 'copy';
-      resetDragTimeout();
     }
-  }, [resetDragTimeout]);
+  }, []);
 
   // Handle drag leave - remove visual feedback
   const handleDragLeave = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
-
+    
     // Only set isDragOver to false if we're leaving the drop zone entirely
     // Check if the related target is outside the drop zone
     const relatedTarget = e.relatedTarget as HTMLElement | null;
     const currentTarget = e.currentTarget as HTMLElement;
-
+    
     if (!relatedTarget || !currentTarget.contains(relatedTarget)) {
       setIsDragOver(false);
-      clearDragTimeout();
     }
-  }, [clearDragTimeout]);
+  }, []);
 
   // Handle drop - route to unified attachment pipeline via props
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
     setIsDragOver(false);
-    clearDragTimeout();
 
     // Path 1: Workspace explorer (JSON data from FileTreeNode drag)
     const jsonData = e.dataTransfer.getData('application/json');

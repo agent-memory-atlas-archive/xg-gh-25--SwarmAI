@@ -49,25 +49,6 @@ from channels.base import (
 
 logger = logging.getLogger(__name__)
 
-# OS secret-store coordinates for Slack credentials. MUST match
-# routers/channels.py CHANNEL_CREDS_SERVICE + _keychain_account("slack", key) —
-# the write side stores under exactly these, the read side (here) retrieves them.
-# Keyed by channel_type "slack" (not channel_id): channels are upsert-by-type,
-# and the fallback jobs look up by type, so one account per (type, key) is the
-# single coordinate every reader agrees on.
-_CREDS_SERVICE = "com.swarmai.channel-creds"
-
-
-def _load_channel_secret(key: str) -> str:
-    """Read a Slack credential (bot_token/app_token) from the OS secret store.
-
-    Returns "" when absent — the caller (validate_config) turns that into a clear
-    'needs reconfigure' error rather than a silent generic auth failure.
-    """
-    from core import keychain
-    return keychain.get_secret(_CREDS_SERVICE, f"slack:{key}") or ""
-
-
 # Sentinel for "this (channel, ts) has never been seen" — distinct from a
 # stored False verdict (seen, but not a mention). Used by the dedup map in
 # _normalize_event so a missed-mention upgrade can be told apart from a
@@ -425,14 +406,8 @@ class SlackChannelAdapter(ChannelAdapter):
 
     def __init__(self, channel_id: str, config: dict, on_message) -> None:
         super().__init__(channel_id, config, on_message)
-        # Credentials live in the OS secret store, NOT config (config is exported
-        # verbatim into a git-tracked DB dump — see core/keychain.py). Keystore is
-        # AUTHORITATIVE (read first); a config-supplied token is only a legacy
-        # fallback for rows written before the migration. Keystore-first (not
-        # config-first) so a stray/injected config token can never override the
-        # real stored credential (adversarial review: config-first was a downgrade).
-        self._bot_token: str = _load_channel_secret("bot_token") or config.get("bot_token", "")
-        self._app_token: str = _load_channel_secret("app_token") or config.get("app_token", "")
+        self._bot_token: str = config.get("bot_token", "")
+        self._app_token: str = config.get("app_token", "")
         self._bolt_app = None
         self._handler = None
         self._slack_client = None
@@ -480,23 +455,10 @@ class SlackChannelAdapter(ChannelAdapter):
 
     async def validate_config(self) -> tuple[bool, Optional[str]]:
         """Verify bot_token and app_token are present and valid."""
-        # Tokens come from the OS secret store (see _load_channel_secret). If they
-        # are absent, the most likely cause is a restore onto a new machine where
-        # the keystore did not come along (secrets are deliberately NOT in the
-        # git-backed DB) — so say exactly that and how to fix it, not a generic
-        # "missing bot_token" that reads like a code bug.
-        _RECONFIG_HINT = (
-            "Slack credentials not found in the OS secret store — re-save this "
-            "Slack channel with its Bot Token (xoxb-) and App Token (xapp-). "
-            "(Credentials are stored in the Keychain/secret store, not the DB, so "
-            "they do not transfer on a backup restore.)"
-        )
-        if not self._bot_token or not self._app_token:
-            return False, f"CREDENTIALS_NEEDED: {_RECONFIG_HINT}"
-        if not self._bot_token.startswith("xoxb-"):
-            return False, "Invalid bot_token (must start with xoxb-)"
-        if not self._app_token.startswith("xapp-"):
-            return False, "Invalid app_token (must start with xapp-)"
+        if not self._bot_token or not self._bot_token.startswith("xoxb-"):
+            return False, "Missing or invalid bot_token (must start with xoxb-)"
+        if not self._app_token or not self._app_token.startswith("xapp-"):
+            return False, "Missing or invalid app_token (must start with xapp-)"
 
         try:
             client = WebClient(token=self._bot_token)

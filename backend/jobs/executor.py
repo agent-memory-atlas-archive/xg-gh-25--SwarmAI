@@ -1543,29 +1543,23 @@ def _send_slack_dm_bot_api(message: str) -> bool:
         if not dm_channel:
             return False
 
-        # Read bot_token from the OS secret store (same source as the channel
-        # adapter). Credentials are no longer in channels.config (that column is
-        # git-exported verbatim — see core/keychain.py); config is a legacy
-        # fallback for rows written before the migration.
-        from core import keychain
-        bot_token = keychain.get_secret("com.swarmai.channel-creds", "slack:bot_token") or ""
-        if not bot_token:
-            db_path = DB_PATH
-            if not db_path.exists():
-                return False
-            conn = sqlite3.connect(str(db_path), timeout=5)
-            conn.row_factory = sqlite3.Row
-            try:
-                row = conn.execute(
-                    "SELECT config FROM channels WHERE channel_type = 'slack' LIMIT 1"
-                ).fetchone()
-            finally:
-                conn.close()
+        # Read bot_token from channels table (same source as channel adapter)
+        db_path = DB_PATH
+        if not db_path.exists():
+            return False
+        conn = sqlite3.connect(str(db_path), timeout=5)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT config FROM channels WHERE channel_type = 'slack' LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
 
-            if not row:
-                return False
-            config = json.loads(row["config"] or "{}")
-            bot_token = config.get("bot_token", "")
+        if not row:
+            return False
+        config = json.loads(row["config"] or "{}")
+        bot_token = config.get("bot_token", "")
         if not bot_token or not bot_token.startswith("xoxb-"):
             return False
 

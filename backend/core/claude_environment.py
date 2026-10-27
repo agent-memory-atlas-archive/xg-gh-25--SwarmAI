@@ -7,10 +7,7 @@ This module isolates environment setup concerns.  It is responsible for:
                                          cache (zero IO) and sets the minimal
                                          process-level environment variables
                                          consumed by the Claude Agent SDK.
-                                         In ada/sso mode, REMOVES static AWS
-                                         credential env vars so the CLI
-                                         subprocess falls through to
-                                         credential_process for auto-refresh.
+                                         Never sets AWS credential env vars.
 - ``_ClaudeClientWrapper``             — Async context-manager wrapper around
                                          ``ClaudeSDKClient`` that suppresses
                                          anyio cancel-scope cleanup errors when
@@ -204,20 +201,9 @@ def _configure_claude_environment(config: AppConfigManager) -> None:
       (``auth_method=="bedrock_api_key"``) mode from the persisted secret;
       cleared for other Bedrock methods if WE injected it
 
-    **Credential delegation** (Bedrock + ada/sso mode):
+    **Env vars NOT set** (delegated to AWS credential chain):
 
-    Static AWS credential env vars (``AWS_ACCESS_KEY_ID``,
-    ``AWS_SECRET_ACCESS_KEY``, ``AWS_SESSION_TOKEN``) are explicitly REMOVED
-    so the CLI subprocess's AWS JS SDK falls through to ``fromProcess()``
-    which reads ``credential_process`` from ``~/.aws/config``.  This is
-    critical because the CLI subprocess is long-lived (warm reuse) and
-    ``fromEnv()`` would freeze stale credentials from fork time forever.
-
-    The credential chain in the CLI (AWS SDK v3) is:
-      fromEnv → fromIni → fromProcess → fromInstanceMetadata
-    By removing env vars AND ensuring no [default] in ~/.aws/credentials,
-    ``fromProcess()`` is reached and calls ``ada credentials print`` which
-    returns fresh 15-minute tokens on every credential resolution.
+    - ``AWS_ACCESS_KEY_ID``, ``AWS_SECRET_ACCESS_KEY``, ``AWS_SESSION_TOKEN``
 
     Raises:
         AuthenticationNotConfiguredError: If no ``ANTHROPIC_API_KEY`` env var
@@ -231,48 +217,6 @@ def _configure_claude_environment(config: AppConfigManager) -> None:
         region = config.get("aws_region", "us-east-1") or "us-east-1"
         os.environ["AWS_REGION"] = region
         os.environ["AWS_DEFAULT_REGION"] = region
-
-        # 1a. Credential delegation for ada/sso modes.
-        #
-        # REMOVE static AWS credential env vars so the CLI subprocess's
-        # credential chain falls through to fromProcess() → credential_process.
-        #
-        # Root cause (investigated 2026-10-19): the CLI subprocess is a
-        # long-lived Node.js process that reuses across turns (warm reuse).
-        # Its process.env is copied at fork and never updates.  If we inject
-        # AWS_ACCESS_KEY_ID/SECRET/TOKEN, fromEnv() succeeds with those stale
-        # values on every API call and fromProcess() (which would auto-refresh
-        # via credential_process) is never reached.  After the 15-minute
-        # Isengard TTL, every Bedrock call returns 403.
-        #
-        # The fix: don't inject static creds.  Let the SDK's default chain
-        # reach fromProcess() which calls ada credentials print on demand.
-        # Also ensure ~/.aws/credentials has no [default] section (which
-        # would be read by fromIni() and also shadow fromProcess()).
-        auth_method = config.get("auth_method")
-        if auth_method in ("ada", "sso", None):
-            _removed = []
-            for key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
-                        "AWS_SESSION_TOKEN"):
-                if os.environ.pop(key, None) is not None:
-                    _removed.append(key)
-            if _removed:
-                logger.info(
-                    "Cleared static AWS credential env vars for credential_process "
-                    "delegation: %s (auth_method=%s)",
-                    ", ".join(_removed), auth_method,
-                )
-            else:
-                logger.debug(
-                    "No static AWS credential env vars to clear (auth_method=%s)",
-                    auth_method,
-                )
-
-            # Also ensure ~/.aws/credentials doesn't have a [default] section
-            # that would shadow credential_process via fromIni().  External
-            # tools (ada credentials update, etc.) may write this at any time.
-            _ensure_no_default_credentials_section()
-
         # Clear a stale key that WE injected in a prior API-key-mode spawn — the
         # daemon is long-lived, so a leftover ANTHROPIC_API_KEY from a previous
         # config would ride into this Bedrock session and confuse SDK routing.
@@ -350,9 +294,58 @@ def _configure_claude_environment(config: AppConfigManager) -> None:
     os.environ.setdefault("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", "180000")
 
     # 6. MCP connection mode — PINNED to blocking ("0") deliberately.
+    #
+    # Read the CLI before changing this. Verified against the actual CLI bundle
+    # (claude-code 2.1.145, run_2f19c4e1) — the connect path computes:
+    #
+    #   O = lK(env.MCP_CONNECTION_NONBLOCKING)          # "0"/"false"/"no"/"off"
+    #         ? false                                    #   → BLOCKING
+    #         : xH(env.MCP_CONNECTION_NONBLOCKING)       # "1"/"true"/"yes"/"on"
+    #           || (opts.nonBlocking ?? false)           #   → else caller opt, default FALSE
+    #
+    # with lK(undefined) === false and xH(undefined) === false. So:
+    #   env "0"   → BLOCKING
+    #   env UNSET → BLOCKING   (falls through to opts.nonBlocking ?? false)
+    #   env "1"   → non-blocking
+    #
+    # `opts.nonBlocking` is a CLI-caller option the Python SDK NEVER sets (no
+    # occurrence in claude_agent_sdk), so UNSET and "0" are behaviourally
+    # IDENTICAL today. Setting "0" is therefore not a cost — it PINS the
+    # guarantee so a future SDK/CLI that starts passing nonBlocking=true cannot
+    # silently flip us to background init (see the unanswered question below).
+    #
+    # CORRECTION (run_2f19c4e1) — the removal in run_a7b35b68 was reverted here
+    # because BOTH halves of its justification were factually wrong:
+    #   1. "Removing this enables background init." FALSE — unset is blocking
+    #      (above). The removal was a provable NO-OP: the non-blocking branch was
+    #      never taken, and the CLI's own `[MCP] … running fully async` marker
+    #      appears in zero log lines across all daemon logs on this machine.
+    #   2. "Each of 4 MCPs blocks spawn up to 5s (~20s total)." FALSE — the
+    #      blocking wait is ONE batch-level `Promise.race` against a single
+    #      deadline constant (1000ms in this CLI build), after which the CLI
+    #      abandons the wait and proceeds with connect continuing in background.
+    #      Blocking mode's ceiling is ~1s for the whole batch, not ~20s — so it
+    #      was never a plausible cause of the measured p50 15.4s / p90 26.3s
+    #      spawn. That latency is the CLI startup + SDK `initialize` handshake;
+    #      it needs its own root-cause, and MCP mode is not the lever.
+    #      (Servers marked alwaysLoad are awaited unconditionally regardless of
+    #      this flag — we set alwaysLoad on none of ours, so all are in the
+    #      flag-governed batch.)
+    #
+    # UNANSWERED — resolve before ever setting "1": _check_mcp_health treating
+    # "pending" as non-failed only means the health check does not FALSE-ALARM.
+    # It says nothing about whether a first-turn tool call against a not-yet-
+    # connected MCP succeeds. "Health does not false-alarm" ≠ "the tool works".
+    # Blocking mode is what currently makes that question moot.
     os.environ.setdefault("MCP_CONNECTION_NONBLOCKING", "0")
 
-    # 6b. Bash tool timeout
+    # 6b. Bash tool timeout — the CLI already defaults BASH_DEFAULT_TIMEOUT_MS
+    # to 120s (max 600s/10min). We re-assert the 120s default explicitly to
+    # document intent; we deliberately DO NOT raise the 10min max (a higher
+    # ceiling only allows longer hangs). NOTE: this only bounds FOREGROUND
+    # commands — background commands (run_in_background) ignore it entirely
+    # (anthropics/claude-code#61568), which is the real runaway hole; that is
+    # handled separately by the background-command guard, not here.
     os.environ.setdefault("BASH_DEFAULT_TIMEOUT_MS", "120000")
 
     # 7. Pre-flight auth validation
@@ -366,39 +359,3 @@ def _configure_claude_environment(config: AppConfigManager) -> None:
         )
 
     logger.info(f"Claude environment configured - Bedrock: {use_bedrock}, Base URL: {base_url or 'default'}")
-
-
-def _ensure_no_default_credentials_section() -> None:
-    """Remove [default] from ~/.aws/credentials if present.
-
-    External tools (``ada credentials update``, Amazon tooling) may write a
-    [default] section with static short-lived tokens.  In the AWS SDK v3
-    credential chain, ``fromIni()`` (which reads this file) has HIGHER priority
-    than ``fromProcess()`` (which reads credential_process from ~/.aws/config).
-    So a stale [default] in credentials shadows the auto-refreshing
-    credential_process.  We remove it at every spawn to keep the path clear.
-    """
-    import configparser
-    from pathlib import Path
-
-    creds_path = Path.home() / ".aws" / "credentials"
-    if not creds_path.exists():
-        return
-
-    try:
-        cp = configparser.ConfigParser()
-        cp.read(creds_path)
-        if "default" not in cp:
-            return
-
-        cp.remove_section("default")
-        with open(creds_path, "w") as f:
-            cp.write(f)
-        logger.info(
-            "Removed [default] from ~/.aws/credentials to unblock credential_process"
-        )
-    except Exception:
-        logger.warning(
-            "Failed to clean [default] from ~/.aws/credentials",
-            exc_info=True,
-        )

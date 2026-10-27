@@ -39,13 +39,6 @@ class BaseTable(ABC, Generic[T]):
         """List items by session ID. Override in subclasses that support this."""
         raise NotImplementedError("list_by_session not implemented for this table")
 
-    async def list_inbox(self, since: str | None = None, limit: int = 50) -> list[T]:
-        """List inbound messages across all channels (unified inbox).
-
-        Override in subclasses that support cross-channel queries.
-        """
-        raise NotImplementedError("list_inbox not implemented for this table")
-
 class BaseDatabase(ABC):
     """Abstract base class for database clients."""
 

@@ -356,9 +356,6 @@ export interface ChatRequest {
    *  request types and are unaffected; channels use the backend run_conversation
    *  path (not ChatRequest) and are a distinct keyless-for-life axis. */
   clientId: string;
-  /** Per-request model override (e.g. "claude-sonnet-4-6").
-   *  When set, this session uses the specified model instead of the default. */
-  model?: string;
 }
 
 // ============== File Attachment Types ==============

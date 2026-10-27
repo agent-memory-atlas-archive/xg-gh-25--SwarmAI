@@ -1,4 +1,3 @@
-import type { ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { OpenTab } from '../types';
 import type { TabStatus } from '../../../hooks/useUnifiedTabState';
@@ -32,9 +31,6 @@ interface ChatHeaderProps {
   canvasOpen?: boolean;
   /** Open Canvas on the active tab (dispatches swarm:open-canvas). */
   onOpenCanvas?: () => void;
-
-  /** Optional inbox toggle button — rendered in the header right cluster. */
-  inboxToggle?: ReactNode;
 }
 
 /**
@@ -66,7 +62,6 @@ export function ChatHeader({
   lastSeenOutputCount = 0,
   canvasOpen = false,
   onOpenCanvas,
-  inboxToggle,
 }: ChatHeaderProps) {
   const { t } = useTranslation();
   const { health } = useHealth();
@@ -109,8 +104,6 @@ export function ChatHeader({
             {outputCount} output{outputCount !== 1 ? 's' : ''}
           </button>
         )}
-        {/* Inbox toggle — opens/closes the right-side inbox dock */}
-        {inboxToggle}
         {/* Health warning — only shown for non-connected states (BottomBar handles normal status) */}
         {health.status === 'disconnected' && (
           <div

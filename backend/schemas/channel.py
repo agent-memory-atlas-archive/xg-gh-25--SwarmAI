@@ -6,7 +6,7 @@ from typing import Literal, Optional
 class ChannelCreateRequest(BaseModel):
     """Request to create a new channel."""
     name: str = Field(..., min_length=1, max_length=255)
-    channel_type: Literal["slack", "outlook"]
+    channel_type: Literal["slack"]
     agent_id: str
     config: dict = Field(default_factory=dict)
     access_mode: Literal["open", "allowlist", "blocklist"] = "allowlist"
@@ -62,7 +62,6 @@ class ChannelStatusResponse(BaseModel):
     messages_processed: int = 0
     active_sessions: int = 0
     error_message: Optional[str] = None
-    connection_mode: Optional[str] = None
 
 
 class ChannelSessionResponse(BaseModel):

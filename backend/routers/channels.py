@@ -17,10 +17,6 @@ from schemas.channel import (
     ChannelSessionResponse,
 )
 from core.exceptions import NotFoundException, ValidationException
-from core.channel_secrets import (
-    extract_secrets_to_keystore as _extract_secrets_to_keystore,
-    delete_channel_secrets as _delete_channel_secrets,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -98,19 +94,6 @@ async def list_channel_types():
     return list_supported_types()
 
 
-@router.get("/inbox")
-async def list_inbox(since: str | None = None, limit: int = 50):
-    """List inbound messages across all channels (unified inbox).
-
-    Declared BEFORE ``/{channel_id}`` so FastAPI doesn't treat "inbox"
-    as a channel_id path parameter.
-    """
-    # Cap limit to prevent OOM on large tables
-    limit = min(max(limit, 1), 200)
-    rows = await db.channel_messages.list_inbox(since=since, limit=limit)
-    return rows
-
-
 @router.get("/{channel_id}", response_model=ChannelResponse)
 async def get_channel(channel_id: str):
     """Get a single channel by ID."""
@@ -140,15 +123,11 @@ async def create_channel(request: ChannelCreateRequest):
             detail=f"Agent with ID '{request.agent_id}' not found"
         )
 
-    # Strip secret keys (Slack bot/app tokens) out of config into the OS secret
-    # store BEFORE building channel_data — they must never reach the DB column.
-    sanitized_config = _extract_secrets_to_keystore(request.channel_type, request.config)
-
     channel_data = {
         "name": request.name,
         "channel_type": request.channel_type,
         "agent_id": request.agent_id,
-        "config": sanitized_config,
+        "config": request.config,
         "status": "inactive",
         "access_mode": request.access_mode,
         "allowed_senders": request.allowed_senders,
@@ -210,10 +189,7 @@ async def update_channel(channel_id: str, request: ChannelUpdateRequest):
     if request.name is not None:
         updates["name"] = request.name
     if request.config is not None:
-        # Strip secrets to the keystore before persisting the updated config.
-        updates["config"] = _extract_secrets_to_keystore(
-            channel.get("channel_type", ""), request.config
-        )
+        updates["config"] = request.config
     if request.agent_id is not None:
         # Validate the new agent exists (file-based for default, DB for custom)
         if not await agent_exists(request.agent_id):
@@ -264,25 +240,17 @@ async def update_channel(channel_id: str, request: ChannelUpdateRequest):
     if request.enable_mcp is not None:
         updates["enable_mcp"] = request.enable_mcp
 
-    # Per-channel model override: merge into the config dict.
-    # Merge INTO updates["config"] if this same request already set it (the
-    # stripped request.config above) — otherwise read the existing DB config.
-    # Without this, a request carrying BOTH config and model silently LOST the
-    # config update (model path overwrote it with the stale DB value) — adversarial
-    # review lost-update finding.
+    # Per-channel model override: merge into config dict
     if request.model is not None:
         import json
-        if "config" in updates:
-            base_config = dict(updates["config"])  # already stripped above
-        else:
-            base_config = channel.get("config", "{}")
-            if isinstance(base_config, str):
-                try:
-                    base_config = json.loads(base_config)
-                except (json.JSONDecodeError, TypeError):
-                    base_config = {}
-        base_config["model"] = request.model if request.model != "" else None
-        updates["config"] = base_config
+        existing_config = channel.get("config", "{}")
+        if isinstance(existing_config, str):
+            try:
+                existing_config = json.loads(existing_config)
+            except (json.JSONDecodeError, TypeError):
+                existing_config = {}
+        existing_config["model"] = request.model if request.model != "" else None
+        updates["config"] = existing_config
 
     if updates:
         updated = await db.channels.update(channel_id, updates)
@@ -326,9 +294,6 @@ async def delete_channel(channel_id: str):
 
     # Delete the channel
     await db.channels.delete(channel_id)
-    # Also purge any stored credentials for this channel type, so a later
-    # re-create cannot silently reuse a stale token (review LOW finding).
-    _delete_channel_secrets(channel.get("channel_type", ""))
     logger.info(f"Deleted channel '{channel_id}'")
 
 
@@ -360,7 +325,6 @@ async def start_channel(channel_id: str):
         messages_processed=status.get("messages_processed", 0),
         active_sessions=status.get("active_sessions", 0),
         error_message=status.get("error_message"),
-        connection_mode=status.get("connection_mode"),
     )
 
 
@@ -411,7 +375,6 @@ async def restart_channel(channel_id: str):
         messages_processed=status.get("messages_processed", 0),
         active_sessions=status.get("active_sessions", 0),
         error_message=status.get("error_message"),
-        connection_mode=status.get("connection_mode"),
     )
 
 
@@ -432,7 +395,6 @@ async def get_channel_status(channel_id: str):
         messages_processed=status.get("messages_processed", 0),
         active_sessions=status.get("active_sessions", 0),
         error_message=status.get("error_message"),
-        connection_mode=status.get("connection_mode"),
     )
 
 
